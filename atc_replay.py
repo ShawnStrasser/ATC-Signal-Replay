@@ -1,0 +1,239 @@
+# atc_replay.py
+import duckdb
+import pandas as pd
+import requests
+import xml.etree.ElementTree as ET
+from send_ntcip import send_ntcip
+import asyncio
+import threading
+import time
+from datetime import datetime, timedelta
+import math
+
+class ATCReplay:
+    def __init__(self, event_log, ip_port, incompatible_pairs, simulation_speed=1, cycle_length=0):
+        self.event_log = event_log
+        self.ip_port = ip_port
+        self.incompatible_pairs = incompatible_pairs
+        self.activation_feed = None
+        self.input_data = None
+        self.output_data = None
+        self.log_path = None
+        self.ip_mapping = {0: self.ip_port}
+        self.start_run = None
+        self.cycle_length = cycle_length
+        self.original_start_time = None
+
+
+        # Load event log and generate activation feed
+        self._load_input_data()
+        self._generate_activation_feed(simulation_speed)
+
+    def _load_input_data(self):
+        # Connect to the SQLite database using DuckDB
+        con = duckdb.connect()
+        con.execute(f"ATTACH DATABASE '{self.event_log}' AS LastFail (TYPE SQLITE)")
+        con.execute("USE LastFail")
+
+        # Read SQL from 'load_event_log.sql'
+        sql_file = 'load_event_log.sql'
+        with open(sql_file, 'r') as f:
+            sql = f.read()
+
+        self.input_data = con.execute(sql).df()
+        con.close()
+
+    def _generate_activation_feed(self, simulation_speed):
+        con = duckdb.connect()
+        # Register raw_data as a table in DuckDB
+        con.register('raw_data', self.input_data)
+
+        # Read SQL from 'impute_actuations.sql'
+        with open('impute_actuations.sql', 'r') as f:
+            sql_impute_actuations = f.read()
+
+        imputed = con.execute(sql_impute_actuations).df()
+
+        # Register imputed as a table in DuckDB
+        con.register('imputed', imputed)
+
+        # Read SQL from 'generate_activation_feed.sql'
+        with open('generate_activation_feed.sql', 'r') as f:
+            sql_generate_activation_feed = f.read()
+
+        self.activation_feed = con.execute(sql_generate_activation_feed).df()
+        con.close()
+
+        # Add sleep_time_cumulative column
+        self.activation_feed['sleep_time_cumulative'] = self.activation_feed['sleep_time'].cumsum() / simulation_speed
+        # for timing when the simulation starts if it is in coord
+        self.original_start_time = self.activation_feed['TimeStamp'].min()
+
+
+
+
+
+
+    async def _send_command(self, row, start_time):
+        """
+        Coroutine to send a single SNMP command after waiting for the required delay.
+        """
+        current_time = asyncio.get_event_loop().time()
+        delay = row.sleep_time_cumulative - (current_time - start_time)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # Send the command asynchronously using run_in_executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            send_ntcip,
+            self.ip_mapping[row.DeviceId],
+            row.group_number,
+            row.state_integer,
+            row.DetectorType
+        )
+
+    async def _run_async(self):
+        """
+        Asynchronous runner that schedules all SNMP commands based on their cumulative sleep times.
+        """
+        activation_feed = self.activation_feed.copy()
+        start_time = asyncio.get_event_loop().time()
+
+        tasks = [
+            asyncio.create_task(self._send_command(row, start_time))
+            for _, row in activation_feed.iterrows()
+        ]
+
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+
+    def run(self):
+        """
+        Synchronous method to start the asynchronous SNMP command replay.
+        It handles cases where an event loop is already running by running the async tasks in a separate thread.
+        """
+        self.start_run = datetime.now().strftime('%m-%d-%Y %H:%M:%S.%f')[:-5]
+
+        try:
+            # Try to get the current running loop
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop is running, safe to use asyncio.run
+            asyncio.run(self._run_async())
+        else:
+            # An event loop is already running, run the async code in a new thread
+            thread = threading.Thread(target=self._run_in_thread)
+            thread.start()
+            thread.join()  # Wait for the thread to finish
+
+    def _run_in_thread(self):
+        """
+        Runs the asynchronous _run_async method in a new event loop within a separate thread.
+        """
+        self.wait_until_next_cycle()
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        new_loop.run_until_complete(self._run_async())
+        new_loop.close()
+
+
+
+    # This function will wait until the next cycle starts to start the simulation
+    def wait_until_next_cycle(self):
+        # pass if cycle_length is 0
+        if self.cycle_length == 0:
+            return
+        
+        # Calculate the difference in seconds between current_time and start_time
+        delta = datetime.now() - self.original_start_time
+        delta_seconds = delta.total_seconds()
+
+        # Calculate the number of cycles that have passed
+        cycles_passed = delta_seconds / self.cycle_length
+
+        # Find the next whole cycle
+        next_cycle = math.ceil(cycles_passed) * self.cycle_length
+
+        # Calculate the next multiple time
+        next_time = self.original_start_time + timedelta(seconds=next_cycle)
+
+        # Calculate the sleep time from current_time to next_time
+        sleep_time = next_time - datetime.now()
+        sleep_time = sleep_time.total_seconds()
+        print(f'Waiting for {sleep_time} seconds until the next cycle starts')
+        time.sleep(sleep_time)
+
+
+    def get_output_data(self):
+        # Get the output data from the ASC log
+        url = f'http://{self.ip_port[0]}:{self.ip_port[1]}//v1/asclog/xml/full'# ?since={} only returns 15-minute chunks
+        response = requests.get(url, verify=False)
+        # Parse the XML
+        root = ET.fromstring(response.text)
+        # Create a list of dictionaries from the Event elements
+        data = [event.attrib for event in root.findall('.//Event')]
+        # Create a DataFrame from the list of dictionaries
+        df = pd.DataFrame(data).drop(columns='ID')
+        df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
+        df['EventTypeID'] = df['EventTypeID'].astype(int)
+        df['Parameter'] = df['Parameter'].astype(int)
+        self.output_data = df
+
+    def conflict_check(self):
+        con = duckdb.connect()
+        con.register('Event', self.output_data)
+
+        # Read SQL from 'load_conflict_events.sql'
+        sql_file = 'load_conflict_events.sql'
+        with open(sql_file, 'r') as f:
+            sql = f.read()
+
+        raw_data = con.sql(sql).df()
+        con.close()
+
+        # Get the list of parameters
+        parameters = raw_data['Parameter'].unique().tolist()
+
+        # Initialize the state dictionary with default state 0 for each parameter
+        current_states = {param: 0 for param in parameters}
+
+        # List to store the state snapshots
+        state_records = []
+
+        # Iterate through the DataFrame and update states
+        for index, row in raw_data.iterrows():
+            param = row['Parameter']
+            state = row['state_integer']
+            current_states[param] = state
+
+            # Create a snapshot: copy the current state
+            snapshot = {'TimeStamp': row['TimeStamp']}
+            for p in parameters:
+                snapshot[p] = current_states[p]
+
+            state_records.append(snapshot)
+
+        # Create the final DataFrame
+        final_df = pd.DataFrame(state_records)
+
+        # Check for conflicts
+        final_df['Conflicts'] = final_df.apply(lambda row: self._check_incompatibilities(row, self.incompatible_pairs), axis=1)
+        final_df['Has_Conflict'] = final_df['Conflicts'].apply(lambda x: len(x) > 0)
+        final_df['Conflict_Details'] = final_df['Conflicts'].apply(
+            lambda x: '; '.join([f"{a} & {b}" for a, b in x]) if x else ""
+        )
+
+        # Drop duplicates of TimeStamp, keeping the last row
+        final_df = final_df.drop_duplicates(subset='TimeStamp', keep='last')
+
+        conflict_df = final_df[final_df['Has_Conflict']][['TimeStamp', 'Conflict_Details']]
+
+        return conflict_df
+
+    def _check_incompatibilities(self, row, pairs):
+        conflicts = []
+        for (param1, param2) in pairs:
+            if row.get(param1, 0) == 1 and row.get(param2, 0) == 1:
+                conflicts.append((param1, param2))
+        return conflicts

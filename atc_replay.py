@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import math
 
 class ATCReplay:
-    def __init__(self, event_log, ip_port, incompatible_pairs, simulation_speed=1, cycle_length=0):
+    def __init__(self, event_log, ip_port, incompatible_pairs, simulation_speed=1, cycle_length=0, limit_rows=0):
         self.event_log = event_log
         self.ip_port = ip_port
         self.incompatible_pairs = incompatible_pairs
@@ -23,7 +23,7 @@ class ATCReplay:
         self.start_run = None
         self.cycle_length = cycle_length
         self.original_start_time = None
-
+        self.limit_rows = limit_rows
 
         # Load event log and generate activation feed
         self._load_input_data()
@@ -42,6 +42,11 @@ class ATCReplay:
 
         self.input_data = con.execute(sql).df()
         con.close()
+
+        # NOTE: This does not explicitly order the data! Come back to this later.
+        # ~~~ Nothing is as permanent as a temporary solution ~~~ 
+        if self.limit_rows > 0:
+            self.input_data = self.input_data.tail(self.limit_rows)
 
     def _generate_activation_feed(self, simulation_speed):
         con = duckdb.connect()
@@ -68,10 +73,6 @@ class ATCReplay:
         self.activation_feed['sleep_time_cumulative'] = self.activation_feed['sleep_time'].cumsum() / simulation_speed
         # for timing when the simulation starts if it is in coord
         self.original_start_time = self.activation_feed['TimeStamp'].min()
-
-
-
-
 
 
     async def _send_command(self, row, start_time):
@@ -131,12 +132,30 @@ class ATCReplay:
         """
         Runs the asynchronous _run_async method in a new event loop within a separate thread.
         """
+        self.reset_detector_states()
         self.wait_until_next_cycle()
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
         new_loop.run_until_complete(self._run_async())
         new_loop.close()
 
+    def reset_detector_states(self):
+        """
+        Resets the detector states for all types to 0.
+        Catches and handles 'noSuchName' errors that occur when a detector doesn't exist.
+        """
+        for detector_type in ['Vehicle', 'Ped', 'Preempt']:
+            for detector_group in range(1, 17):  # Assuming detector groups range from 1 to 16
+                try:
+                    send_ntcip(self.ip_port, detector_group, 0, detector_type)
+                except Exception as e:
+                    # Skip 'noSuchName' errors as they just indicate non-existent detectors
+                    if "noSuchName" in str(e):
+                        print(f"Detector {detector_group} of type {detector_type} does not exist.")
+                        break
+                    else:
+                        print(f"Error resetting detector {detector_group} of type {detector_type}: {e}")
+                        raise e
 
 
     # This function will wait until the next cycle starts to start the simulation

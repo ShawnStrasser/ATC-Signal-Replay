@@ -1,0 +1,5 @@
+duckdb
+pandas
+requests
+pysnmplib==5.0.24
+jinja2

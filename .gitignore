@@ -1,0 +1,23 @@
+# Environment
+env_replay/
+
+# Test folders
+2C039_CycleFault/
+6th_Homedale_Preempt/
+OR99W_Baker_Conflict/
+PedOverlapFlash/
+Pendelton TSP Testing/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Data files
+#*.db
+#*.parquet

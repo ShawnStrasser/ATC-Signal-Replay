@@ -1,4 +1,4 @@
--- load_event_log.sql
+-- load .db log from maxtime
 SELECT
     TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS TimeStamp,
     0 AS DeviceId,

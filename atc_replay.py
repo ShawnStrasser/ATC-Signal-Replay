@@ -9,34 +9,40 @@ import threading
 import time
 from datetime import datetime, timedelta
 import math
+from jinja2 import Template
 
 class ATCReplay:
-    def __init__(self, event_log, ip_port, incompatible_pairs, simulation_speed=1, cycle_length=0, limit_rows=0):
+    def __init__(self, event_log, device_mapping, incompatible_pairs=None, simulation_speed=1, cycle_length=0, limit_rows=0, debug=False):
         self.event_log = event_log
-        self.ip_port = ip_port
         self.incompatible_pairs = incompatible_pairs
         self.activation_feed = None
         self.input_data = None
         self.output_data = None
         self.log_path = None
-        self.ip_mapping = {0: self.ip_port}
-        self.start_run = None
+        self.ip_mapping = device_mapping
         self.cycle_length = cycle_length
         self.original_start_time = None
         self.limit_rows = limit_rows
+        self.debug = debug
 
-        # Load event log and generate activation feed
-        self._load_input_data()
+        # If event log is .db then load the maxtime and lastfail from the database
+        if event_log.endswith('.db'):
+            self._load_maxtime_lastfail()
+        else:
+            self._load_from_path()
+
         self._generate_activation_feed(simulation_speed)
 
-    def _load_input_data(self):
+    def _load_maxtime_lastfail(self):
+        if self.debug:
+            print("Loading data from SQLite database")
         # Connect to the SQLite database using DuckDB
         con = duckdb.connect()
         con.execute(f"ATTACH DATABASE '{self.event_log}' AS LastFail (TYPE SQLITE)")
         con.execute("USE LastFail")
 
         # Read SQL from 'load_event_log.sql'
-        sql_file = 'load_event_log.sql'
+        sql_file = 'SQL/load_maxtime_db.sql'
         with open(sql_file, 'r') as f:
             sql = f.read()
 
@@ -47,14 +53,41 @@ class ATCReplay:
         # ~~~ Nothing is as permanent as a temporary solution ~~~ 
         if self.limit_rows > 0:
             self.input_data = self.input_data.tail(self.limit_rows)
+        if self.debug:
+            print("Data loaded successfully")
+
+    def _load_from_path(self):
+        if self.debug:
+            print("Loading data from path")
+        # Variables to replace
+        template_vars = {
+            'timestamp': 'timestamp',
+            'eventid': 'event_id',
+            'parameter': 'parameter',
+            'from_path': self.event_log
+        }
+        # Read SQL template
+        with open('SQL/load_from_path.sql', 'r') as f:
+            template = Template(f.read())
+        # Render SQL with variables
+        sql = template.render(**template_vars)
+        self.input_data = duckdb.sql(sql).df()
+        # NOTE: This does not explicitly order the data! Come back to this later.
+        # ~~~ Nothing is as permanent as a temporary solution ~~~ 
+        if self.limit_rows > 0:
+            self.input_data = self.input_data.tail(self.limit_rows)
+        if self.debug:
+            print("Data loaded successfully")
 
     def _generate_activation_feed(self, simulation_speed):
+        if self.debug:
+            print("Generating activation feed")
         con = duckdb.connect()
         # Register raw_data as a table in DuckDB
         con.register('raw_data', self.input_data)
 
         # Read SQL from 'impute_actuations.sql'
-        with open('impute_actuations.sql', 'r') as f:
+        with open('SQL/impute_actuations.sql', 'r') as f:
             sql_impute_actuations = f.read()
 
         imputed = con.execute(sql_impute_actuations).df()
@@ -63,7 +96,7 @@ class ATCReplay:
         con.register('imputed', imputed)
 
         # Read SQL from 'generate_activation_feed.sql'
-        with open('generate_activation_feed.sql', 'r') as f:
+        with open('SQL/generate_activation_feed.sql', 'r') as f:
             sql_generate_activation_feed = f.read()
 
         self.activation_feed = con.execute(sql_generate_activation_feed).df()
@@ -73,6 +106,8 @@ class ATCReplay:
         self.activation_feed['sleep_time_cumulative'] = self.activation_feed['sleep_time'].cumsum() / simulation_speed
         # for timing when the simulation starts if it is in coord
         self.original_start_time = self.activation_feed['TimeStamp'].min()
+        if self.debug:
+            print("Activation feed generated successfully")
 
 
     async def _send_command(self, row, start_time):
@@ -140,22 +175,32 @@ class ATCReplay:
         new_loop.close()
 
     def reset_detector_states(self):
-        """
-        Resets the detector states for all types to 0.
-        Catches and handles 'noSuchName' errors that occur when a detector doesn't exist.
-        """
-        for detector_type in ['Vehicle', 'Ped', 'Preempt']:
-            for detector_group in range(1, 17):  # Assuming detector groups range from 1 to 16
-                try:
-                    send_ntcip(self.ip_port, detector_group, 0, detector_type)
-                except Exception as e:
-                    # Skip 'noSuchName' errors as they just indicate non-existent detectors
-                    if "noSuchName" in str(e):
-                        print(f"Detector {detector_group} of type {detector_type} does not exist.")
-                        break
-                    else:
-                        print(f"Error resetting detector {detector_group} of type {detector_type}: {e}")
-                        raise e
+            """
+            Resets the detector states for all types to 0.
+            Catches and handles 'noSuchName' errors that occur when a detector doesn't exist.
+            """
+            if self.debug:
+                print("Resetting detector states to 0")
+            # Get all unique IP/port combinations from the mapping
+            ip_ports = set(self.ip_mapping.values())
+            if self.debug:
+                print(f"IP/port combinations: {ip_ports}")
+
+            for ip_port in ip_ports:
+                for detector_type in ['Vehicle', 'Ped', 'Preempt']:
+                    for detector_group in range(1, 17):  # Assuming detector groups range from 1 to 16
+                        try:
+                            send_ntcip(ip_port, detector_group, 0, detector_type)
+                        except Exception as e:
+                            # Skip 'noSuchName' errors as they just indicate non-existent detectors
+                            if "noSuchName" in str(e):
+                                print(f"Detector {detector_group} of type {detector_type} does not exist for {ip_port}.")
+                                break
+                            else:
+                                print(f"Error resetting detector {detector_group} of type {detector_type} for {ip_port}: {e}")
+                                raise e
+            if self.debug:
+                print("Detector states reset successfully")
 
 
     # This function will wait until the next cycle starts to start the simulation
@@ -163,7 +208,6 @@ class ATCReplay:
         # pass if cycle_length is 0
         if self.cycle_length == 0:
             return
-        
         # Calculate the difference in seconds between current_time and start_time
         delta = datetime.now() - self.original_start_time
         delta_seconds = delta.total_seconds()
@@ -186,7 +230,12 @@ class ATCReplay:
 
     def get_output_data(self):
         # Get the output data from the ASC log
-        url = f'http://{self.ip_port[0]}:{self.ip_port[1]}//v1/asclog/xml/full'# ?since={} only returns 15-minute chunks
+        # Get the first device IP and port from the mapping
+        first_device_id = list(self.ip_mapping.keys())[0]
+        ip_port = self.ip_mapping[first_device_id]  # It's already a tuple
+        # Get the output data from the ASC log
+        url = f'http://{ip_port[0]}:{ip_port[1]}/v1/asclog/xml/full'
+
         response = requests.get(url, verify=False)
         # Parse the XML
         root = ET.fromstring(response.text)
@@ -200,11 +249,14 @@ class ATCReplay:
         self.output_data = df
 
     def conflict_check(self):
+        if self.incompatible_pairs is None:
+            return "Conflict check cannot be performed: no incompatible pairs provided"
+        
         con = duckdb.connect()
         con.register('Event', self.output_data)
 
         # Read SQL from 'load_conflict_events.sql'
-        sql_file = 'load_conflict_events.sql'
+        sql_file = 'SQL/load_conflict_events.sql'
         with open(sql_file, 'r') as f:
             sql = f.read()
 

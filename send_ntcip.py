@@ -2,21 +2,23 @@ from pysnmp.hlapi import SnmpEngine, CommunityData, UdpTransportTarget, ContextD
 import time
 from typing import Tuple, Literal
 
+import threading
+
+# Create one SnmpEngine per thread to avoid concurrency issues
+_thread_local = threading.local()
+
+def get_engine():
+    if not hasattr(_thread_local, 'engine'):
+        _thread_local.engine = SnmpEngine()
+    return _thread_local.engine
+
 def send_ntcip(
     ip_port: Tuple[str, int],
     detector_group: int,
     state_integer: int,
-    type: Literal['Vehicle', 'Ped', 'Preempt']
+    type: Literal['Vehicle', 'Ped', 'Preempt'],
+    community: str = 'public'
 ) -> None:
-    """Set the state of a detector group using NTCIP protocol.
-    
-    Args:
-        ip_port: Tuple of (IP address, port number)
-        detector_group: Detector group number (expected range: 1-16)
-        state_integer: State value (expected range: 0-255)
-        type: Type of detector ('Vehicle', 'Ped', or 'Preempt')
-    """
-    # From NTCIP 1202 v3 section 5.3.11.3 - Vehicle Detector Control Group Actuation
     if type == 'Vehicle':
         oid = ObjectIdentity(f'1.3.6.1.4.1.1206.4.2.1.2.12.1.2.{detector_group}')
     elif type == 'Ped':
@@ -26,10 +28,15 @@ def send_ntcip(
 
     error_indication, error_status, error_index, var_binds = next(
         setCmd(
-            SnmpEngine(),
-            CommunityData('public', mpModel=0),
-            UdpTransportTarget(ip_port),
+            get_engine(),  # Get thread-specific engine
+            CommunityData(community, mpModel=0),
+            UdpTransportTarget(ip_port, timeout=3, retries=0),
             ContextData(),
             ObjectType(oid, Integer(state_integer))
         )
     )
+
+    if error_indication:
+        raise RuntimeError(f'SNMP error: {error_indication}')
+    elif error_status:
+        raise RuntimeError(f'SNMP error: {error_status.prettyPrint()} at {error_index}')

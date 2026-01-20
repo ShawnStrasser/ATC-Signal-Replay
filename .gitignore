@@ -21,3 +21,7 @@ __pycache__/
 # Data files
 #*.db
 #*.parquet
+archive/
+testing.ipynb
+test_design.ipynb
+test_package.ipynb

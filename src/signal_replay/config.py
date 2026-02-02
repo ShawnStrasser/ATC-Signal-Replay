@@ -24,14 +24,20 @@ class SignalConfig:
         device_id: Unique identifier for the signal device
         ip_port: Tuple of (IP address, port) for NTCIP communication
         cycle_length: Cycle length in seconds for coordinated signals (0 = disabled)
+        cycle_offset: Offset in seconds within the cycle to start playback (0 = cycle boundary)
         incompatible_pairs: List of phase/overlap pairs that should never be active together
         events: Hi-res event data as Arrow table, pandas DataFrame, or file path (str/Path)
+        limit_minutes: Limit input events to the last N minutes (0 = no limit)
+        buffer_minutes: Include additional buffer minutes before the last N minutes (0 = no buffer)
     """
     device_id: str
     ip_port: Tuple[str, int]
     cycle_length: int
     incompatible_pairs: List[Tuple[str, str]]
     events: Union[pd.DataFrame, str, Path]  # Also accepts pyarrow.Table at runtime
+    cycle_offset: float = 0.0
+    limit_minutes: float = 0.0
+    buffer_minutes: float = 0.0
     
     def __post_init__(self):
         # Validate ip_port format
@@ -47,6 +53,10 @@ class SignalConfig:
         # Validate cycle_length
         if not isinstance(self.cycle_length, int) or self.cycle_length < 0:
             raise ValueError(f"cycle_length must be a non-negative integer, got {self.cycle_length}")
+
+        # Validate cycle_offset
+        if not isinstance(self.cycle_offset, (int, float)) or self.cycle_offset < 0:
+            raise ValueError(f"cycle_offset must be a non-negative number, got {self.cycle_offset}")
         
         # Validate incompatible_pairs
         if not isinstance(self.incompatible_pairs, list):
@@ -55,6 +65,12 @@ class SignalConfig:
         for pair in self.incompatible_pairs:
             if not isinstance(pair, tuple) or len(pair) != 2:
                 raise ValueError(f"Each incompatible pair must be a tuple of 2 strings, got {pair}")
+
+        # Validate limit_minutes and buffer_minutes
+        if not isinstance(self.limit_minutes, (int, float)) or self.limit_minutes < 0:
+            raise ValueError(f"limit_minutes must be a non-negative number, got {self.limit_minutes}")
+        if not isinstance(self.buffer_minutes, (int, float)) or self.buffer_minutes < 0:
+            raise ValueError(f"buffer_minutes must be a non-negative number, got {self.buffer_minutes}")
         
         # Validate events type
         valid_types = [pd.DataFrame, str, Path]

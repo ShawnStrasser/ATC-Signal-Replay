@@ -60,7 +60,8 @@ class ComparisonResult:
 
 def prepare_events_for_comparison(
     events_df: pd.DataFrame,
-    start_time: Optional[datetime] = None
+    start_time: Optional[datetime] = None,
+    event_ids: Optional[List[int]] = None
 ) -> pd.DataFrame:
     """
     Prepare events for DTW comparison.
@@ -89,7 +90,10 @@ def prepare_events_for_comparison(
     df = df.rename(columns=col_map)
     
     # Filter to comparison event IDs
-    df = df[df['event_id'].isin(COMPARISON_EVENT_IDS)].copy()
+    if event_ids is None:
+        event_ids = COMPARISON_EVENT_IDS
+    if event_ids:
+        df = df[df['event_id'].isin(event_ids)].copy()
     
     if df.empty:
         return df
@@ -278,7 +282,8 @@ def compare_runs(
     run_a_label: Union[int, str] = "A",
     run_b_label: Union[int, str] = "B",
     start_time_a: Optional[datetime] = None,
-    start_time_b: Optional[datetime] = None
+    start_time_b: Optional[datetime] = None,
+    event_ids: Optional[List[int]] = None
 ) -> ComparisonResult:
     """
     Compare two runs using DTW on both sequence and timing.
@@ -296,8 +301,8 @@ def compare_runs(
         ComparisonResult with DTW distances and divergence windows
     """
     # Prepare events
-    df_a = prepare_events_for_comparison(events_a, start_time_a)
-    df_b = prepare_events_for_comparison(events_b, start_time_b)
+    df_a = prepare_events_for_comparison(events_a, start_time_a, event_ids=event_ids)
+    df_b = prepare_events_for_comparison(events_b, start_time_b, event_ids=event_ids)
     
     if df_a.empty or df_b.empty:
         return ComparisonResult(

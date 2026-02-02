@@ -1,5 +1,5 @@
 # Environment
-env_replay/
+test_async_env/
 
 # Test folders
 2C039_CycleFault/
@@ -25,3 +25,6 @@ archive/
 testing.ipynb
 test_design.ipynb
 test_package.ipynb
+test_output_compare.ipynb
+version_testing/
+experiments/

@@ -13,6 +13,7 @@ import time
 import multiprocessing as mp
 from dataclasses import dataclass
 import threading
+import time
 
 from .config import SignalConfig
 
@@ -423,7 +424,12 @@ class DataCollector:
         
         while not stop_event.is_set():
             self.collect_once(run_number, simulation_start_time, conflict_callback)
-            time.sleep(self.collection_interval)
+            
+            # Sleep in small intervals so we can check stop_event frequently
+            sleep_elapsed = 0
+            while sleep_elapsed < self.collection_interval and not stop_event.is_set():
+                time.sleep(1)  # Check every 1 second
+                sleep_elapsed += 1
         
         if self.debug:
             print(f"Collection loop stopped for run {run_number}")
@@ -461,7 +467,9 @@ class DataCollector:
                 print(f"Inserted {rows} events for {device_id}")
             
             # Check for conflicts
+            start = time.time()
             conflicts = check_conflicts(df, incompatible_pairs)
+            print(f"Conflict check for {device_id} took {time.time() - start:.2f} seconds")
             if not conflicts.empty:
                 if self.debug:
                     print(f"Conflicts found for {device_id}!")

@@ -141,7 +141,7 @@ class ATCSimulation:
               f"{self.config.simulation_replays} replays")
         
         estimated_duration = self._get_estimated_duration()
-        print(f"Estimated duration per run: {estimated_duration:.1f} seconds")
+        print(f"Estimated duration per run: {int(estimated_duration // 60):02d}:{int(estimated_duration % 60):02d}")
         
         # Build device configs for collector
         device_configs = {

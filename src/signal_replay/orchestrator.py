@@ -4,9 +4,11 @@ Main orchestrator for ATC Signal Replay simulations.
 
 import threading
 import time
+from copy import copy
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import pandas as pd
 
 from .config import SimulationConfig, SignalConfig
@@ -15,27 +17,150 @@ from .collector import DatabaseManager, DataCollector, fetch_output_data, check_
 from .comparison import compare_all_runs, format_comparison_summary, ComparisonResult
 
 
+def _load_events(events: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
+    """Load events from DataFrame or file path."""
+    if isinstance(events, pd.DataFrame):
+        return events
+    elif isinstance(events, (str, Path)):
+        path = Path(events)
+        if path.suffix.lower() == '.parquet':
+            return pd.read_parquet(path)
+        else:
+            return pd.read_csv(path)
+    else:
+        raise ValueError(f"events must be DataFrame or file path, got {type(events)}")
+
+
+def _normalize_device_id_column(df: pd.DataFrame) -> str:
+    """Find and return the device_id column name (normalized)."""
+    for col in df.columns:
+        if col.lower() in ('device_id', 'deviceid'):
+            return col
+    raise ValueError(
+        "Centralized events must have a 'device_id' column to map events to signals. "
+        f"Found columns: {list(df.columns)}"
+    )
+
+
+def _distribute_events(
+    signals: List[SignalConfig],
+    centralized_events: Union[pd.DataFrame, str, Path]
+) -> None:
+    """
+    Distribute centralized events to all signals by filtering on device_id.
+    
+    Args:
+        signals: List of SignalConfig objects (modified in place)
+        centralized_events: DataFrame or path with device_id column
+    """
+    # Load the centralized events
+    all_events = _load_events(centralized_events)
+    device_id_col = _normalize_device_id_column(all_events)
+    
+    # Get unique device_ids in the events
+    available_device_ids = set(all_events[device_id_col].astype(str).unique())
+    
+    for signal in signals:
+        # Filter centralized events for this device
+        device_id_str = str(signal.device_id)
+        if device_id_str not in available_device_ids:
+            raise ValueError(
+                f"Signal '{signal.device_id}' not found in events. "
+                f"Available device_ids: {sorted(available_device_ids)}"
+            )
+        
+        # Filter events for this device
+        mask = all_events[device_id_col].astype(str) == device_id_str
+        signal_events = all_events[mask].copy()
+        
+        if signal_events.empty:
+            raise ValueError(
+                f"No events found for device_id '{signal.device_id}'"
+            )
+        
+        # Assign events directly (using object.__setattr__ for frozen dataclass compatibility)
+        object.__setattr__(signal, 'events', signal_events)
+
+
 class ATCSimulation:
     """
     Main orchestrator for multi-signal ATC replay simulations.
     
     Manages replay processes, data collection, conflict detection,
     and post-simulation comparison analysis.
+    
+    Can be initialized in two ways:
+    
+    1. Legacy (with SimulationConfig):
+        config = SimulationConfig(signals=[...], simulation_replays=5)
+        sim = ATCSimulation(config)
+    
+    2. Streamlined (with kwargs):
+        sim = ATCSimulation(
+            signals=[...],
+            events='all_events.csv',  # Centralized, filtered by device_id
+            replays=5
+        )
     """
     
-    def __init__(self, config: SimulationConfig, debug: bool = False):
+    def __init__(
+        self,
+        config: Optional[SimulationConfig] = None,
+        *,
+        signals: Optional[List[SignalConfig]] = None,
+        events: Union[pd.DataFrame, str, Path, None] = None,
+        replays: int = 1,
+        stop_on_conflict: bool = False,
+        db_path: str = "./atc_replay.duckdb",
+        simulation_speed: float = 1.0,
+        debug: bool = False
+    ):
         """
         Initialize the ATC simulation.
         
         Args:
-            config: SimulationConfig with all simulation parameters
+            config: SimulationConfig with all simulation parameters (legacy pattern)
+            signals: List of SignalConfig objects (streamlined pattern)
+            events: REQUIRED. Centralized event source with device_id column.
+                Events are automatically filtered and distributed to signals by device_id.
+            replays: Number of simulation runs (streamlined pattern)
+            stop_on_conflict: Stop simulation on first conflict
+            db_path: Path to DuckDB database
+            simulation_speed: Speed multiplier (1.0 = real-time)
             debug: Enable debug output
         """
-        self.config = config
         self.debug = debug
         
+        # Handle legacy vs streamlined initialization
+        if config is not None:
+            # Legacy pattern: SimulationConfig provided
+            if signals is not None:
+                raise ValueError("Cannot specify both 'config' and 'signals'. Use one or the other.")
+            # Distribute events to all signals
+            _distribute_events(config.signals, config.events)
+            self.config = config
+        else:
+            # Streamlined pattern: kwargs provided
+            if signals is None:
+                raise ValueError("Must provide either 'config' or 'signals'")
+            if events is None:
+                raise ValueError("Must provide 'events' (centralized event source with device_id column)")
+            
+            # Distribute centralized events to all signals
+            _distribute_events(signals, events)
+            
+            # Create SimulationConfig internally
+            self.config = SimulationConfig(
+                signals=signals,
+                events=events,
+                simulation_replays=replays,
+                stop_on_conflict=stop_on_conflict,
+                db_path=db_path,
+                simulation_speed=simulation_speed,
+            )
+        
         # Initialize database
-        self.db = DatabaseManager(config.db_path)
+        self.db = DatabaseManager(self.config.db_path)
         
         # Determine starting run number if database already has runs
         self._run_offset = self.db.get_max_run_number()

@@ -23,10 +23,11 @@ class SignalConfig:
     """
     Configuration for a single signal/intersection.
     
+    Events are provided at the simulation level and automatically filtered by device_id.
+    
     Attributes:
         device_id: Unique identifier for the signal device
         ip: IP address for NTCIP/SNMP communication
-        events: Hi-res event data as Arrow table, pandas DataFrame, or file path (str/Path)
         udp_port: UDP port for SNMP communication. Required for localhost, defaults to 161 for remote hosts.
         cycle_length: Cycle length in seconds for coordinated signals (0 = disabled, default)
         incompatible_pairs: List of phase/overlap pairs that should never be active together. Optional - if not provided, conflict checking is disabled.
@@ -37,7 +38,6 @@ class SignalConfig:
     """
     device_id: str
     ip: str
-    events: Union[pd.DataFrame, str, Path]  # Also accepts pyarrow.Table at runtime
     udp_port: Optional[int] = None
     cycle_length: int = 0
     incompatible_pairs: Optional[List[Tuple[str, str]]] = None
@@ -45,6 +45,9 @@ class SignalConfig:
     limit_minutes: float = 0.0
     buffer_minutes: float = 0.0
     http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
+    
+    # Internal: populated during simulation initialization
+    events: Union[pd.DataFrame, None] = field(default=None, init=False, repr=False)
     
     def __post_init__(self):
         # Detect if this is localhost
@@ -102,17 +105,6 @@ class SignalConfig:
             raise ValueError(f"limit_minutes must be a non-negative number, got {self.limit_minutes}")
         if not isinstance(self.buffer_minutes, (int, float)) or self.buffer_minutes < 0:
             raise ValueError(f"buffer_minutes must be a non-negative number, got {self.buffer_minutes}")
-        
-        # Validate events type
-        valid_types = [pd.DataFrame, str, Path]
-        if HAS_PYARROW:
-            valid_types.append(pa.Table)
-        
-        if not any(isinstance(self.events, t) for t in valid_types):
-            raise ValueError(
-                f"events must be a pandas DataFrame, Arrow Table, or file path, "
-                f"got {type(self.events)}"
-            )
     
     @property
     def ip_port(self) -> Tuple[str, int]:
@@ -127,6 +119,9 @@ class SimulationConfig:
     
     Attributes:
         signals: List of SignalConfig objects for each signal to simulate
+        events: Centralized event source (DataFrame or file path). Events are automatically
+            filtered by device_id and distributed to signals. REQUIRED.
+            The data must contain a 'device_id' column (or 'DeviceId').
         simulation_replays: Number of times to replay the simulation
         stop_on_conflict: If True, stop simulation when a conflict is detected
         db_path: Path to DuckDB database file (defaults to ./atc_replay.duckdb)
@@ -135,6 +130,7 @@ class SimulationConfig:
         collection_interval_minutes: How often to collect data from controllers (default: 5)
     """
     signals: List[SignalConfig]
+    events: Union[pd.DataFrame, str, Path]
     simulation_replays: int = 1
     stop_on_conflict: bool = False
     db_path: str = "./atc_replay.duckdb"

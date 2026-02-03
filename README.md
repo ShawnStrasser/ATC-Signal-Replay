@@ -27,23 +27,20 @@ Replay events to a controller and monitor for phase conflicts:
 ```python
 import signal_replay as sr
 
-signal = sr.SignalConfig(
-    device_id=0,
-    ip='192.0.2.10',
-    events='2025-01-15_events.csv',
-    incompatible_pairs=[
-        ('O5', 'Ph4'), ('O5', 'Ph8'),
-    ]
-)
-
-config = sr.SimulationConfig(
-    signals=[signal],
-    simulation_replays=40,
+sim = sr.ATCSimulation(
+    signals=[
+        sr.SignalConfig(
+            device_id='0',
+            ip='192.0.2.10',
+            incompatible_pairs=[('O5', 'Ph4'), ('O5', 'Ph8')],
+        )
+    ],
+    events='2025-01-15_events.csv',  # Must have device_id column
+    replays=40,
     stop_on_conflict=True,
     db_path='./conflict_test.duckdb'
 )
 
-sim = sr.ATCSimulation(config)
 results = sim.run()
 ```
 
@@ -78,41 +75,41 @@ Device: 0
 
 ---
 
-## Example: Multi-Signal with Emulators
+## Example: Multi-Signal with Centralized Events
 
-Test coordinated signals using MAXTIME emulators on localhost:
+Test coordinated signals using a **single event file** containing all device data.
+Events are automatically filtered by `device_id` and distributed to each signal:
 
 ```python
 import signal_replay as sr
 
-signals = [
-    sr.SignalConfig(
-        device_id='main_1st',
-        ip='127.0.0.1',
-        udp_port=1025,          # Required for localhost
-        events='main_1st_events.csv',
-        cycle_length=120,
-        cycle_offset=0,
-    ),
-    sr.SignalConfig(
-        device_id='main_2nd',
-        ip='127.0.0.1',
-        udp_port=1026,
-        events='main_2nd_events.csv',
-        cycle_length=120,
-        cycle_offset=30,        # 30s offset from reference
-    ),
-]
-
-config = sr.SimulationConfig(
-    signals=signals,
-    simulation_replays=5,
-    db_path='./coordination_test.duckdb'
+sim = sr.ATCSimulation(
+    signals=[
+        sr.SignalConfig(
+            device_id='main_1st',
+            ip='127.0.0.1',
+            udp_port=1025,          # Required for localhost
+            cycle_length=120,
+            cycle_offset=0,
+        ),
+        sr.SignalConfig(
+            device_id='main_2nd',
+            ip='127.0.0.1',
+            udp_port=1026,
+            cycle_length=120,
+            cycle_offset=30,        # 30s offset from reference
+        ),
+    ],
+    events='all_signals_events.csv',  # Must have 'device_id' column
+    replays=5,
+    db_path='./coordination_test.duckdb',
+    debug=True
 )
 
-sim = sr.ATCSimulation(config, debug=True)
 results = sim.run()
 ```
+
+The centralized events file must contain a `device_id` column matching the `device_id` in each `SignalConfig`.
 
 ---
 
@@ -257,13 +254,41 @@ for device_id, results in comparison.items():
 
 ## Configuration Reference
 
+### ATCSimulation
+
+The main entry point. Events are **always** provided at this level and automatically filtered by `device_id`.
+
+Accepts either a `SimulationConfig` object (legacy) or keyword arguments (streamlined):
+
+```python
+# Streamlined API (recommended)
+sim = sr.ATCSimulation(
+    signals=[...],           # List of SignalConfig  
+    events='events.csv',     # REQUIRED: centralized events with device_id column
+    replays=5,               # Number of simulation runs
+    stop_on_conflict=False,  # Stop on first conflict
+    db_path='./test.duckdb', # Database path
+    simulation_speed=1.0,    # Speed multiplier
+    debug=False
+)
+
+# Legacy API (still supported)
+config = sr.SimulationConfig(
+    signals=[...],
+    events='events.csv',     # REQUIRED
+    simulation_replays=5
+)
+sim = sr.ATCSimulation(config)
+```
+
 ### SignalConfig
+
+Configuration for individual signals. Events are provided at the simulation level.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `device_id` | str | *required* | Unique identifier |
 | `ip` | str | *required* | Controller IP |
-| `events` | DataFrame/Path | *required* | Hi-res event data |
 | `udp_port` | int | 161 | SNMP port. **Required for localhost** |
 | `cycle_length` | int | 0 | Cycle length for coordination (0 = disabled) |
 | `cycle_offset` | float | 0.0 | Offset from cycle start (use with `cycle_length`) |
@@ -272,11 +297,12 @@ for device_id, results in comparison.items():
 | `limit_minutes` | float | 0.0 | Only replay last N minutes |
 | `buffer_minutes` | float | 0.0 | Lead-in minutes when using `limit_minutes` |
 
-### SimulationConfig
+### SimulationConfig (Legacy)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `signals` | list | *required* | List of `SignalConfig` |
+| `events` | DataFrame/Path | *required* | Centralized events (filtered by `device_id`) |
 | `simulation_replays` | int | 1 | Number of replay runs |
 | `stop_on_conflict` | bool | False | Stop on first conflict |
 | `db_path` | str | `./atc_replay.duckdb` | Database path |
@@ -293,6 +319,7 @@ Input events require these columns (flexible naming):
 | timestamp | `TimeStamp`, `time` | Event timestamp |
 | event_id | `EventId`, `EventTypeID` | Event type code |
 | parameter | `Parameter`, `Detector` | Phase/detector number |
+| device_id | `DeviceId` | **Required for centralized events** |
 
 ---
 

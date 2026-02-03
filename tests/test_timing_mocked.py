@@ -18,7 +18,8 @@ import signal_replay as sr
 def create_synthetic_events(
     duration_seconds: float,
     events_per_second: float = 2.0,
-    detector_groups: List[int] = [1, 2, 3]
+    detector_groups: List[int] = [1, 2, 3],
+    device_id: str = 'test_device'
 ) -> pd.DataFrame:
     """Create synthetic event data with known duration."""
     base_time = datetime(2024, 1, 1, 12, 0, 0)
@@ -33,7 +34,8 @@ def create_synthetic_events(
         events.append({
             'timestamp': timestamp,
             'event_id': event_id,
-            'parameter': detector
+            'parameter': detector,
+            'device_id': device_id
         })
     
     return pd.DataFrame(events)
@@ -49,8 +51,12 @@ class TestOrchestratorTimingWithMocks:
     """
     
     @pytest.fixture
-    def mock_ip_port(self):
-        return ('127.0.0.1', 1025)
+    def mock_ip(self):
+        return '127.0.0.1'
+    
+    @pytest.fixture
+    def mock_port(self):
+        return 1025
     
     @pytest.fixture
     def short_events(self):
@@ -65,7 +71,8 @@ class TestOrchestratorTimingWithMocks:
         mock_reset: MagicMock,
         mock_send: MagicMock,
         mock_fetch: MagicMock,
-        mock_ip_port,
+        mock_ip,
+        mock_port,
         short_events,
         temp_db_path
     ):
@@ -82,14 +89,15 @@ class TestOrchestratorTimingWithMocks:
         
         signal_config = sr.SignalConfig(
             device_id='test_device',
-            ip_port=mock_ip_port,
+            ip=mock_ip,
+            udp_port=mock_port,
             cycle_length=0,
-            incompatible_pairs=[],
-            events=short_events
+            incompatible_pairs=[]
         )
         
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
+            events=short_events,
             simulation_replays=1,
             stop_on_conflict=False,
             db_path=temp_db_path,
@@ -97,6 +105,8 @@ class TestOrchestratorTimingWithMocks:
         )
         
         # Get expected duration from replay
+        # Manually set events on signal config for replay duration calculation
+        signal_config.events = short_events
         replay = sr.SignalReplay(signal_config, simulation_speed=1.0)
         expected_duration = replay.get_run_duration()
         
@@ -128,7 +138,8 @@ class TestOrchestratorTimingWithMocks:
         mock_reset: MagicMock,
         mock_send: MagicMock,
         mock_fetch: MagicMock,
-        mock_ip_port,
+        mock_ip,
+        mock_port,
         short_events,
         temp_db_path
     ):
@@ -143,20 +154,23 @@ class TestOrchestratorTimingWithMocks:
         
         signal_config = sr.SignalConfig(
             device_id='test_device',
-            ip_port=mock_ip_port,
+            ip=mock_ip,
+            udp_port=mock_port,
             cycle_length=0,
-            incompatible_pairs=[],
-            events=short_events
+            incompatible_pairs=[]
         )
         
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
+            events=short_events,
             simulation_replays=num_runs,
             stop_on_conflict=False,
             db_path=temp_db_path,
             simulation_speed=1.0
         )
         
+        # Manually set events on signal config for replay duration calculation
+        signal_config.events = short_events
         replay = sr.SignalReplay(signal_config, simulation_speed=1.0)
         expected_per_run = replay.get_run_duration()
         expected_total = expected_per_run * num_runs
@@ -187,23 +201,29 @@ class TestSignalReplayTiming:
     """Tests for the SignalReplay class timing."""
     
     @pytest.fixture
-    def mock_ip_port(self):
-        return ('127.0.0.1', 1025)
+    def mock_ip(self):
+        return '127.0.0.1'
+    
+    @pytest.fixture
+    def mock_port(self):
+        return 1025
     
     @pytest.fixture
     def short_events(self):
         return create_synthetic_events(duration_seconds=3.0, events_per_second=2.0)
     
-    def test_expected_duration_calculation(self, mock_ip_port, short_events):
+    def test_expected_duration_calculation(self, mock_ip, mock_port, short_events):
         """Verify get_run_duration() returns correct value."""
         config = sr.SignalConfig(
             device_id='test',
-            ip_port=mock_ip_port,
+            ip=mock_ip,
+            udp_port=mock_port,
             cycle_length=0,
-            incompatible_pairs=[],
-            events=short_events
+            incompatible_pairs=[]
         )
         
+        # Manually set events on signal config for replay duration calculation
+        config.events = short_events
         replay = sr.SignalReplay(config, simulation_speed=1.0)
         expected = replay.get_run_duration()
         
@@ -216,17 +236,21 @@ class TestSignalReplayTiming:
         self,
         mock_reset: MagicMock,
         mock_send: MagicMock,
-        mock_ip_port,
+        mock_ip,
+        mock_port,
         short_events
     ):
         """Verify replay completes in approximately expected time."""
         config = sr.SignalConfig(
             device_id='test',
-            ip_port=mock_ip_port,
+            ip=mock_ip,
+            udp_port=mock_port,
             cycle_length=0,
-            incompatible_pairs=[],
-            events=short_events
+            incompatible_pairs=[]
         )
+        
+        # Manually set events on signal config for replay
+        config.events = short_events
         
         replay = sr.SignalReplay(config, simulation_speed=1.0)
         expected = replay.get_run_duration()

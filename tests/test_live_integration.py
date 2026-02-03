@@ -53,7 +53,8 @@ def is_http_reachable(ip: str, port: int, timeout: float = 5.0) -> bool:
 def create_synthetic_events(
     duration_seconds: float,
     events_per_second: float = 2.0,
-    detector_groups: List[int] = [1, 2, 3]
+    detector_groups: List[int] = [1, 2, 3],
+    device_id: str = 'test'
 ) -> pd.DataFrame:
     """Create synthetic event data with known duration."""
     base_time = datetime(2024, 1, 1, 12, 0, 0)
@@ -68,7 +69,8 @@ def create_synthetic_events(
         events.append({
             'timestamp': timestamp,
             'event_id': event_id,
-            'parameter': detector
+            'parameter': detector,
+            'device_id': device_id
         })
     
     return pd.DataFrame(events)
@@ -148,16 +150,19 @@ class TestLiveSimulationTiming:
     @live_device
     def test_single_replay_timing(self, live_ip_port, short_events):
         """Test that a single SignalReplay runs in expected time."""
-        config = sr.SignalConfig(
+        signal_config = sr.SignalConfig(
             device_id='test',
-            ip_port=live_ip_port,
+            ip=live_ip_port[0],
+            udp_port=live_ip_port[1],
             cycle_length=0,
             incompatible_pairs=[],
-            events=short_events,
             http_port=None  # Disable collection for pure timing test
         )
         
-        replay = sr.SignalReplay(config, simulation_speed=1.0, debug=True)
+        # Manually set events on signal config for replay
+        signal_config.events = short_events
+        
+        replay = sr.SignalReplay(signal_config, simulation_speed=1.0, debug=True)
         expected_duration = replay.get_run_duration()
         
         print(f"\nExpected replay duration: {expected_duration:.2f}s")
@@ -192,21 +197,24 @@ class TestLiveSimulationTiming:
         """
         signal_config = sr.SignalConfig(
             device_id='test',
-            ip_port=live_ip_port,
+            ip=live_ip_port[0],
+            udp_port=live_ip_port[1],
             cycle_length=0,
             incompatible_pairs=[],
-            events=short_events,
             http_port=LIVE_DEVICE_HTTP_PORT  # Use correct HTTP port
         )
         
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
+            events=short_events,
             simulation_replays=1,
             stop_on_conflict=False,
             db_path=temp_db_path,
             simulation_speed=1.0
         )
         
+        # Manually set events on signal config for replay duration calculation
+        signal_config.events = short_events
         replay = sr.SignalReplay(signal_config, simulation_speed=1.0)
         expected_duration = replay.get_run_duration()
         
@@ -254,15 +262,16 @@ class TestLiveDataComparison:
         """
         signal_config = sr.SignalConfig(
             device_id='test',
-            ip_port=live_ip_port,
+            ip=live_ip_port[0],
+            udp_port=live_ip_port[1],
             cycle_length=0,
             incompatible_pairs=[],
-            events=short_events,
             http_port=LIVE_DEVICE_HTTP_PORT
         )
         
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
+            events=short_events,
             simulation_replays=2,
             stop_on_conflict=False,
             db_path=temp_db_path,
@@ -292,15 +301,16 @@ class TestLiveDataComparison:
         """Test that events are stored in the database."""
         signal_config = sr.SignalConfig(
             device_id='test',
-            ip_port=live_ip_port,
+            ip=live_ip_port[0],
+            udp_port=live_ip_port[1],
             cycle_length=0,
             incompatible_pairs=[],
-            events=short_events,
             http_port=LIVE_DEVICE_HTTP_PORT
         )
         
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
+            events=short_events,
             simulation_replays=1,
             stop_on_conflict=False,
             db_path=temp_db_path,

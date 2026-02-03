@@ -14,6 +14,9 @@ except ImportError:
     HAS_PYARROW = False
     pa = None
 
+# Sentinel value to indicate "use default"
+_USE_DEFAULT = object()
+
 
 @dataclass
 class SignalConfig:
@@ -22,33 +25,58 @@ class SignalConfig:
     
     Attributes:
         device_id: Unique identifier for the signal device
-        ip_port: Tuple of (IP address, port) for NTCIP communication
-        cycle_length: Cycle length in seconds for coordinated signals (0 = disabled)
-        cycle_offset: Offset in seconds within the cycle to start playback (0 = cycle boundary)
-        incompatible_pairs: List of phase/overlap pairs that should never be active together
+        ip: IP address for NTCIP/SNMP communication
         events: Hi-res event data as Arrow table, pandas DataFrame, or file path (str/Path)
+        udp_port: UDP port for SNMP communication. Required for localhost, defaults to 161 for remote hosts.
+        cycle_length: Cycle length in seconds for coordinated signals (0 = disabled, default)
+        incompatible_pairs: List of phase/overlap pairs that should never be active together. Optional - if not provided, conflict checking is disabled.
+        cycle_offset: Offset in seconds within the cycle to start playback (0 = cycle boundary)
         limit_minutes: Limit input events to the last N minutes (0 = no limit)
         buffer_minutes: Include additional buffer minutes before the last N minutes (0 = no buffer)
+        http_port: Port for HTTP data collection. Defaults to udp_port for localhost, 80 for remote hosts. Use None to disable.
     """
     device_id: str
-    ip_port: Tuple[str, int]
-    cycle_length: int
-    incompatible_pairs: List[Tuple[str, str]]
+    ip: str
     events: Union[pd.DataFrame, str, Path]  # Also accepts pyarrow.Table at runtime
+    udp_port: Optional[int] = None
+    cycle_length: int = 0
+    incompatible_pairs: Optional[List[Tuple[str, str]]] = None
     cycle_offset: float = 0.0
     limit_minutes: float = 0.0
     buffer_minutes: float = 0.0
+    http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
     
     def __post_init__(self):
-        # Validate ip_port format
-        if not isinstance(self.ip_port, tuple) or len(self.ip_port) != 2:
-            raise ValueError(f"ip_port must be a tuple of (host, port), got {self.ip_port}")
+        # Detect if this is localhost
+        is_localhost = self.ip.lower() in ('127.0.0.1', 'localhost')
         
-        host, port = self.ip_port
-        if not isinstance(host, str):
-            raise ValueError(f"IP address must be a string, got {type(host)}")
-        if not isinstance(port, int) or port < 1 or port > 65535:
-            raise ValueError(f"Port must be an integer between 1 and 65535, got {port}")
+        # Validate/default udp_port
+        if self.udp_port is None:
+            if is_localhost:
+                raise ValueError(
+                    f"udp_port is required when ip is localhost/127.0.0.1. "
+                    f"For emulators, specify the port configured in the emulator settings."
+                )
+            else:
+                self.udp_port = 161  # Default SNMP port for remote hosts
+        
+        # Validate udp_port range
+        if not isinstance(self.udp_port, int) or self.udp_port < 1 or self.udp_port > 65535:
+            raise ValueError(f"udp_port must be an integer between 1 and 65535, got {self.udp_port}")
+        
+        # Validate IP address
+        if not isinstance(self.ip, str) or not self.ip:
+            raise ValueError(f"ip must be a non-empty string, got {self.ip}")
+        
+        # Handle http_port defaulting
+        # If http_port is the sentinel value, apply defaults based on IP
+        if self.http_port is _USE_DEFAULT:
+            if is_localhost:
+                self.http_port = self.udp_port  # Match UDP port for localhost
+            else:
+                self.http_port = 80  # Default HTTP port for remote hosts
+        # If user explicitly passed None, keep it as None (disables HTTP collection)
+        # If user passed an int, keep that value
         
         # Validate cycle_length
         if not isinstance(self.cycle_length, int) or self.cycle_length < 0:
@@ -58,13 +86,16 @@ class SignalConfig:
         if not isinstance(self.cycle_offset, (int, float)) or self.cycle_offset < 0:
             raise ValueError(f"cycle_offset must be a non-negative number, got {self.cycle_offset}")
         
-        # Validate incompatible_pairs
-        if not isinstance(self.incompatible_pairs, list):
-            raise ValueError(f"incompatible_pairs must be a list, got {type(self.incompatible_pairs)}")
-        
-        for pair in self.incompatible_pairs:
-            if not isinstance(pair, tuple) or len(pair) != 2:
-                raise ValueError(f"Each incompatible pair must be a tuple of 2 strings, got {pair}")
+        # Normalize and validate incompatible_pairs
+        # None means no conflict checking (convert to empty list for internal use)
+        if self.incompatible_pairs is None:
+            self.incompatible_pairs = []
+        elif not isinstance(self.incompatible_pairs, list):
+            raise ValueError(f"incompatible_pairs must be a list or None, got {type(self.incompatible_pairs)}")
+        else:
+            for pair in self.incompatible_pairs:
+                if not isinstance(pair, tuple) or len(pair) != 2:
+                    raise ValueError(f"Each incompatible pair must be a tuple of 2 strings, got {pair}")
 
         # Validate limit_minutes and buffer_minutes
         if not isinstance(self.limit_minutes, (int, float)) or self.limit_minutes < 0:
@@ -82,6 +113,11 @@ class SignalConfig:
                 f"events must be a pandas DataFrame, Arrow Table, or file path, "
                 f"got {type(self.events)}"
             )
+    
+    @property
+    def ip_port(self) -> Tuple[str, int]:
+        """Get (ip, udp_port) tuple for SNMP communication."""
+        return (self.ip, self.udp_port)
 
 
 @dataclass
@@ -115,12 +151,12 @@ class SimulationConfig:
             if not isinstance(signal, SignalConfig):
                 raise ValueError(f"signals[{i}] must be a SignalConfig object, got {type(signal)}")
         
-        # Validate all cycle lengths match
-        cycle_lengths = set(s.cycle_length for s in self.signals)
-        if len(cycle_lengths) > 1:
+        # Validate all non-zero cycle lengths match (0 means disabled/uncoordinated)
+        non_zero_lengths = set(s.cycle_length for s in self.signals if s.cycle_length > 0)
+        if len(non_zero_lengths) > 1:
             raise ValueError(
-                f"All signals must have the same cycle_length. "
-                f"Found different values: {cycle_lengths}"
+                f"All signals with coordination enabled must have the same cycle_length. "
+                f"Found different values: {non_zero_lengths}"
             )
         
         # Validate simulation_replays

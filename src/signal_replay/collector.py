@@ -34,17 +34,18 @@ class ConflictRecord:
     conflict_details: str
 
 
-def fetch_output_data(ip_port: Tuple[str, int]) -> pd.DataFrame:
+def fetch_output_data(ip: str, http_port: int = 80) -> pd.DataFrame:
     """
     Fetch the event log from a MAXTIME controller.
     
     Args:
-        ip_port: Tuple of (IP address, port)
+        ip: IP address of the controller
+        http_port: HTTP port for data collection (default: 80)
     
     Returns:
         DataFrame with columns: TimeStamp, EventTypeID, Parameter
     """
-    url = f'http://{ip_port[0]}:{ip_port[1]}/v1/asclog/xml/full'
+    url = f'http://{ip}:{http_port}/v1/asclog/xml/full'
     
     response = requests.get(url, verify=False, timeout=30)
     response.raise_for_status()
@@ -186,6 +187,25 @@ class DatabaseManager:
         
         con.close()
     
+    def get_max_run_number(self) -> int:
+        """Get the maximum run number currently in the database."""
+        con = duckdb.connect(self.db_path)
+        try:
+            # Check both events and conflicts tables efficiently
+            res = con.execute("""
+                SELECT MAX(max_run) FROM (
+                    SELECT MAX(run_number) as max_run FROM events
+                    UNION ALL
+                    SELECT MAX(run_number) as max_run FROM conflicts
+                )
+            """).fetchone()
+            max_run = res[0] if res and res[0] is not None else 0
+            return int(max_run)
+        except Exception:
+            return 0
+        finally:
+            con.close()
+    
     def insert_events(
         self,
         df: pd.DataFrame,
@@ -240,12 +260,25 @@ class DatabaseManager:
         return rows_inserted
     
     def insert_conflict(self, conflict: ConflictRecord) -> None:
-        """Insert a conflict record into the database."""
+        """Insert a conflict record into the database if it doesn't already exist."""
         con = duckdb.connect(self.db_path)
-        con.execute("""
-            INSERT INTO conflicts (device_id, run_number, timestamp, conflict_details)
-            VALUES (?, ?, ?, ?)
-        """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details])
+        
+        # Check if this exact conflict already exists
+        existing = con.execute("""
+            SELECT COUNT(*) as count FROM conflicts 
+            WHERE device_id = ? 
+            AND run_number = ? 
+            AND timestamp = ? 
+            AND conflict_details = ?
+        """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details]).fetchone()
+        
+        # Only insert if it doesn't exist
+        if existing[0] == 0:
+            con.execute("""
+                INSERT INTO conflicts (device_id, run_number, timestamp, conflict_details)
+                VALUES (?, ?, ?, ?)
+            """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details])
+        
         con.close()
     
     def insert_input_events(self, df: pd.DataFrame, device_id: str) -> None:
@@ -379,7 +412,7 @@ class DataCollector:
     def __init__(
         self,
         db_path: str,
-        device_configs: Dict[str, Tuple[Tuple[str, int], List[Tuple[str, str]]]],
+        device_configs: Dict[str, Tuple[Tuple[str, int], List[Tuple[str, str]], Optional[int]]],
         collection_interval_minutes: float = 5.0,
         stop_on_conflict: bool = False,
         debug: bool = False
@@ -389,7 +422,7 @@ class DataCollector:
         
         Args:
             db_path: Path to DuckDB database
-            device_configs: Dict mapping device_id to (ip_port, incompatible_pairs)
+            device_configs: Dict mapping device_id to (ip_port, incompatible_pairs, http_port)
             collection_interval_minutes: How often to collect data
             stop_on_conflict: Whether to signal stop when conflict detected
             debug: Enable debug output
@@ -452,8 +485,15 @@ class DataCollector:
             print(f"Collecting data for run {run_number}...")
         
         # Fetch data for each device
-        for device_id, (ip_port, incompatible_pairs) in self.device_configs.items():
-            df = fetch_output_data(ip_port)
+        for device_id, (ip_port, incompatible_pairs, http_port) in self.device_configs.items():
+            # Skip collection if http_port is None
+            if http_port is None:
+                if self.debug:
+                    print(f"HTTP collection disabled for {device_id}")
+                continue
+            
+            ip = ip_port[0]
+            df = fetch_output_data(ip, http_port)
             
             if df.empty:
                 if self.debug:
@@ -469,7 +509,8 @@ class DataCollector:
             # Check for conflicts
             start = time.time()
             conflicts = check_conflicts(df, incompatible_pairs)
-            print(f"Conflict check for {device_id} took {time.time() - start:.2f} seconds")
+            if self.debug:
+                print(f"Conflict check for {device_id} took {time.time() - start:.2f} seconds")
             if not conflicts.empty:
                 if self.debug:
                     print(f"Conflicts found for {device_id}!")

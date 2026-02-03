@@ -245,6 +245,112 @@ class SignalReplay:
             return 0.0
         return self.activation_feed['sleep_time_cumulative'].max()
     
+    def get_source_comparison_events(self) -> pd.DataFrame:
+        """Load phase/overlap events from original source for comparison.
+        
+        This loads the same source data but filters to phase/overlap events
+        (COMPARISON_EVENT_IDS) instead of detector actuations. This allows
+        meaningful comparison between source and replay outputs.
+        
+        Returns:
+            DataFrame with timestamp, event_id, parameter columns containing
+            phase/overlap events from the original source data.
+        """
+        from .comparison import COMPARISON_EVENT_IDS
+        
+        events = self.config.events
+        comparison_df = None
+        
+        # Load based on event source type
+        if isinstance(events, pd.DataFrame):
+            comparison_df = self._load_comparison_from_dataframe(events)
+        elif HAS_PYARROW and isinstance(events, pa.Table):
+            comparison_df = self._load_comparison_from_dataframe(events.to_pandas())
+        elif isinstance(events, (str, Path)):
+            comparison_df = self._load_comparison_from_path(str(events))
+        else:
+            raise ValueError(f"Unsupported events type: {type(events)}")
+        
+        if comparison_df is None or comparison_df.empty:
+            return pd.DataFrame(columns=['timestamp', 'event_id', 'parameter'])
+        
+        # Filter to COMPARISON_EVENT_IDS
+        comparison_df = comparison_df[
+            comparison_df['event_id'].isin(COMPARISON_EVENT_IDS)
+        ].copy()
+        
+        # Apply same time window as input data
+        if self.input_buffer_start is not None:
+            comparison_df = comparison_df[
+                comparison_df['timestamp'] >= self.input_buffer_start
+            ].copy()
+        
+        return comparison_df.sort_values('timestamp').reset_index(drop=True)
+    
+    def _load_comparison_from_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Load comparison events from a DataFrame."""
+        df = df.copy()
+        
+        # Normalize column names
+        col_map = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower in ('timestamp', 'time_stamp'):
+                col_map[col] = 'timestamp'
+            elif col_lower in ('event_id', 'eventid', 'eventtypeid'):
+                col_map[col] = 'event_id'
+            elif col_lower in ('parameter', 'param', 'detector'):
+                col_map[col] = 'parameter'
+        
+        df = df.rename(columns=col_map)
+        
+        # Ensure we have the required columns
+        if 'timestamp' not in df.columns or 'event_id' not in df.columns:
+            raise ValueError("DataFrame must have timestamp and event_id columns")
+        
+        if 'parameter' not in df.columns:
+            df['parameter'] = 0
+        
+        # Ensure timestamp is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        return df[['timestamp', 'event_id', 'parameter']]
+    
+    def _load_comparison_from_path(self, path: str) -> pd.DataFrame:
+        """Load comparison events from a file path."""
+        suffix = Path(path).suffix.lower()
+        
+        if suffix in ('.db', '.sqlite', '.sqlite3'):
+            # Load from SQLite database
+            con = duckdb.connect()
+            con.execute(f"ATTACH DATABASE '{path}' AS SourceDB (TYPE SQLITE)")
+            con.execute("USE SourceDB")
+            
+            # Query all events (not just detector events)
+            sql = """
+                SELECT
+                    TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS timestamp,
+                    EventTypeID AS event_id,
+                    Parameter AS parameter
+                FROM Event
+                ORDER BY timestamp
+            """
+            df = con.execute(sql).df()
+            con.close()
+            return df
+        else:
+            # Load from CSV/Parquet with DuckDB
+            sql = f"""
+                SELECT
+                    timestamp::TIMESTAMP AS timestamp,
+                    event_id::int AS event_id,
+                    parameter::int AS parameter
+                FROM '{path}'
+                ORDER BY timestamp
+            """
+            return duckdb.sql(sql).df()
+    
     async def _send_command(self, row) -> None:
         """Send a single SNMP command via executor (non-blocking)."""
         loop = asyncio.get_event_loop()

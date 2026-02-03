@@ -119,14 +119,18 @@ def encode_categorical_sequence(
     encoding_map: Optional[Dict[Tuple[int, int], int]] = None
 ) -> Tuple[np.ndarray, Dict[Tuple[int, int], int]]:
     """
-    Encode (event_id, parameter) pairs as normalized numerical sequence.
+    Encode (event_id, parameter) pairs as integer sequence for categorical comparison.
+    
+    Each unique (event_id, parameter) combination is assigned a unique integer.
+    These are NOT normalized because we use a custom binary distance function
+    for categorical data: distance = 0 if values match exactly, 1 if they differ.
     
     Args:
         df: DataFrame with event_id and parameter columns
         encoding_map: Optional existing encoding map to use for consistency
     
     Returns:
-        Tuple of (encoded array normalized to [0,1], encoding map)
+        Tuple of (encoded integer array, encoding map)
     """
     if df.empty:
         return np.array([]), {}
@@ -139,20 +143,18 @@ def encode_categorical_sequence(
         unique_pairs = sorted(set(pairs))
         encoding_map = {pair: i for i, pair in enumerate(unique_pairs)}
     
-    # Encode pairs
+    # Encode pairs - use integer encoding, NOT normalized
+    # The distance function will treat these as categorical (match=0, mismatch=1)
     max_val = max(encoding_map.values()) if encoding_map else 0
     encoded = np.array([encoding_map.get(p, max_val + 1) for p in pairs], dtype=float)
-    
-    # Normalize to [0, 1]
-    if len(encoded) > 0 and encoded.max() > 0:
-        encoded = encoded / encoded.max()
     
     return encoded, encoding_map
 
 
 def compute_dtw(
     seq_a: np.ndarray,
-    seq_b: np.ndarray
+    seq_b: np.ndarray,
+    categorical: bool = False
 ) -> DTWResult:
     """
     Compute DTW distance and warping path between two sequences.
@@ -160,6 +162,10 @@ def compute_dtw(
     Args:
         seq_a: First sequence
         seq_b: Second sequence
+        categorical: If True, use binary distance (0=exact match, 1=mismatch).
+                    This is appropriate for encoded categorical data where
+                    numeric proximity has no meaning. If False, use standard
+                    Euclidean distance (appropriate for timing data).
     
     Returns:
         DTWResult with distance, path, and lengths
@@ -179,12 +185,79 @@ def compute_dtw(
             sequence_length_b=len(seq_b)
         )
     
-    # Compute DTW distance and path
-    distance = dtw.distance(seq_a, seq_b)
-    path = dtw.warping_path(seq_a, seq_b)
-    
-    # Normalize by path length
-    normalized_distance = distance / len(path) if path else float('inf')
+    if categorical:
+        # For categorical data, we transform the problem so that Euclidean
+        # DTW produces the correct alignment for categorical matching.
+        #
+        # Problem: Standard DTW uses |seq_a[i] - seq_b[j]| as distance.
+        # With integer encoding, adjacent categories (e.g., 4 and 5) would
+        # appear similar when they're actually completely different categories.
+        #
+        # Solution: Use one-hot encoding. For each position, create a vector
+        # where only the index matching the category value is 1, rest are 0.
+        # Then Euclidean distance between matching categories = 0, 
+        # and between different categories = sqrt(2) ≈ 1.41.
+        #
+        # For efficiency with many categories, we use a simpler approach:
+        # compute the distance matrix directly using binary distance.
+        
+        n, m = len(seq_a), len(seq_b)
+        
+        # Build distance matrix: 0 if values match, 1 if they differ
+        dist_matrix = np.ones((n, m), dtype=np.float64)
+        for i in range(n):
+            for j in range(m):
+                if seq_a[i] == seq_b[j]:
+                    dist_matrix[i, j] = 0.0
+        
+        # Compute DTW using the distance matrix
+        # dtaidistance doesn't directly support distance matrices,
+        # so we compute the cumulative cost matrix and path ourselves
+        
+        # Initialize cumulative cost matrix
+        cum_cost = np.full((n + 1, m + 1), np.inf)
+        cum_cost[0, 0] = 0.0
+        
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                cost = dist_matrix[i - 1, j - 1]
+                cum_cost[i, j] = cost + min(
+                    cum_cost[i - 1, j],      # insertion
+                    cum_cost[i, j - 1],      # deletion  
+                    cum_cost[i - 1, j - 1]   # match
+                )
+        
+        distance = float(cum_cost[n, m])
+        
+        # Backtrack to find the warping path
+        path = []
+        i, j = n, m
+        while i > 0 or j > 0:
+            path.append((i - 1, j - 1))  # Convert to 0-indexed
+            if i == 0:
+                j -= 1
+            elif j == 0:
+                i -= 1
+            else:
+                # Find which direction we came from
+                candidates = [
+                    (cum_cost[i - 1, j - 1], i - 1, j - 1),
+                    (cum_cost[i - 1, j], i - 1, j),
+                    (cum_cost[i, j - 1], i, j - 1),
+                ]
+                _, i, j = min(candidates, key=lambda x: x[0])
+        
+        path.reverse()
+        
+        # Normalize by path length (gives proportion of mismatches)
+        normalized_distance = distance / len(path) if path else float('inf')
+    else:
+        # Standard Euclidean DTW for numerical/timing data
+        distance = dtw.distance(seq_a, seq_b)
+        path = dtw.warping_path(seq_a, seq_b)
+        
+        # Normalize by path length
+        normalized_distance = distance / len(path) if path else float('inf')
     
     return DTWResult(
         distance=distance,
@@ -353,11 +426,11 @@ def compare_runs(
         time_a_norm = time_a
         time_b_norm = time_b
     
-    # Compute DTW for sequences
-    sequence_dtw = compute_dtw(seq_a, seq_b)
+    # Compute DTW for sequences (categorical - binary match/mismatch distance)
+    sequence_dtw = compute_dtw(seq_a, seq_b, categorical=True)
     
-    # Compute DTW for timing
-    timing_dtw = compute_dtw(time_a_norm, time_b_norm)
+    # Compute DTW for timing (numerical - Euclidean distance)
+    timing_dtw = compute_dtw(time_a_norm, time_b_norm, categorical=False)
     
     # Find divergence windows (use sequence path as primary)
     divergences = find_divergence_windows(
@@ -366,20 +439,20 @@ def compare_runs(
         time_b
     )
     
-    # Calculate match percentage based on warping path
-    # Perfect match = diagonal path, length = max(len_a, len_b)
-    # Actual path length vs diagonal gives mismatch
-    max_len = max(len(seq_a), len(seq_b))
-    if max_len > 0 and sequence_dtw.warping_path:
-        # Count how many path steps are diagonal (i+1, j+1)
-        diagonal_steps = 0
-        for k in range(1, len(sequence_dtw.warping_path)):
-            prev_i, prev_j = sequence_dtw.warping_path[k - 1]
-            curr_i, curr_j = sequence_dtw.warping_path[k]
-            if curr_i == prev_i + 1 and curr_j == prev_j + 1:
-                diagonal_steps += 1
-        
-        match_percentage = (diagonal_steps / max_len) * 100
+    # Calculate match percentage based on warping path alignment
+    # For each pair in the warping path, check if values match exactly.
+    # We use path_length as denominator since it represents the actual
+    # number of alignment decisions made by DTW.
+    path_length = len(sequence_dtw.warping_path)
+    if path_length > 0:
+        # Count exact matches along the warping path
+        matching_values = sum(
+            1 for i, j in sequence_dtw.warping_path
+            if seq_a[i] == seq_b[j]
+        )
+        # Match percentage = matches / path length
+        # This gives the proportion of aligned positions that match exactly
+        match_percentage = (matching_values / path_length) * 100
     else:
         match_percentage = 0.0
     
@@ -480,3 +553,84 @@ def format_comparison_summary(results: Dict[str, List[ComparisonResult]]) -> str
         lines.append("")
     
     return "\n".join(lines)
+
+def compare_event_sequences(
+    events_a: pd.DataFrame,
+    events_b: pd.DataFrame,
+    label_a: str = "A",
+    label_b: str = "B",
+    device_id: str = "device",
+    event_ids: Optional[List[int]] = None,
+    print_summary: bool = True
+) -> ComparisonResult:
+    """
+    Compare two event sequences directly using DTW.
+    
+    This is the main entry point for manual comparison of event data from
+    different sources (e.g., comparing runs across different simulations,
+    comparing logs from different time periods, etc.).
+    
+    Args:
+        events_a: First event DataFrame with columns: timestamp, event_id, parameter
+        events_b: Second event DataFrame with same columns
+        label_a: Label for first sequence (default "A")
+        label_b: Label for second sequence (default "B")
+        device_id: Optional device identifier (default "device")
+        event_ids: List of event IDs to include. If None, uses COMPARISON_EVENT_IDS
+        print_summary: If True, print a summary of the comparison
+    
+    Returns:
+        ComparisonResult with DTW distances, match percentage, and divergence windows
+    
+    Example:
+        >>> import pandas as pd
+        >>> import signal_replay as sr
+        >>> 
+        >>> # Load events from different sources
+        >>> run1_events = pd.read_csv('run1_events.csv')
+        >>> run2_events = pd.read_csv('run2_events.csv')
+        >>> 
+        >>> # Compare them
+        >>> result = sr.compare_event_sequences(
+        ...     run1_events, 
+        ...     run2_events,
+        ...     label_a="Run 1",
+        ...     label_b="Run 2"
+        ... )
+        >>> 
+        >>> # Access detailed results
+        >>> print(f"Match: {result.match_percentage:.1f}%")
+        >>> print(f"Sequence DTW: {result.sequence_dtw.normalized_distance:.4f}")
+        >>> print(f"Divergences: {len(result.divergence_windows)}")
+    """
+    result = compare_runs(
+        events_a=events_a,
+        events_b=events_b,
+        device_id=device_id,
+        run_a_label=label_a,
+        run_b_label=label_b,
+        event_ids=event_ids
+    )
+    
+    if print_summary:
+        print(f"\n{'='*60}")
+        print(f"DTW Comparison: {label_a} vs {label_b}")
+        print(f"{'='*60}")
+        print(f"  Sequence DTW (normalized): {result.sequence_dtw.normalized_distance:.4f}")
+        print(f"  Timing DTW (normalized):   {result.timing_dtw.normalized_distance:.4f}")
+        print(f"  Match Percentage:          {result.match_percentage:.1f}%")
+        print(f"  Divergence Windows:        {len(result.divergence_windows)}")
+        print(f"  Sequence A length:         {result.sequence_dtw.sequence_length_a}")
+        print(f"  Sequence B length:         {result.sequence_dtw.sequence_length_b}")
+        print(f"{'='*60}\n")
+        
+        if result.divergence_windows:
+            print("Divergence Windows (where sequences differ):")
+            for i, div in enumerate(result.divergence_windows, 1):
+                print(f"  {i}. A[{div.start_index_a}:{div.end_index_a}] @ "
+                      f"{div.start_time_delta_a:.2f}s - {div.end_time_delta_a:.2f}s")
+                print(f"     B[{div.start_index_b}:{div.end_index_b}] @ "
+                      f"{div.start_time_delta_b:.2f}s - {div.end_time_delta_b:.2f}s")
+            print()
+    
+    return result

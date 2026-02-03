@@ -1,247 +1,341 @@
 # Signal-Replay
 
-Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP.
+Replay historical traffic signal events to test controllers for **bug replication**, **software validation**, and **behavior comparison**.
 
-For now, it is set up to work with the MAXTIME emulator, but can be adapted to any controller due to using NTCIP.
+Signal-Replay reads high-resolution event logs, replays detector actuations via NTCIP/SNMP, monitors for phase conflicts, and uses Dynamic Time Warping to compare controller behavior across runs. All results are stored in DuckDB for analysis.
+
+## Features
+
+- **Replay** hi-res events to any ATC controller via NTCIP
+- **Detect conflicts** between incompatible phases/overlaps  
+- **Compare runs** using DTW to find behavioral differences
+- **Multi-signal** coordinated replay with parallel execution
+- **DuckDB storage** for SQL-based analysis
 
 ## Installation
 
 ```bash
-# Install from source (in development mode)
-pip install -e .
-
-# Or install dependencies only
-pip install -r requirements.txt
+pip install signal-replay
 ```
 
-## How it Works
+---
 
-1. Read vehicle/pedestrian/preempt inputs from hi-res data and converts them into detector group state integers per NTCIP 1202 v3 section 5.3.11.3 (page 275)
-2. State integers are then fed back to a test controller with SNMP
-3. Read the new event log from the test controller
-4. Check for phase/overlap conflicts (virtual conflict monitor)
-5. Compare output events to input events using DTW (Dynamic Time Warping)
-6. Repeat until a conflict is found or all replays complete
+## Example: Conflict Detection
 
-## Quick Start
+Replay events to a controller and monitor for phase conflicts:
 
 ```python
 import signal_replay as sr
 
-# Define signal configuration
 signal = sr.SignalConfig(
-    device_id='intersection_1',
-    ip_port=('127.0.0.1', 1025),
-    cycle_length=100,
+    device_id=0,
+    ip='192.0.2.10',
+    events='2025-01-15_events.csv',
     incompatible_pairs=[
-        ('Ph1', 'Ph5'),
-        ('Ph2', 'Ph6'),
-        ('Ph3', 'Ph7'),
-        ('Ph4', 'Ph8'),
-    ],
-    events='path/to/events.csv'  # or DataFrame, or Arrow Table
+        ('O5', 'Ph4'), ('O5', 'Ph8'),
+    ]
 )
 
-# Create simulation config
 config = sr.SimulationConfig(
     signals=[signal],
-    simulation_replays=3,
+    simulation_replays=40,
     stop_on_conflict=True,
-    db_path='./simulation_results.duckdb',
-    simulation_speed=1.0
+    db_path='./conflict_test.duckdb'
 )
 
-# Run simulation
-sim = sr.ATCSimulation(config, debug=True)
+sim = sr.ATCSimulation(config)
 results = sim.run()
-
-# Access results
-print(f"Completed runs: {results['completed_runs']}")
-print(f"Conflicts found: {len(results['conflicts'])}")
-print(results['comparison_summary'])
-
-# Query data
-events_df = sim.get_events(device_id='intersection_1', run_number=1)
-conflicts_df = sim.get_conflicts()
 ```
 
-## Multi-Signal Configuration
+**Output:**
+
+```
+Starting ATC simulation with 1 signals, 40 replays
+Estimated duration per run: 32:29
+
+--- Starting Run 1/40 ---
+Run 1 completed
+
+Conflict detected! Stopping simulation.
+
+--- Running Comparison Analysis ---
+
+============================================================
+SIMULATION COMPLETE
+============================================================
+
+Completed Runs: 1
+Conflicts Found: 2
+
+Conflicts:
+  [0] Run 1: O5 & Ph4; O5 & Ph8 at 2026-02-02 14:28:16.100000
+
+Comparison Summary:
+
+Device: 0
+  input vs 1: Sequence DTW=0.0034, Timing DTW=0.0001, Match=56.0%
+```
+
+---
+
+## Example: Multi-Signal with Emulators
+
+Test coordinated signals using MAXTIME emulators on localhost:
 
 ```python
 import signal_replay as sr
-import pandas as pd
 
-# Load event data (can be DataFrame, Arrow Table, or file path)
-events_signal_1 = pd.read_csv('signal_1_events.csv')
-events_signal_2 = 'signal_2_events.parquet'  # file path
-
-# Define incompatible pairs for each signal
-incompatible_pairs_1 = [
-    ('Ph1', 'Ph5'), ('Ph2', 'Ph6'),
-    ('O1', 'Ph5'), ('O1', 'Ph6'),
-]
-
-incompatible_pairs_2 = [
-    ('Ph1', 'Ph5'), ('Ph2', 'Ph6'),
-    ('Ph3', 'Ph7'), ('Ph4', 'Ph8'),
-]
-
-# Create signal configs
 signals = [
     sr.SignalConfig(
-        device_id='signal_1',
-        ip_port=('192.168.1.10', 1025),
+        device_id='main_1st',
+        ip='127.0.0.1',
+        udp_port=1025,          # Required for localhost
+        events='main_1st_events.csv',
         cycle_length=120,
-        incompatible_pairs=incompatible_pairs_1,
-        events=events_signal_1
+        cycle_offset=0,
     ),
     sr.SignalConfig(
-        device_id='signal_2',
-        ip_port=('192.168.1.11', 1025),
-        cycle_length=120,  # Must match across all signals
-        incompatible_pairs=incompatible_pairs_2,
-        events=events_signal_2
+        device_id='main_2nd',
+        ip='127.0.0.1',
+        udp_port=1026,
+        events='main_2nd_events.csv',
+        cycle_length=120,
+        cycle_offset=30,        # 30s offset from reference
     ),
 ]
 
-# Create and run simulation
 config = sr.SimulationConfig(
     signals=signals,
     simulation_replays=5,
-    stop_on_conflict=False,
-    db_path='./multi_signal_sim.duckdb',
-    simulation_speed=1.0,
-    collection_interval_minutes=5.0
+    db_path='./coordination_test.duckdb'
 )
 
 sim = sr.ATCSimulation(config, debug=True)
 results = sim.run()
 ```
 
-## Quick Run Helper
+---
 
-For simpler use cases, use the `quick_run` helper:
+## Querying Results with DuckDB
+
+All events, conflicts, and comparisons are stored in DuckDB:
 
 ```python
-import signal_replay as sr
+import duckdb
 
-results = sr.quick_run(
-    signals=[
-        {
-            'device_id': 'signal_1',
-            'ip_port': ('127.0.0.1', 1025),
-            'cycle_length': 100,
-            'incompatible_pairs': [('Ph1', 'Ph5')],
-            'events': 'events.csv'
-        }
-    ],
-    simulation_replays=3,
-    stop_on_conflict=True,
-    debug=True
-)
+con = duckdb.connect('./conflict_test.duckdb')
+
+# Find all conflicts
+conflicts = con.execute("""
+    SELECT timestamp, conflict_details, run_number
+    FROM conflicts
+    ORDER BY timestamp
+""").df()
+
+print(conflicts)
 ```
 
-## Features
+| timestamp | conflict_details | run_number |
+|-----------|------------------|------------|
+| 2026-02-02 14:28:16.100 | O5 & Ph4; O5 & Ph8 | 1 |
 
-### Conflict Detection
-- Virtual conflict monitor checks for incompatible phase/overlap combinations
-- Conflicts are logged to DuckDB database with timestamps and details
-- Optional `stop_on_conflict` to halt simulation immediately
+```python
+# Compare phase green times across runs
+phase_greens = con.execute("""
+    SELECT 
+        run_number,
+        parameter as phase,
+        COUNT(*) as green_count,
+        MIN(timestamp) as first_green,
+        MAX(timestamp) as last_green
+    FROM events
+    WHERE event_id = 1  -- Phase On
+    GROUP BY run_number, parameter
+    ORDER BY run_number, parameter
+""").df()
 
-### Data Collection
-- Automatic polling of controller event logs every 5 minutes (configurable)
-- Events stored in DuckDB with `run_number` for tracking
-- Deduplication via destructive left join on `(device_id, timestamp, event_id, parameter)`
+print(phase_greens)
+```
 
-### DTW Comparison
-- Compares output events to input events using Dynamic Time Warping
-- Separate DTW analysis for event sequences and timing
-- Identifies divergence windows where runs differ
-- Calculates match percentage for similarity scoring
+| run_number | phase | green_count | first_green | last_green |
+|------------|-------|-------------|-------------|------------|
+| 1 | 1 | 42 | 2025-01-15 14:00:01 | 2025-01-15 14:32:15 |
+| 1 | 2 | 38 | 2025-01-15 14:00:45 | 2025-01-15 14:31:52 |
+| 2 | 1 | 42 | 2025-01-15 14:00:01 | 2025-01-15 14:32:14 |
 
-### Coordinated Signals
-- Enter the cycle length to wait until the right time in the next cycle to begin simulation
-- Ensures coordinated signals stay in sync during replay
+---
 
-### Speed Control
-- Set `simulation_speed` to run faster than real-time
-- Useful for testing long event logs quickly
+## Dynamic Time Warping (DTW)
+
+Signal-Replay uses DTW to compare event sequences between runs. DTW aligns two time series by finding the optimal "warping path" that minimizes the total distance between matched points, even when events are shifted in time.
+
+**How it works:**
+
+1. **Sequence encoding**: Each `(event_id, parameter)` pair is encoded as a categorical value
+2. **Categorical DTW**: For sequence comparison, a binary distance metric is used (0 = exact match, 1 = different event). This ensures that `(event_id=1, param=5)` "Phase 5 Green" is treated as completely different from `(event_id=1, param=6)` "Phase 6 Green" — there's no concept of "similar" for categorical events
+3. **Timing DTW**: For timing comparison, standard Euclidean distance is used since timing values are numerical
+4. **DTW alignment**: The algorithm finds the best alignment between runs, allowing for insertions, deletions, and timing shifts
+5. **Divergence detection**: Large jumps in the warping path indicate where sequences diverge
+6. **Match percentage**: Ratio of exactly matching events along the aligned path
+
+**Metrics reported:**
+
+| Metric | Meaning |
+|--------|---------|
+| Sequence DTW | Distance based on event type differences (lower = more similar) |
+| Timing DTW | Distance based on event timing differences (lower = more similar) |
+| Match % | Percentage of events that match along the warping path |
+
+**Example interpretation:**
+- `Sequence DTW=0.001, Match=99%` → Nearly identical runs
+- `Sequence DTW=0.08, Match=92%` → Runs diverged, possibly around a conflict or timing change
+
+### Manual Comparison
+
+You can compare any two event DataFrames directly, which is useful for:
+- Comparing runs from different simulations
+- Comparing events from different time periods
+- Cross-comparing runs that aren't consecutive
+
+```python
+import pandas as pd
+import signal_replay as sr
+
+# Load events from any source
+events_a = pd.read_csv('simulation_1/run_3.csv')
+events_b = pd.read_csv('simulation_2/run_7.csv')
+
+# Compare them directly
+result = sr.compare_event_sequences(
+    events_a,
+    events_b,
+    label_a="Sim1 Run3",
+    label_b="Sim2 Run7"
+)
+
+# Output:
+# ============================================================
+# DTW Comparison: Sim1 Run3 vs Sim2 Run7
+# ============================================================
+#   Sequence DTW (normalized): 0.0234
+#   Timing DTW (normalized):   0.0156
+#   Match Percentage:          97.2%
+#   Divergence Windows:        2
+#   Sequence A length:         1542
+#   Sequence B length:         1538
+# ============================================================
+```
+
+Access detailed results programmatically:
+
+```python
+# Suppress automatic printing for scripted use
+result = sr.compare_event_sequences(
+    events_a, events_b,
+    label_a="A", label_b="B",
+    print_summary=False
+)
+
+print(f"Match: {result.match_percentage:.1f}%")
+print(f"Sequence similarity: {1 - result.sequence_dtw.normalized_distance:.2%}")
+
+# Examine divergence windows
+for div in result.divergence_windows:
+    print(f"Divergence at {div.start_time_delta_a:.1f}s - {div.end_time_delta_a:.1f}s")
+```
+
+Access raw comparison results from a simulation:
+
+```python
+comparison = sim.get_comparison_results()
+for device_id, results in comparison.items():
+    for r in results:
+        print(f"{r.run_a} vs {r.run_b}: {len(r.divergence_windows)} divergences")
+```
+
+---
+
+## Configuration Reference
+
+### SignalConfig
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `device_id` | str | *required* | Unique identifier |
+| `ip` | str | *required* | Controller IP |
+| `events` | DataFrame/Path | *required* | Hi-res event data |
+| `udp_port` | int | 161 | SNMP port. **Required for localhost** |
+| `cycle_length` | int | 0 | Cycle length for coordination (0 = disabled) |
+| `cycle_offset` | float | 0.0 | Offset from cycle start (use with `cycle_length`) |
+| `incompatible_pairs` | list | None | Phase pairs to monitor. Omit to disable conflict checking |
+| `http_port` | int/None | Auto | HTTP port for log collection. `None` disables |
+| `limit_minutes` | float | 0.0 | Only replay last N minutes |
+| `buffer_minutes` | float | 0.0 | Lead-in minutes when using `limit_minutes` |
+
+### SimulationConfig
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `signals` | list | *required* | List of `SignalConfig` |
+| `simulation_replays` | int | 1 | Number of replay runs |
+| `stop_on_conflict` | bool | False | Stop on first conflict |
+| `db_path` | str | `./atc_replay.duckdb` | Database path |
+| `simulation_speed` | float | 1.0 | Speed multiplier |
+
+---
 
 ## Event Data Format
 
-Input events should have these columns (names are flexible):
-- `timestamp` / `TimeStamp` / `time`: Event timestamp
-- `event_id` / `EventId` / `EventTypeID`: Event type code
-- `parameter` / `Parameter` / `Detector`: Event parameter (detector number, phase, etc.)
+Input events require these columns (flexible naming):
 
-Optionally:
-- `device_id` / `DeviceId`: Device identifier (added automatically if not present)
+| Column | Alternatives | Description |
+|--------|--------------|-------------|
+| timestamp | `TimeStamp`, `time` | Event timestamp |
+| event_id | `EventId`, `EventTypeID` | Event type code |
+| parameter | `Parameter`, `Detector` | Phase/detector number |
 
-## Database Schema
+---
 
-The simulation stores data in a DuckDB database:
+<details>
+<summary><strong>Database Schema</strong></summary>
 
-### `events` table
-| Column | Type | Description |
-|--------|------|-------------|
-| device_id | VARCHAR | Device identifier |
-| run_number | INTEGER | Simulation run number |
-| timestamp | TIMESTAMP | Event timestamp |
-| event_id | INTEGER | Event type code |
-| parameter | INTEGER | Event parameter |
+**`events`** — Output events from controller
 
-### `conflicts` table
-| Column | Type | Description |
-|--------|------|-------------|
-| device_id | VARCHAR | Device identifier |
-| run_number | INTEGER | Simulation run number |
-| timestamp | TIMESTAMP | Conflict timestamp |
-| conflict_details | VARCHAR | Description of conflicting phases |
+| Column | Type |
+|--------|------|
+| device_id | VARCHAR |
+| run_number | INTEGER |
+| timestamp | TIMESTAMP |
+| event_id | INTEGER |
+| parameter | INTEGER |
 
-### `input_events` table
-| Column | Type | Description |
-|--------|------|-------------|
-| device_id | VARCHAR | Device identifier |
-| timestamp | TIMESTAMP | Event timestamp |
-| event_id | INTEGER | Event type code |
-| parameter | INTEGER | Event parameter |
+**`conflicts`** — Detected conflicts
 
-## Legacy Usage
+| Column | Type |
+|--------|------|
+| device_id | VARCHAR |
+| run_number | INTEGER |
+| timestamp | TIMESTAMP |
+| conflict_details | VARCHAR |
 
-The original `ATCReplay` class is still available in [atc_replay.py](atc_replay.py) for backwards compatibility. See [Example.ipynb](Example.ipynb) for legacy usage.
+**`input_events`** — Source events for comparison
 
-## Project Structure
+| Column | Type |
+|--------|------|
+| device_id | VARCHAR |
+| timestamp | TIMESTAMP |
+| event_id | INTEGER |
+| parameter | INTEGER |
 
-```
-ATC-Signal-Replay/
-├── src/
-│   └── atc_signal_replay/
-│       ├── __init__.py
-│       ├── config.py          # Configuration classes
-│       ├── ntcip.py           # SNMP communication
-│       ├── replay.py          # Event replay logic
-│       ├── collector.py       # Data collection & conflict detection
-│       ├── comparison.py      # DTW comparison analysis
-│       ├── orchestrator.py    # Main simulation orchestrator
-│       └── sql/               # SQL templates
-├── pyproject.toml
-├── requirements.txt
-├── Example.ipynb              # Legacy example
-├── test_package.ipynb         # Package testing notebook
-└── [project folders]          # Various testing projects
-```
+</details>
 
-## Requirements
+---
 
-- Python 3.9+
-- DuckDB
-- pandas
-- pysnmplib
-- requests
-- jinja2
-- dtaidistance
-- pyarrow (optional, for Arrow table support)
+## Compatibility
+
+- **Sending actuations**: Any NTCIP 1202 v3 controller
+- **Reading logs**: MAXTIME controllers (others can be added)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE)

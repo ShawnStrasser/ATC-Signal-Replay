@@ -4,7 +4,7 @@ from ATC signal controllers back to test controllers using NTCIP.
 """
 
 from .config import SignalConfig, SimulationConfig
-from .orchestrator import ATCSimulation, quick_run
+from .orchestrator import ATCSimulation
 from .replay import SignalReplay, create_replays
 from .collector import (
     DatabaseManager,
@@ -23,6 +23,7 @@ from .comparison import (
     compute_dtw,
     compare_runs,
     compare_all_runs,
+    compare_event_sequences,
     format_comparison_summary,
 )
 from .ntcip import send_ntcip, reset_all_detectors
@@ -33,7 +34,6 @@ __all__ = [
     "ATCSimulation",
     "SimulationConfig",
     "SignalConfig",
-    "quick_run",
     "SignalReplay",
     "create_replays",
     "DatabaseManager",
@@ -50,6 +50,7 @@ __all__ = [
     "compute_dtw",
     "compare_runs",
     "compare_all_runs",
+    "compare_event_sequences",
     "format_comparison_summary",
     "send_ntcip",
     "reset_all_detectors",

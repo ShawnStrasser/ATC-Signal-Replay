@@ -241,13 +241,93 @@ for div in result.divergence_windows:
     print(f"Divergence at {div.start_time_delta_a:.1f}s - {div.end_time_delta_a:.1f}s")
 ```
 
-Access raw comparison results from a simulation:
+---
+
+## Comparison Visualization
+
+Compare any two event logs and generate an interactive Gantt chart showing signal phase timing side-by-side:
 
 ```python
-comparison = sim.get_comparison_results()
-for device_id, results in comparison.items():
-    for r in results:
-        print(f"{r.run_a} vs {r.run_b}: {len(r.divergence_windows)} divergences")
+import signal_replay as sr
+
+result = sr.compare_and_visualize(
+    events_a='input_events.csv',      # Path, DataFrame, or .db file
+    events_b='output_run_0.csv',
+    label_a='Input Events',
+    label_b='Output Run 0',
+    output_dir='./comparison_plots',
+    output_name='my_comparison',
+    
+    # Optional thresholds
+    match_threshold=95.0,      # Warn if match < 95%
+    sequence_threshold=0.05,   # Warn if sequence DTW > 0.05
+    timing_threshold=0.02,     # Warn if timing DTW > 0.02
+)
+```
+
+**Output:**
+```
+============================================================
+Comparison: Input Events vs Output Run 0
+============================================================
+  Match Percentage:  97.2%  (threshold: ≥95.0%)
+    ✓  PASS
+  Events in A: 620
+  Events in B: 615
+  Divergences: 1
+============================================================
+✓  ALL THRESHOLDS MET
+Saved comparison chart to: comparison_plots/my_comparison.html
+```
+
+### Supported Input Formats
+
+The `compare_and_visualize` function accepts multiple input formats:
+
+| Format | Example |
+|--------|---------|
+| CSV file | `'events.csv'` |
+| Parquet file | `'events.parquet'` |
+| SQLite database | `'results.db'` (reads `events` table) |
+| DuckDB database | `'results.duckdb'` (reads `events` table) |
+| pandas DataFrame | `pd.DataFrame(...)` |
+
+### Gantt Chart Features
+
+The generated HTML chart includes:
+- **Two-panel layout**: Original events on top, replay on bottom
+- **Color-coded phases**: Green, Yellow, Red, and Overlap states
+- **Interactive hover**: Shows start time and duration for each state
+- **Divergence markers**: Red vertical lines indicate where sequences diverged
+- **Zoom/Pan**: Use Plotly's built-in tools to explore the timeline
+
+### Threshold Interpretation
+
+| Metric | Good Value | Meaning |
+|--------|------------|---------|
+| Match % | ≥95% | Percentage of events that align exactly |
+| Sequence DTW | <0.05 | Lower = more similar event sequences |
+| Timing DTW | <0.02 | Lower = more similar event timing |
+
+**Understanding the relationship:**
+- **Match %** = `1 - Sequence DTW` (approximately)
+- A low Match % with low Sequence DTW indicates timing shifts but similar sequences
+- High Sequence DTW with high Match % is rare but indicates the DTW found a good alignment despite many differences
+
+### Database Storage
+
+Comparison results are automatically stored in the simulation database for SQL analysis:
+
+```sql
+-- Find all comparisons with poor match percentage
+SELECT device_id, run_a, run_b, match_percentage
+FROM comparison_results
+WHERE match_percentage < 90
+ORDER BY match_percentage ASC;
+
+-- Get divergence details
+SELECT * FROM divergence_windows
+WHERE device_id = '0' AND run_a = 'input';
 ```
 
 ---
@@ -353,6 +433,32 @@ Input events require these columns (flexible naming):
 | timestamp | TIMESTAMP |
 | event_id | INTEGER |
 | parameter | INTEGER |
+
+**`comparison_results`** — DTW comparison metrics
+
+| Column | Type | Description |
+|--------|------|-------------|
+| device_id | VARCHAR | Signal identifier |
+| run_a | VARCHAR | First run label (e.g., 'input') |
+| run_b | VARCHAR | Second run label (e.g., '1') |
+| sequence_dtw | DOUBLE | Normalized sequence DTW distance |
+| timing_dtw | DOUBLE | Normalized timing DTW distance |
+| match_percentage | DOUBLE | Percentage of aligned events that match |
+| divergence_count | INTEGER | Number of divergence windows |
+| computed_at | TIMESTAMP | When comparison was performed |
+
+**`divergence_windows`** — Detected divergence periods
+
+| Column | Type | Description |
+|--------|------|-------------|
+| device_id | VARCHAR | Signal identifier |
+| run_a | VARCHAR | First run label |
+| run_b | VARCHAR | Second run label |
+| start_time_a | TIMESTAMP | Start of divergence in run A |
+| end_time_a | TIMESTAMP | End of divergence in run A |
+| start_time_b | TIMESTAMP | Start of divergence in run B |
+| end_time_b | TIMESTAMP | End of divergence in run B |
+| severity | DOUBLE | Relative divergence magnitude |
 
 </details>
 

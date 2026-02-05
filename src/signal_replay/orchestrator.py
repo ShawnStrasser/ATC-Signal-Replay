@@ -14,7 +14,18 @@ import pandas as pd
 from .config import SimulationConfig, SignalConfig
 from .replay import SignalReplay, create_replays
 from .collector import DatabaseManager, DataCollector, fetch_output_data, check_conflicts
-from .comparison import compare_all_runs, format_comparison_summary, ComparisonResult
+from .comparison import (
+    compare_all_runs, 
+    format_comparison_summary, 
+    ComparisonResult,
+    ComparisonThresholds,
+    compare_runs,
+    compare_and_visualize,
+    store_comparison_result,
+    generate_timeline,
+    prepare_events_for_comparison,
+    HAS_ATSPM
+)
 
 
 def _load_events(events: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
@@ -101,6 +112,11 @@ class ATCSimulation:
             events='all_events.csv',  # Centralized, filtered by device_id
             replays=5
         )
+    
+    Comparison Thresholds:
+        Set comparison_thresholds to control when plots are generated.
+        If a comparison exceeds thresholds and output_dir is set, 
+        Gantt charts will be automatically generated.
     """
     
     def __init__(
@@ -113,6 +129,8 @@ class ATCSimulation:
         stop_on_conflict: bool = False,
         db_path: str = "./atc_replay.duckdb",
         simulation_speed: float = 1.0,
+        comparison_thresholds: Optional[ComparisonThresholds] = None,
+        output_dir: Optional[Union[str, Path]] = None,
         debug: bool = False
     ):
         """
@@ -127,9 +145,15 @@ class ATCSimulation:
             stop_on_conflict: Stop simulation on first conflict
             db_path: Path to DuckDB database
             simulation_speed: Speed multiplier (1.0 = real-time)
+            comparison_thresholds: Thresholds for triggering comparison alerts.
+                If None, uses defaults (sequence=0.05, timing=0.02, match=95%).
+            output_dir: Directory to save comparison plots when thresholds exceeded.
+                If None, no plots are generated.
             debug: Enable debug output
         """
         self.debug = debug
+        self.comparison_thresholds = comparison_thresholds or ComparisonThresholds()
+        self.output_dir = Path(output_dir) if output_dir else None
         
         # Handle legacy vs streamlined initialization
         if config is not None:
@@ -364,7 +388,7 @@ class ATCSimulation:
         return results
     
     def _run_comparison(self) -> None:
-        """Run DTW comparison analysis on all collected data."""
+        """Run DTW comparison analysis on all collected data with threshold checks."""
         device_ids = [sig.device_id for sig in self.config.signals]
         
         self._comparison_results = compare_all_runs(
@@ -373,6 +397,117 @@ class ATCSimulation:
             self._completed_runs,
             include_input_comparison=True
         )
+        
+        # Check thresholds and generate plots for each comparison
+        self._check_thresholds_and_plot()
+    
+    def _check_thresholds_and_plot(self) -> None:
+        """Check comparison thresholds and generate plots when exceeded."""
+        if not self._comparison_results:
+            return
+        
+        for device_id, comparisons in self._comparison_results.items():
+            for result in comparisons:
+                # Add threshold info to result
+                result.thresholds = self.comparison_thresholds
+                exceeded, reason = self.comparison_thresholds.exceeds_threshold(
+                    result.sequence_dtw.normalized_distance,
+                    result.timing_dtw.normalized_distance,
+                    result.match_percentage
+                )
+                result.exceeds_threshold = exceeded
+                result.threshold_reason = reason
+                
+                # Store result in database
+                try:
+                    store_comparison_result(self.config.db_path, result)
+                except Exception as e:
+                    if self.debug:
+                        print(f"Failed to store comparison result: {e}")
+                
+                # Generate plot if threshold exceeded and output_dir configured
+                if exceeded and self.output_dir:
+                    self._generate_comparison_plot(device_id, result)
+                elif exceeded:
+                    print(f"\n⚠️  Threshold exceeded for {device_id} ({result.run_a} vs {result.run_b}):")
+                    print(f"    {reason}")
+                    print(f"    Set output_dir to generate comparison plots.")
+    
+    def _generate_comparison_plot(self, device_id: str, result: ComparisonResult) -> None:
+        """Generate Gantt chart for a comparison that exceeded thresholds."""
+        if not HAS_ATSPM:
+            if self.debug:
+                print("Cannot generate plots: 'atspm' package not installed")
+            return
+        if not HAS_PLOTLY:
+            if self.debug:
+                print("Cannot generate plots: 'plotly' package not installed")
+            return
+        
+        try:
+            # Get events for both runs
+            if result.run_a == "input":
+                events_a = self.db.get_input_events(device_id=device_id)
+            else:
+                events_a = self.db.get_events(device_id=device_id, run_number=int(result.run_a))
+            
+            events_b = self.db.get_events(device_id=device_id, run_number=int(result.run_b))
+            
+            if events_a.empty or events_b.empty:
+                if self.debug:
+                    print(f"No events to plot for {device_id}")
+                return
+            
+            # Find divergence time
+            divergence_start = None
+            divergence_end = None
+            
+            if result.divergence_windows:
+                df_a_prep = prepare_events_for_comparison(events_a)
+                if not df_a_prep.empty:
+                    first_div = result.divergence_windows[0]
+                    if first_div.start_index_a < len(df_a_prep):
+                        divergence_start = df_a_prep.iloc[first_div.start_index_a]['timestamp']
+                    if first_div.end_index_a < len(df_a_prep):
+                        divergence_end = df_a_prep.iloc[first_div.end_index_a]['timestamp']
+            
+            # Generate timelines
+            timeline_a = generate_timeline(events_a, device_id=device_id)
+            timeline_b = generate_timeline(events_b, device_id=device_id)
+            
+            # Create output filename
+            label_a = str(result.run_a)
+            label_b = str(result.run_b)
+            output_name = f"{device_id}_{label_a}_vs_{label_b}".replace(' ', '_')
+            output_path = self.output_dir / f"{output_name}.png"
+            
+            # Create Gantt chart
+            if HAS_MATPLOTLIB:
+                from .comparison import create_comparison_gantt_matplotlib
+                import matplotlib.pyplot as plt
+                
+                fig = create_comparison_gantt_matplotlib(
+                    timeline_a=timeline_a,
+                    timeline_b=timeline_b,
+                    label_a=f"Run {label_a}" if label_a != "input" else "Input",
+                    label_b=f"Run {label_b}",
+                    title=f"Device {device_id}: {label_a} vs {label_b}",
+                    divergence_start=divergence_start,
+                    divergence_end=divergence_end,
+                    output_path=output_path,
+                    window_minutes=5.0
+                )
+                if fig:
+                    plt.close(fig)
+            
+            result.plot_path = str(output_path)
+            
+            if self.debug:
+                print(f"Generated comparison plot: {output_path}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"Failed to generate plot for {device_id}: {e}")
     
     def _print_summary(self) -> None:
         """Print final simulation summary."""
@@ -391,6 +526,20 @@ class ATCSimulation:
         
         if self._comparison_results:
             print("\n" + self.get_comparison_summary())
+            
+            # Print threshold alerts
+            alerts = []
+            for device_id, comparisons in self._comparison_results.items():
+                for result in comparisons:
+                    if hasattr(result, 'exceeds_threshold') and result.exceeds_threshold:
+                        alerts.append((device_id, result))
+            
+            if alerts:
+                print("\n⚠️  THRESHOLD ALERTS:")
+                for device_id, result in alerts:
+                    print(f"  [{device_id}] {result.run_a} vs {result.run_b}: {result.threshold_reason}")
+                    if result.plot_path:
+                        print(f"      Plot: {result.plot_path}")
     
     def get_events(
         self,

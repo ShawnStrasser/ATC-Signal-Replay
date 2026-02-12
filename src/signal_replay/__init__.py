@@ -34,6 +34,9 @@ from .comparison import (
     generate_timeline,
     create_comparison_gantt_matplotlib,
     store_comparison_result,
+    find_alignment_offset,
+    calculate_timeline_offset,
+    compute_timeline_offset,
 )
 from .ntcip import send_ntcip, reset_all_detectors
 from . import collector, comparison, config, ntcip, orchestrator, replay

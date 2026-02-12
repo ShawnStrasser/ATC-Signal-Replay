@@ -105,7 +105,12 @@ class DTWResult:
 
 @dataclass 
 class DivergenceWindow:
-    """A window where two sequences diverge significantly."""
+    """A window where two sequences diverge significantly.
+    
+    Time fields:
+        start_time_delta_a/b: Seconds from the ALIGNED start (after trimming)
+        original_start_seconds_a/b: Seconds from the ORIGINAL run start (before trimming)
+    """
     start_index_a: int
     end_index_a: int
     start_index_b: int
@@ -118,6 +123,13 @@ class DivergenceWindow:
     end_timestamp_a: Optional[datetime] = None
     start_timestamp_b: Optional[datetime] = None
     end_timestamp_b: Optional[datetime] = None
+    # Human-readable description of the divergence
+    description: str = ""
+    # Seconds from original run start (before alignment trimming)
+    original_start_seconds_a: float = 0.0
+    original_end_seconds_a: float = 0.0
+    original_start_seconds_b: float = 0.0
+    original_end_seconds_b: float = 0.0
 
 
 @dataclass
@@ -130,12 +142,53 @@ class ComparisonResult:
     timing_dtw: DTWResult
     divergence_windows: List[DivergenceWindow]
     match_percentage: float
+    # Alignment offset applied (positive = skipped groups from B, negative = from A)
+    alignment_offset: int = 0
     # Optional: threshold info for storage
     thresholds: Optional[ComparisonThresholds] = None
     exceeds_threshold: bool = False
     threshold_reason: str = ""
     # Optional: plot path if generated
     plot_path: Optional[str] = None
+    # Timing analysis: stats on time differences between matched event groups
+    timing_stats: Optional[Dict] = None
+    # How much time was trimmed from each sequence during alignment
+    alignment_trim_seconds_a: float = 0.0
+    alignment_trim_seconds_b: float = 0.0
+    
+    def format_summary(self) -> str:
+        """Return a human-readable summary of the comparison."""
+        lines = []
+        lines.append(f"Match: {self.match_percentage:.1f}%")
+        if self.alignment_offset != 0:
+            direction = "B" if self.alignment_offset > 0 else "A"
+            lines.append(f"Alignment: trimmed {abs(self.alignment_offset)} timestamp groups "
+                         f"from {direction} start "
+                         f"({self.alignment_trim_seconds_a:.1f}s from A, "
+                         f"{self.alignment_trim_seconds_b:.1f}s from B)")
+        
+        if self.divergence_windows:
+            lines.append(f"Divergences: {len(self.divergence_windows)}")
+            for i, div in enumerate(self.divergence_windows, 1):
+                if div.description:
+                    lines.append(f"  {i}. {div.description}")
+                else:
+                    lines.append(f"  {i}. A: {div.original_start_seconds_a:.1f}s - "
+                                 f"{div.original_end_seconds_a:.1f}s, "
+                                 f"B: {div.original_start_seconds_b:.1f}s - "
+                                 f"{div.original_end_seconds_b:.1f}s")
+        else:
+            lines.append("Divergences: 0")
+        
+        if self.timing_stats:
+            ts = self.timing_stats
+            residual = ts.get('alignment_residual', 0.0)
+            lines.append(f"Timing: jitter std={ts['std_diff']:.3f}s, "
+                         f"max={ts['max_abs_diff']:.3f}s, "
+                         f"95th pctl={ts['p95_abs_diff']:.3f}s"
+                         + (f" (alignment residual={residual:+.1f}s)" if abs(residual) > 0.05 else ""))
+        
+        return "\n".join(lines)
 
 
 @dataclass
@@ -194,8 +247,10 @@ def prepare_events_for_comparison(
     if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
         df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Sort by timestamp
-    df = df.sort_values('timestamp').reset_index(drop=True)
+    # Sort by timestamp, then by event_id and parameter for consistent ordering
+    # Events at the same timestamp can appear in different order between runs,
+    # so sorting by all three columns ensures DTW sees them in the same order.
+    df = df.sort_values(['timestamp', 'event_id', 'parameter']).reset_index(drop=True)
     
     # Calculate time delta from start
     if start_time is None:
@@ -362,31 +417,42 @@ def compute_dtw(
 
 def find_divergence_windows(
     warping_path: List[Tuple[int, int]],
+    seq_a: np.ndarray,
+    seq_b: np.ndarray,
     time_deltas_a: np.ndarray,
     time_deltas_b: np.ndarray,
-    jump_threshold: int = 3
+    jump_threshold: int = 3,
+    mismatch_window: int = 5
 ) -> List[DivergenceWindow]:
     """
-    Find windows where sequences diverge based on warping path.
+    Find windows where sequences diverge based on the warping path.
     
-    A divergence occurs when the warping path shows large jumps,
-    indicating one sequence has events not matched in the other.
+    A divergence is detected in TWO ways:
+    1. **Structural divergence**: Large jumps in the warping path, indicating
+       one sequence has events not present in the other (insertions/deletions).
+    2. **Value divergence**: A window of consecutive mismatches along the path,
+       indicating the sequences have different event types at aligned positions.
     
     Args:
         warping_path: DTW warping path as list of (i, j) tuples
+        seq_a: Encoded sequence A (for checking value matches)
+        seq_b: Encoded sequence B
         time_deltas_a: Time deltas for sequence A
         time_deltas_b: Time deltas for sequence B
-        jump_threshold: Minimum jump size to consider a divergence
+        jump_threshold: Minimum jump size to consider a structural divergence
+        mismatch_window: Number of consecutive mismatches to trigger value divergence
     
     Returns:
-        List of DivergenceWindow objects
+        List of DivergenceWindow objects, sorted by start position
     """
     if not warping_path or len(warping_path) < 2:
         return []
     
     divergences = []
-    in_divergence = False
-    divergence_start = None
+    
+    # === Method 1: Structural divergence (jumps in path) ===
+    in_structural_div = False
+    structural_start = None
     
     for k in range(1, len(warping_path)):
         prev_i, prev_j = warping_path[k - 1]
@@ -401,14 +467,12 @@ def find_divergence_windows(
             (jump_j >= jump_threshold and jump_i <= 1)
         )
         
-        if is_divergent and not in_divergence:
-            # Start of divergence
-            in_divergence = True
-            divergence_start = (prev_i, prev_j, k - 1)
-        elif not is_divergent and in_divergence:
-            # End of divergence
-            in_divergence = False
-            start_i, start_j, _ = divergence_start
+        if is_divergent and not in_structural_div:
+            in_structural_div = True
+            structural_start = (prev_i, prev_j, k - 1)
+        elif not is_divergent and in_structural_div:
+            in_structural_div = False
+            start_i, start_j, _ = structural_start
             
             divergences.append(DivergenceWindow(
                 start_index_a=start_i,
@@ -421,11 +485,10 @@ def find_divergence_windows(
                 end_time_delta_b=float(time_deltas_b[prev_j]) if prev_j < len(time_deltas_b) else 0.0,
             ))
     
-    # Handle divergence at end of path
-    if in_divergence and divergence_start:
-        start_i, start_j, _ = divergence_start
+    # Handle structural divergence at end
+    if in_structural_div and structural_start:
+        start_i, start_j, _ = structural_start
         last_i, last_j = warping_path[-1]
-        
         divergences.append(DivergenceWindow(
             start_index_a=start_i,
             end_index_a=last_i,
@@ -437,7 +500,691 @@ def find_divergence_windows(
             end_time_delta_b=float(time_deltas_b[last_j]) if last_j < len(time_deltas_b) else 0.0,
         ))
     
+    # === Method 2: Value divergence (consecutive mismatches) ===
+    # Track runs of mismatches along the path
+    mismatch_run_start = None
+    mismatch_count = 0
+    
+    for k, (i, j) in enumerate(warping_path):
+        is_match = seq_a[i] == seq_b[j]
+        
+        if not is_match:
+            if mismatch_run_start is None:
+                mismatch_run_start = k
+            mismatch_count += 1
+        else:
+            # End of mismatch run - check if it was long enough
+            if mismatch_count >= mismatch_window:
+                start_i, start_j = warping_path[mismatch_run_start]
+                end_i, end_j = warping_path[k - 1]
+                
+                divergences.append(DivergenceWindow(
+                    start_index_a=start_i,
+                    end_index_a=end_i,
+                    start_index_b=start_j,
+                    end_index_b=end_j,
+                    start_time_delta_a=float(time_deltas_a[start_i]) if start_i < len(time_deltas_a) else 0.0,
+                    end_time_delta_a=float(time_deltas_a[end_i]) if end_i < len(time_deltas_a) else 0.0,
+                    start_time_delta_b=float(time_deltas_b[start_j]) if start_j < len(time_deltas_b) else 0.0,
+                    end_time_delta_b=float(time_deltas_b[end_j]) if end_j < len(time_deltas_b) else 0.0,
+                ))
+            
+            mismatch_run_start = None
+            mismatch_count = 0
+    
+    # Handle mismatch run at end of path
+    if mismatch_count >= mismatch_window and mismatch_run_start is not None:
+        start_i, start_j = warping_path[mismatch_run_start]
+        end_i, end_j = warping_path[-1]
+        
+        divergences.append(DivergenceWindow(
+            start_index_a=start_i,
+            end_index_a=end_i,
+            start_index_b=start_j,
+            end_index_b=end_j,
+            start_time_delta_a=float(time_deltas_a[start_i]) if start_i < len(time_deltas_a) else 0.0,
+            end_time_delta_a=float(time_deltas_a[end_i]) if end_i < len(time_deltas_a) else 0.0,
+            start_time_delta_b=float(time_deltas_b[start_j]) if start_j < len(time_deltas_b) else 0.0,
+            end_time_delta_b=float(time_deltas_b[end_j]) if end_j < len(time_deltas_b) else 0.0,
+        ))
+    
+    # Sort by start position in sequence A and merge overlapping windows
+    if divergences:
+        divergences.sort(key=lambda d: d.start_index_a)
+        
+        # Merge overlapping windows
+        merged = [divergences[0]]
+        for div in divergences[1:]:
+            last = merged[-1]
+            if div.start_index_a <= last.end_index_a + 1:
+                # Overlapping or adjacent - merge
+                merged[-1] = DivergenceWindow(
+                    start_index_a=last.start_index_a,
+                    end_index_a=max(last.end_index_a, div.end_index_a),
+                    start_index_b=last.start_index_b,
+                    end_index_b=max(last.end_index_b, div.end_index_b),
+                    start_time_delta_a=last.start_time_delta_a,
+                    end_time_delta_a=max(last.end_time_delta_a, div.end_time_delta_a),
+                    start_time_delta_b=last.start_time_delta_b,
+                    end_time_delta_b=max(last.end_time_delta_b, div.end_time_delta_b),
+                )
+            else:
+                merged.append(div)
+        divergences = merged
+    
     return divergences
+
+
+def _group_events_by_timestamp(df: pd.DataFrame) -> List[Tuple[float, frozenset]]:
+    """
+    Group events by timestamp into sets of (event_id, parameter) tuples.
+    
+    Events at the same timestamp may appear in different order between runs.
+    Grouping them into sets makes comparison order-independent.
+    
+    Returns:
+        List of (time_delta, frozenset_of_event_tuples)
+    """
+    groups = []
+    for td, grp in df.groupby('time_delta'):
+        events = frozenset(zip(grp['event_id'].values, grp['parameter'].values))
+        groups.append((float(td), events))
+    return groups
+
+
+def _dtw_with_jaccard(
+    groups_a: List[Tuple[float, frozenset]],
+    groups_b: List[Tuple[float, frozenset]]
+) -> Tuple[DTWResult, float, np.ndarray]:
+    """
+    Run DTW on timestamp groups using Jaccard distance.
+    
+    Each group is a frozenset of (event_id, parameter) tuples.
+    Distance between groups: 0 if identical, Jaccard distance otherwise.
+    
+    Returns:
+        Tuple of (DTWResult, match_percentage, distance_matrix)
+    """
+    n, m = len(groups_a), len(groups_b)
+    
+    if n == 0 or m == 0:
+        return DTWResult(
+            distance=float('inf'),
+            normalized_distance=float('inf'),
+            warping_path=[],
+            sequence_length_a=n,
+            sequence_length_b=m
+        ), 0.0, np.array([])
+    
+    # Build Jaccard distance matrix
+    dist_matrix = np.ones((n, m), dtype=np.float64)
+    for i in range(n):
+        set_a = groups_a[i][1]
+        for j in range(m):
+            set_b = groups_b[j][1]
+            if set_a == set_b:
+                dist_matrix[i, j] = 0.0
+            else:
+                inter = len(set_a & set_b)
+                union = len(set_a | set_b)
+                dist_matrix[i, j] = 1.0 - inter / union if union > 0 else 1.0
+    
+    # DTW with custom distance matrix
+    cum_cost = np.full((n + 1, m + 1), np.inf)
+    cum_cost[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = dist_matrix[i - 1, j - 1]
+            cum_cost[i, j] = cost + min(
+                cum_cost[i - 1, j],
+                cum_cost[i, j - 1],
+                cum_cost[i - 1, j - 1]
+            )
+    
+    distance = float(cum_cost[n, m])
+    
+    # Backtrack to find warping path
+    path = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        path.append((i - 1, j - 1))
+        if i == 0:
+            j -= 1
+        elif j == 0:
+            i -= 1
+        else:
+            candidates = [
+                (cum_cost[i - 1, j - 1], i - 1, j - 1),
+                (cum_cost[i - 1, j], i - 1, j),
+                (cum_cost[i, j - 1], i, j - 1),
+            ]
+            _, i, j = min(candidates, key=lambda x: x[0])
+    path.reverse()
+    
+    normalized_distance = distance / len(path) if path else float('inf')
+    matches = sum(1 for i, j in path if dist_matrix[i, j] == 0.0)
+    match_pct = matches / len(path) * 100 if path else 0.0
+    
+    dtw_result = DTWResult(
+        distance=distance,
+        normalized_distance=normalized_distance,
+        warping_path=path,
+        sequence_length_a=n,
+        sequence_length_b=m
+    )
+    
+    return dtw_result, match_pct, dist_matrix
+
+
+def _find_group_divergences(
+    path: List[Tuple[int, int]],
+    dist_matrix: np.ndarray,
+    groups_a: List[Tuple[float, frozenset]],
+    groups_b: List[Tuple[float, frozenset]],
+    trim_seconds_a: float = 0.0,
+    trim_seconds_b: float = 0.0,
+    skip_threshold: int = 2,
+    mismatch_window: int = 3,
+    alignment_grace_seconds: float = 30.0
+) -> List[DivergenceWindow]:
+    """
+    Find divergence windows from group-level DTW path.
+    
+    Detects two types of divergence:
+    1. **Runs**: Consecutive horizontal/vertical DTW steps where one sequence
+       advances while the other stalls (direct gap/insertion evidence). Reports
+       the actual time gap from the stalled sequence's timeline.
+    2. **Mismatches**: Consecutive groups that don't match (different events).
+    
+    Divergences in the first ``alignment_grace_seconds`` after alignment are
+    suppressed — these are typically residual alignment boundary effects.
+    
+    Args:
+        path: DTW warping path (group index pairs)
+        dist_matrix: Jaccard distance matrix between groups
+        groups_a/b: Timestamp groups
+        trim_seconds_a/b: How much time was trimmed during alignment
+        skip_threshold: Min consecutive run steps to detect as structural gap
+        mismatch_window: Min consecutive mismatches for value divergence
+        alignment_grace_seconds: Ignore divergences in the first N seconds
+    
+    Returns:
+        List of DivergenceWindow with descriptions and original timestamps
+    """
+    if not path or len(path) < 2:
+        return []
+    
+    divergences = []
+    
+    def _time_a(idx):
+        return groups_a[idx][0] if idx < len(groups_a) else 0.0
+    
+    def _time_b(idx):
+        return groups_b[idx][0] if idx < len(groups_b) else 0.0
+    
+    def _make_div(start_i, end_i, start_j, end_j, description=""):
+        return DivergenceWindow(
+            start_index_a=start_i,
+            end_index_a=end_i,
+            start_index_b=start_j,
+            end_index_b=end_j,
+            start_time_delta_a=_time_a(start_i),
+            end_time_delta_a=_time_a(end_i),
+            start_time_delta_b=_time_b(start_j),
+            end_time_delta_b=_time_b(end_j),
+            description=description,
+            original_start_seconds_a=_time_a(start_i) + trim_seconds_a,
+            original_end_seconds_a=_time_a(end_i) + trim_seconds_a,
+            original_start_seconds_b=_time_b(start_j) + trim_seconds_b,
+            original_end_seconds_b=_time_b(end_j) + trim_seconds_b,
+        )
+    
+    # === Method 1: Structural divergence (runs of horizontal/vertical steps) ===
+    # Standard DTW only steps by 0 or 1 per dimension, so we detect RUNS of
+    # horizontal steps (A advances, B stalls) or vertical steps (B advances, A stalls).
+    # A run of N such steps means N groups in one sequence have no match.
+    run_start_k = 0
+    run_type = None  # 'h' = horizontal (A advances, B stalls), 'v' = vertical, 'd' = diagonal
+    
+    def _classify_step(k):
+        pi, pj = path[k - 1]
+        ci, cj = path[k]
+        di, dj = ci - pi, cj - pj
+        if di >= 1 and dj == 0:
+            return 'h'
+        elif di == 0 and dj >= 1:
+            return 'v'
+        return 'd'
+    
+    def _emit_run(start_k, end_k, rtype):
+        """Create a divergence for a run of horizontal or vertical steps.
+        
+        When a gap is detected, the DivergenceWindow's original_*_seconds fields
+        are expanded to span the full gap duration (not just the boundary groups).
+        This ensures the Gantt chart shading covers the entire missing region.
+        """
+        run_len = end_k - start_k
+        if run_len < skip_threshold:
+            return
+        si, sj = path[start_k]
+        ei, ej = path[end_k - 1]  # Last step in the run
+        orig_a_s = _time_a(si) + trim_seconds_a
+        orig_a_e = _time_a(ei) + trim_seconds_a
+        orig_b_s = _time_b(sj) + trim_seconds_b
+        orig_b_e = _time_b(ej) + trim_seconds_b
+        if rtype == 'h':
+            # A advances while B stalls → gap in B's data
+            # Compute B's actual time gap: time between B[stall_idx] and B[stall_idx + 1]
+            b_stall_idx = sj  # B is stuck at this index during the run
+            if b_stall_idx + 1 < len(groups_b):
+                b_gap = _time_b(b_stall_idx + 1) - _time_b(b_stall_idx)
+            else:
+                b_gap = _time_a(ei) - _time_a(si)  # Fallback: at end of B
+            desc = (f"~{b_gap:.0f}s gap in B "
+                    f"(A: {orig_a_s:.0f}s-{orig_a_e:.0f}s, {run_len} unmatched groups)")
+            # Expand the A-side window to cover the full gap duration
+            # so the Gantt chart shading spans the entire missing region
+            orig_a_e_expanded = orig_a_s + b_gap
+        else:
+            # B advances while A stalls → gap in A's data
+            a_stall_idx = si
+            if a_stall_idx + 1 < len(groups_a):
+                a_gap = _time_a(a_stall_idx + 1) - _time_a(a_stall_idx)
+            else:
+                a_gap = _time_b(ej) - _time_b(sj)
+            desc = (f"~{a_gap:.0f}s gap in A "
+                    f"(B: {orig_b_s:.0f}s-{orig_b_e:.0f}s, {run_len} unmatched groups)")
+            orig_a_e_expanded = orig_a_s + a_gap
+        
+        div = DivergenceWindow(
+            start_index_a=si,
+            end_index_a=ei,
+            start_index_b=sj,
+            end_index_b=ej,
+            start_time_delta_a=_time_a(si),
+            end_time_delta_a=_time_a(ei),
+            start_time_delta_b=_time_b(sj),
+            end_time_delta_b=_time_b(ej),
+            description=desc,
+            original_start_seconds_a=orig_a_s,
+            original_end_seconds_a=max(orig_a_e, orig_a_e_expanded),
+            original_start_seconds_b=orig_b_s,
+            original_end_seconds_b=orig_b_e,
+        )
+        divergences.append(div)
+    
+    if len(path) > 1:
+        run_type = _classify_step(1)
+        run_start_k = 1
+        for k in range(2, len(path)):
+            step = _classify_step(k)
+            if step != run_type:
+                if run_type in ('h', 'v'):
+                    _emit_run(run_start_k, k, run_type)
+                run_start_k = k
+                run_type = step
+        # Final run
+        if run_type in ('h', 'v'):
+            _emit_run(run_start_k, len(path), run_type)
+    
+    # === Method 2: Value divergence (consecutive mismatches) ===
+    mismatch_start_k = None
+    mismatch_count = 0
+    
+    for k, (i, j) in enumerate(path):
+        is_match = dist_matrix[i, j] == 0.0
+        
+        if not is_match:
+            if mismatch_start_k is None:
+                mismatch_start_k = k
+            mismatch_count += 1
+        else:
+            if mismatch_count >= mismatch_window:
+                si, sj = path[mismatch_start_k]
+                ei, ej = path[k - 1]
+                orig_a_start = _time_a(si) + trim_seconds_a
+                orig_a_end = _time_a(ei) + trim_seconds_a
+                orig_b_start = _time_b(sj) + trim_seconds_b
+                orig_b_end = _time_b(ej) + trim_seconds_b
+                desc = (f"Event difference: {mismatch_count} mismatched groups "
+                        f"(A: {orig_a_start:.0f}s-{orig_a_end:.0f}s, "
+                        f"B: {orig_b_start:.0f}s-{orig_b_end:.0f}s)")
+                divergences.append(_make_div(si, ei, sj, ej, desc))
+            mismatch_start_k = None
+            mismatch_count = 0
+    
+    # Handle mismatch at end
+    if mismatch_count >= mismatch_window and mismatch_start_k is not None:
+        si, sj = path[mismatch_start_k]
+        ei, ej = path[-1]
+        orig_a_start = _time_a(si) + trim_seconds_a
+        orig_a_end = _time_a(ei) + trim_seconds_a
+        orig_b_start = _time_b(sj) + trim_seconds_b
+        orig_b_end = _time_b(ej) + trim_seconds_b
+        desc = (f"Event difference: {mismatch_count} mismatched groups "
+                f"(A: {orig_a_start:.0f}s-{orig_a_end:.0f}s, "
+                f"B: {orig_b_start:.0f}s-{orig_b_end:.0f}s)")
+        divergences.append(_make_div(si, ei, sj, ej, desc))
+    
+    # Sort and merge overlapping
+    if divergences:
+        divergences.sort(key=lambda d: d.start_index_a)
+        merged = [divergences[0]]
+        for div in divergences[1:]:
+            last = merged[-1]
+            if div.start_index_a <= last.end_index_a + 1:
+                # Merge: prefer gap descriptions over mismatch descriptions
+                # (gap descriptions include the actual time gap from the timeline)
+                all_descs = [last.description, div.description]
+                gap_descs = [d for d in all_descs if d and 'gap in' in d]
+                best_desc = gap_descs[0] if gap_descs else (last.description or div.description)
+                merged[-1] = DivergenceWindow(
+                    start_index_a=last.start_index_a,
+                    end_index_a=max(last.end_index_a, div.end_index_a),
+                    start_index_b=last.start_index_b,
+                    end_index_b=max(last.end_index_b, div.end_index_b),
+                    start_time_delta_a=last.start_time_delta_a,
+                    end_time_delta_a=max(last.end_time_delta_a, div.end_time_delta_a),
+                    start_time_delta_b=last.start_time_delta_b,
+                    end_time_delta_b=max(last.end_time_delta_b, div.end_time_delta_b),
+                    description=best_desc,
+                    original_start_seconds_a=last.original_start_seconds_a,
+                    original_end_seconds_a=max(last.original_end_seconds_a, div.original_end_seconds_a),
+                    original_start_seconds_b=last.original_start_seconds_b,
+                    original_end_seconds_b=max(last.original_end_seconds_b, div.original_end_seconds_b),
+                )
+            else:
+                merged.append(div)
+        divergences = merged
+    
+    # Filter out divergences in the alignment grace period
+    # The first few seconds after alignment often have residual mismatches
+    if alignment_grace_seconds > 0:
+        divergences = [
+            d for d in divergences
+            if d.start_time_delta_a >= alignment_grace_seconds
+        ]
+    
+    return divergences
+
+
+def _analyze_timing(
+    path: List[Tuple[int, int]],
+    dist_matrix: np.ndarray,
+    groups_a: List[Tuple[float, frozenset]],
+    groups_b: List[Tuple[float, frozenset]],
+) -> Optional[Dict]:
+    """
+    Analyze timing differences between matched timestamp groups.
+    
+    For each pair in the warping path where the event sets match,
+    compute the time difference. This reveals how much the timing
+    varies between runs even when the event sequence is identical.
+    
+    Returns:
+        Dict with timing statistics, or None if insufficient matches
+    """
+    timing_diffs = []
+    for i, j in path:
+        if dist_matrix[i, j] == 0.0:  # Exact set match
+            t_a = groups_a[i][0]
+            t_b = groups_b[j][0]
+            timing_diffs.append(t_a - t_b)
+    
+    if len(timing_diffs) < 3:
+        return None
+    
+    raw_diffs = np.array(timing_diffs)
+    
+    # The raw diffs include a constant offset from alignment granularity
+    # (e.g., alignment trims to the nearest group boundary, leaving ~1s residual).
+    # Subtract the median to isolate the actual timing jitter/variation.
+    median_offset = float(np.median(raw_diffs))
+    diffs = raw_diffs - median_offset
+    abs_diffs = np.abs(diffs)
+    
+    return {
+        'alignment_residual': median_offset,  # Systematic offset after alignment
+        'mean_diff': float(np.mean(diffs)),   # Mean jitter (should be ~0)
+        'std_diff': float(np.std(diffs)),      # Timing jitter std deviation
+        'max_abs_diff': float(np.max(abs_diffs)),  # Worst-case jitter
+        'median_diff': float(np.median(diffs)),  # Should be ~0 after correction
+        'p95_abs_diff': float(np.percentile(abs_diffs, 95)),
+        'n_matched_groups': len(timing_diffs),
+        'n_total_path_steps': len(path),
+    }
+
+
+def find_alignment_offset(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    max_offset: int = 50,
+    align_seconds: float = 360.0
+) -> Tuple[int, float]:
+    """
+    Find the optimal offset to align sequence B with sequence A.
+    
+    Sequences often start at different points in the signal cycle (e.g., A starts
+    with a "begin green" while B starts mid-cycle with an "end green"). This
+    function finds the best alignment by:
+    
+    1. Grouping events by timestamp into SETS (order-independent matching)
+    2. Trying different offsets (trimming the start of A or B)
+    3. Comparing only the first `align_seconds` worth of data
+    
+    The set-based approach handles the common case where events at the same
+    timestamp appear in different order between runs.
+    
+    Args:
+        df_a: Prepared events DataFrame A (with event_id, parameter, time_delta)
+        df_b: Prepared events DataFrame B
+        max_offset: Maximum number of timestamp groups to try shifting
+        align_seconds: Only use the first N seconds for alignment (default 360 = 6 min)
+    
+    Returns:
+        Tuple of (best_offset_groups, match_percentage_at_offset)
+        - If offset > 0: Skip first `offset` timestamp groups from B
+        - If offset < 0: Skip first `-offset` timestamp groups from A
+        The offset is in timestamp GROUPS (not individual events).
+    """
+    if df_a.empty or df_b.empty:
+        return 0, 0.0
+    
+    # Group events by timestamp into sets (order-independent)
+    groups_a = _group_events_by_timestamp(df_a)
+    groups_b = _group_events_by_timestamp(df_b)
+    
+    sets_a = [events for _, events in groups_a]
+    sets_b = [events for _, events in groups_b]
+    times_a = [t for t, _ in groups_a]
+    times_b = [t for t, _ in groups_b]
+    
+    # Find how many groups fit in align_seconds for each sequence
+    max_groups_a = next((i for i, t in enumerate(times_a) if t > align_seconds), len(times_a))
+    max_groups_b = next((i for i, t in enumerate(times_b) if t > align_seconds), len(times_b))
+    max_compare = max(max_groups_a, max_groups_b)
+    
+    best_offset = 0
+    best_match = 0.0
+    
+    def _jaccard_score(a_sub, b_sub, compare_len):
+        """Compute average Jaccard similarity over the comparison window."""
+        total_sim = 0.0
+        for i in range(compare_len):
+            if a_sub[i] == b_sub[i]:
+                total_sim += 1.0
+            else:
+                inter = len(a_sub[i] & b_sub[i])
+                union = len(a_sub[i] | b_sub[i])
+                total_sim += inter / union if union > 0 else 0.0
+        return total_sim / compare_len * 100
+    
+    # Small penalty per offset group to prefer smaller offsets when scores are close.
+    # This prevents spurious alignment shifts from minor data perturbations.
+    # Penalty of 0.15% per group means an offset of 10 costs 1.5% — significant
+    # enough to prevent drift from small perturbations, but small enough that
+    # genuinely different start positions still get found (a true match at offset 
+    # 10 that scores 5%+ higher will still win).
+    OFFSET_PENALTY_PER_GROUP = 0.15
+    
+    # Try positive offsets (skip timestamp groups from B)
+    for offset in range(0, min(max_offset, len(sets_b))):
+        a_sub = sets_a
+        b_sub = sets_b[offset:]
+        compare_len = min(len(a_sub), len(b_sub), max_compare)
+        if compare_len < 3:
+            continue
+        
+        match_pct = _jaccard_score(a_sub, b_sub, compare_len) - offset * OFFSET_PENALTY_PER_GROUP
+        
+        if match_pct > best_match:
+            best_match = match_pct
+            best_offset = offset
+    
+    # Try negative offsets (skip timestamp groups from A)
+    for offset in range(1, min(max_offset, len(sets_a))):
+        a_sub = sets_a[offset:]
+        b_sub = sets_b
+        compare_len = min(len(a_sub), len(b_sub), max_compare)
+        if compare_len < 3:
+            continue
+        
+        match_pct = _jaccard_score(a_sub, b_sub, compare_len) - offset * OFFSET_PENALTY_PER_GROUP
+        
+        if match_pct > best_match:
+            best_match = match_pct
+            best_offset = -offset
+    
+    return best_offset, best_match
+
+
+def calculate_timeline_offset(
+    events_a: pd.DataFrame,
+    events_b: pd.DataFrame, 
+    alignment_offset: int = 0,
+    event_ids: Optional[List[int]] = None
+) -> float:
+    """
+    Calculate the time offset (in seconds) needed to align timeline B with A.
+    
+    Uses the alignment offset (in timestamp groups) found by find_alignment_offset
+    to determine the time difference between the starts of the aligned sequences.
+    
+    The offset tells us which timestamp group in B corresponds to the start of A.
+    We compute the time difference between A's start and that group in B.
+    
+    Args:
+        events_a: Original events DataFrame
+        events_b: Replay events DataFrame
+        alignment_offset: Offset in timestamp groups (from find_alignment_offset)
+        event_ids: Optional list of event IDs to filter
+    
+    Returns:
+        Time offset in seconds to apply to timeline B (negative = shift B left/earlier)
+    """
+    df_a = prepare_events_for_comparison(events_a, event_ids=event_ids)
+    df_b = prepare_events_for_comparison(events_b, event_ids=event_ids)
+    
+    if df_a.empty or df_b.empty:
+        return 0.0
+    
+    # Group by timestamp to get timestamp groups (same as find_alignment_offset uses)
+    groups_a = _group_events_by_timestamp(df_a)
+    groups_b = _group_events_by_timestamp(df_b)
+    
+    if alignment_offset > 0:
+        # Skip first N timestamp groups from B
+        # The Nth group in B corresponds to the start of A
+        if alignment_offset < len(groups_b):
+            time_b_at_offset = groups_b[alignment_offset][0]  # time_delta of that group
+            # B needs to be shifted left by this amount so B[offset] aligns with A[0]
+            return -time_b_at_offset
+    elif alignment_offset < 0:
+        # Skip first N timestamp groups from A
+        skip = -alignment_offset
+        if skip < len(groups_a):
+            time_a_at_offset = groups_a[skip][0]
+            # A starts later, so B needs to be shifted right
+            return time_a_at_offset
+    
+    return 0.0
+
+
+def compute_timeline_offset(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    max_offset_seconds: float = 300.0,
+    resolution: float = 0.5,
+    align_seconds: float = 360.0
+) -> float:
+    """
+    Compute the time offset to align two atspm timelines using cross-correlation.
+    
+    This directly compares the phase state patterns in both timelines to find
+    the time shift that best aligns them. This is more reliable than converting
+    an event-count offset to a time offset.
+    
+    The method creates discrete time series (at `resolution` intervals) of which
+    phases are in each state, then cross-correlates to find the best lag.
+    
+    Args:
+        timeline_a: Timeline DataFrame from atspm (StartTime, EndTime, EventClass, EventValue)
+        timeline_b: Timeline DataFrame from atspm
+        max_offset_seconds: Maximum offset to search (both directions)
+        resolution: Time resolution for discretization in seconds (default 0.5s)
+        align_seconds: Only use the first N seconds for alignment (default 360s = 6 min)
+    
+    Returns:
+        Time offset in seconds to apply to timeline B.
+        Negative = shift B earlier (B started later in the signal cycle).
+    """
+    if timeline_a.empty or timeline_b.empty:
+        return 0.0
+    
+    start_a = timeline_a['StartTime'].min()
+    start_b = timeline_b['StartTime'].min()
+    
+    # Create discrete time series of green phase states
+    n_bins = int(align_seconds / resolution)
+    
+    def discretize(tl_df, start_time):
+        """Create array of frozensets: which (class, phase) are active at each time bin."""
+        states = [set() for _ in range(n_bins)]
+        for _, row in tl_df.iterrows():
+            start_sec = (row['StartTime'] - start_time).total_seconds()
+            end_sec = (row['EndTime'] - start_time).total_seconds()
+            start_bin = max(0, int(start_sec / resolution))
+            end_bin = min(n_bins, int(end_sec / resolution) + 1)
+            key = (row['EventClass'], int(float(row['EventValue'])))
+            for b in range(start_bin, end_bin):
+                states[b].add(key)
+        return [frozenset(s) for s in states]
+    
+    states_a = discretize(timeline_a, start_a)
+    states_b = discretize(timeline_b, start_b)
+    
+    max_lag_bins = int(max_offset_seconds / resolution)
+    best_lag = 0
+    best_score = -1
+    
+    for lag in range(-max_lag_bins, max_lag_bins + 1):
+        matches = 0
+        total = 0
+        
+        for i in range(n_bins):
+            j = i - lag  # index in B that corresponds to i in A
+            if 0 <= j < n_bins:
+                if states_a[i] == states_b[j] and len(states_a[i]) > 0:
+                    matches += 1
+                if len(states_a[i]) > 0 or len(states_b[j]) > 0:
+                    total += 1
+        
+        score = matches / total if total > 0 else 0
+        if score > best_score:
+            best_score = score
+            best_lag = lag
+    
+    return best_lag * resolution
 
 
 def compare_runs(
@@ -448,10 +1195,24 @@ def compare_runs(
     run_b_label: Union[int, str] = "B",
     start_time_a: Optional[datetime] = None,
     start_time_b: Optional[datetime] = None,
-    event_ids: Optional[List[int]] = None
+    event_ids: Optional[List[int]] = None,
+    auto_align: bool = True
 ) -> ComparisonResult:
     """
-    Compare two runs using DTW on both sequence and timing.
+    Compare two runs using group-level DTW on event sequences and timing.
+    
+    Events are grouped by timestamp into sets (order-independent within each
+    timestamp). DTW is run on these groups using Jaccard distance:
+    - 0 if the event sets are identical
+    - Jaccard distance otherwise (fraction of non-overlapping events)
+    
+    This approach is faster and more robust than individual-event DTW because:
+    - Event ordering within a timestamp doesn't matter
+    - Gaps (missing time periods) are immediately obvious
+    - Typical sequences have ~200-500 groups vs ~5000-10000 individual events
+    
+    After sequence comparison, timing analysis compares the time deltas
+    of matched groups to detect timing drift between runs.
     
     Args:
         events_a: Events from first run
@@ -461,13 +1222,41 @@ def compare_runs(
         run_b_label: Label for second run
         start_time_a: Start time for run A (for time delta calculation)
         start_time_b: Start time for run B
+        event_ids: Optional list of event IDs to include in comparison
+        auto_align: If True, automatically find best alignment offset
     
     Returns:
-        ComparisonResult with DTW distances and divergence windows
+        ComparisonResult with DTW distances, divergence windows, and timing stats
     """
-    # Prepare events
+    # Prepare events (filter, sort, compute time_deltas)
     df_a = prepare_events_for_comparison(events_a, start_time_a, event_ids=event_ids)
     df_b = prepare_events_for_comparison(events_b, start_time_b, event_ids=event_ids)
+    
+    # Auto-alignment: Find optimal offset to align the sequences
+    alignment_offset = 0
+    trim_seconds_a = 0.0
+    trim_seconds_b = 0.0
+    
+    if auto_align and not df_a.empty and not df_b.empty:
+        alignment_offset, pre_align_match = find_alignment_offset(df_a, df_b)
+        
+        raw_groups_a = _group_events_by_timestamp(df_a)
+        raw_groups_b = _group_events_by_timestamp(df_b)
+        
+        if alignment_offset > 0 and alignment_offset < len(raw_groups_b):
+            # Skip first N timestamp groups from B
+            trim_seconds_b = raw_groups_b[alignment_offset][0]
+            df_b = df_b[df_b['time_delta'] >= trim_seconds_b].reset_index(drop=True)
+            if not df_b.empty:
+                new_start = df_b['timestamp'].min()
+                df_b['time_delta'] = (df_b['timestamp'] - new_start).dt.total_seconds()
+        elif alignment_offset < 0 and -alignment_offset < len(raw_groups_a):
+            # Skip first N timestamp groups from A
+            trim_seconds_a = raw_groups_a[-alignment_offset][0]
+            df_a = df_a[df_a['time_delta'] >= trim_seconds_a].reset_index(drop=True)
+            if not df_a.empty:
+                new_start = df_a['timestamp'].min()
+                df_a['time_delta'] = (df_a['timestamp'] - new_start).dt.total_seconds()
     
     if df_a.empty or df_b.empty:
         return ComparisonResult(
@@ -478,38 +1267,54 @@ def compare_runs(
                 distance=float('inf'),
                 normalized_distance=float('inf'),
                 warping_path=[],
-                sequence_length_a=len(df_a),
-                sequence_length_b=len(df_b)
+                sequence_length_a=0,
+                sequence_length_b=0
             ),
             timing_dtw=DTWResult(
                 distance=float('inf'),
                 normalized_distance=float('inf'),
                 warping_path=[],
-                sequence_length_a=len(df_a),
-                sequence_length_b=len(df_b)
+                sequence_length_a=0,
+                sequence_length_b=0
             ),
             divergence_windows=[],
             match_percentage=0.0
         )
     
-    # Build unified encoding map for both sequences
-    all_pairs = (
-        list(zip(df_a['event_id'].values, df_a['parameter'].values)) +
-        list(zip(df_b['event_id'].values, df_b['parameter'].values))
+    # ===== GROUP-LEVEL DTW =====
+    # Group events by timestamp into sets of (event_id, parameter) tuples.
+    # Each group represents "what happened at this moment in time".
+    groups_a = _group_events_by_timestamp(df_a)
+    groups_b = _group_events_by_timestamp(df_b)
+    
+    # Run DTW with Jaccard distance on the groups
+    sequence_dtw, match_percentage, dist_matrix = _dtw_with_jaccard(groups_a, groups_b)
+    
+    # ===== DIVERGENCE DETECTION =====
+    # Find gaps (one side skips ahead) and mismatches (different events)
+    divergences = _find_group_divergences(
+        sequence_dtw.warping_path,
+        dist_matrix,
+        groups_a,
+        groups_b,
+        trim_seconds_a=trim_seconds_a,
+        trim_seconds_b=trim_seconds_b,
     )
-    unique_pairs = sorted(set(all_pairs))
-    encoding_map = {pair: i for i, pair in enumerate(unique_pairs)}
     
-    # Encode sequences
-    seq_a, _ = encode_categorical_sequence(df_a, encoding_map)
-    seq_b, _ = encode_categorical_sequence(df_b, encoding_map)
+    # ===== TIMING ANALYSIS =====
+    # For matched groups, compare how much the timing differs
+    timing_stats = _analyze_timing(
+        sequence_dtw.warping_path,
+        dist_matrix,
+        groups_a,
+        groups_b,
+    )
     
-    # Get timing sequences
-    time_a = df_a['time_delta'].values.astype(float)
-    time_b = df_b['time_delta'].values.astype(float)
-    
-    # Normalize timing to [0, 1] for fair comparison
-    max_time = max(time_a.max() if len(time_a) > 0 else 0, 
+    # ===== TIMING DTW =====
+    # DTW on the time-delta sequences (for backward compatibility)
+    time_a = np.array([t for t, _ in groups_a], dtype=float)
+    time_b = np.array([t for t, _ in groups_b], dtype=float)
+    max_time = max(time_a.max() if len(time_a) > 0 else 0,
                    time_b.max() if len(time_b) > 0 else 0)
     if max_time > 0:
         time_a_norm = time_a / max_time
@@ -517,36 +1322,7 @@ def compare_runs(
     else:
         time_a_norm = time_a
         time_b_norm = time_b
-    
-    # Compute DTW for sequences (categorical - binary match/mismatch distance)
-    sequence_dtw = compute_dtw(seq_a, seq_b, categorical=True)
-    
-    # Compute DTW for timing (numerical - Euclidean distance)
     timing_dtw = compute_dtw(time_a_norm, time_b_norm, categorical=False)
-    
-    # Find divergence windows (use sequence path as primary)
-    divergences = find_divergence_windows(
-        sequence_dtw.warping_path,
-        time_a,
-        time_b
-    )
-    
-    # Calculate match percentage based on warping path alignment
-    # For each pair in the warping path, check if values match exactly.
-    # We use path_length as denominator since it represents the actual
-    # number of alignment decisions made by DTW.
-    path_length = len(sequence_dtw.warping_path)
-    if path_length > 0:
-        # Count exact matches along the warping path
-        matching_values = sum(
-            1 for i, j in sequence_dtw.warping_path
-            if seq_a[i] == seq_b[j]
-        )
-        # Match percentage = matches / path length
-        # This gives the proportion of aligned positions that match exactly
-        match_percentage = (matching_values / path_length) * 100
-    else:
-        match_percentage = 0.0
     
     return ComparisonResult(
         device_id=device_id,
@@ -555,7 +1331,11 @@ def compare_runs(
         sequence_dtw=sequence_dtw,
         timing_dtw=timing_dtw,
         divergence_windows=divergences,
-        match_percentage=match_percentage
+        match_percentage=match_percentage,
+        alignment_offset=alignment_offset,
+        timing_stats=timing_stats,
+        alignment_trim_seconds_a=trim_seconds_a,
+        alignment_trim_seconds_b=trim_seconds_b,
     )
 
 
@@ -708,22 +1488,38 @@ def compare_event_sequences(
         print(f"\n{'='*60}")
         print(f"DTW Comparison: {label_a} vs {label_b}")
         print(f"{'='*60}")
-        print(f"  Sequence DTW (normalized): {result.sequence_dtw.normalized_distance:.4f}")
-        print(f"  Timing DTW (normalized):   {result.timing_dtw.normalized_distance:.4f}")
         print(f"  Match Percentage:          {result.match_percentage:.1f}%")
+        print(f"  Groups in A:               {result.sequence_dtw.sequence_length_a}")
+        print(f"  Groups in B:               {result.sequence_dtw.sequence_length_b}")
+        print(f"  Alignment offset:          {result.alignment_offset} groups")
+        if result.alignment_trim_seconds_a > 0:
+            print(f"    Trimmed {result.alignment_trim_seconds_a:.1f}s from A start")
+        if result.alignment_trim_seconds_b > 0:
+            print(f"    Trimmed {result.alignment_trim_seconds_b:.1f}s from B start")
         print(f"  Divergence Windows:        {len(result.divergence_windows)}")
-        print(f"  Sequence A length:         {result.sequence_dtw.sequence_length_a}")
-        print(f"  Sequence B length:         {result.sequence_dtw.sequence_length_b}")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}")
         
         if result.divergence_windows:
-            print("Divergence Windows (where sequences differ):")
+            print("\nDivergence Windows:")
             for i, div in enumerate(result.divergence_windows, 1):
-                print(f"  {i}. A[{div.start_index_a}:{div.end_index_a}] @ "
-                      f"{div.start_time_delta_a:.2f}s - {div.end_time_delta_a:.2f}s")
-                print(f"     B[{div.start_index_b}:{div.end_index_b}] @ "
-                      f"{div.start_time_delta_b:.2f}s - {div.end_time_delta_b:.2f}s")
-            print()
+                if div.description:
+                    print(f"  {i}. {div.description}")
+                else:
+                    print(f"  {i}. A: {div.original_start_seconds_a:.1f}s - "
+                          f"{div.original_end_seconds_a:.1f}s from start")
+                    print(f"     B: {div.original_start_seconds_b:.1f}s - "
+                          f"{div.original_end_seconds_b:.1f}s from start")
+        
+        if result.timing_stats:
+            ts = result.timing_stats
+            residual = ts.get('alignment_residual', 0.0)
+            print(f"\nTiming Analysis ({ts['n_matched_groups']} matched groups):")
+            if abs(residual) > 0.05:
+                print(f"  Alignment residual: {residual:+.3f}s (constant offset, subtracted below)")
+            print(f"  Timing jitter std:  {ts['std_diff']:.3f}s")
+            print(f"  Max jitter:         {ts['max_abs_diff']:.3f}s")
+            print(f"  95th percentile:    {ts['p95_abs_diff']:.3f}s")
+        print()
     
     return result
 
@@ -887,89 +1683,6 @@ def generate_timeline(
     return timeline
 
 
-def generate_simple_timeline(events: pd.DataFrame, device_id: str = "0") -> pd.DataFrame:
-    """
-    Generate a simple timeline from raw hi-res events without atspm.
-    
-    This is a fallback when atspm is slow or unavailable.
-    Groups events into phase/overlap on/off pairs.
-    
-    Args:
-        events: DataFrame with timestamp, event_id, parameter columns
-        device_id: Device ID
-    
-    Returns:
-        Timeline DataFrame with StartTime, EndTime, Duration, EventClass, EventValue
-    """
-    # Normalize column names
-    df = events.copy()
-    col_map = {}
-    for col in df.columns:
-        col_lower = col.lower()
-        if col_lower in ('timestamp', 'time_stamp'):
-            col_map[col] = 'timestamp'
-        elif col_lower in ('event_id', 'eventid', 'eventtypeid'):
-            col_map[col] = 'event_id'
-        elif col_lower in ('parameter', 'param'):
-            col_map[col] = 'parameter'
-    
-    df = df.rename(columns=col_map)
-    
-    # Ensure timestamp is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    
-    # Event mappings: start_event -> (end_event, EventClass)
-    event_pairs = {
-        1: (7, 'Green'),      # Phase On -> Phase Green Termination
-        7: (8, 'Yellow'),     # Phase Green Term -> Phase Yellow
-        8: (9, 'Red'),        # Phase Yellow -> Phase Red  
-        61: (63, 'Overlap Green'),   # Overlap On -> Overlap Green Term
-        63: (64, 'Overlap Yellow'),  # Overlap Green Term -> Overlap Yellow
-        64: (65, 'Overlap Red'),     # Overlap Yellow -> Overlap Off
-        105: (111, 'Preempt'),       # Preempt entry -> Preempt exit
-    }
-    
-    timeline_rows = []
-    
-    # Track active events by (event_class, parameter)
-    active_events = {}
-    
-    for _, row in df.iterrows():
-        event_id = row['event_id']
-        param = row['parameter']
-        ts = row['timestamp']
-        
-        # Check if this is a start event
-        if event_id in event_pairs:
-            end_event, event_class = event_pairs[event_id]
-            key = (event_class, param)
-            active_events[key] = (ts, end_event)
-        
-        # Check if this ends any active event
-        for key, (start_ts, end_event) in list(active_events.items()):
-            event_class, p = key
-            if event_id == end_event and param == p:
-                duration = (ts - start_ts).total_seconds()
-                timeline_rows.append({
-                    'DeviceId': device_id,
-                    'StartTime': start_ts,
-                    'EndTime': ts,
-                    'Duration': duration,
-                    'EventClass': event_class,
-                    'EventValue': param,
-                    'IsValid': True
-                })
-                del active_events[key]
-    
-    if not timeline_rows:
-        return pd.DataFrame(columns=['DeviceId', 'StartTime', 'EndTime', 'Duration', 'EventClass', 'EventValue', 'IsValid'])
-    
-    return pd.DataFrame(timeline_rows).sort_values('StartTime').reset_index(drop=True)
-
-
 # =============================================================================
 # Gantt Chart Visualization
 # =============================================================================
@@ -1034,26 +1747,35 @@ def create_comparison_gantt_matplotlib(
     output_path: Optional[Union[str, Path]] = None,
     window_minutes: float = 5.0,
     event_classes: Optional[List[str]] = None,
-    dpi: int = 150
+    dpi: int = 150,
+    align_by_time_delta: bool = True,
+    time_offset_b: float = 0.0
 ) -> Optional[Any]:
     """
     Create a Gantt chart comparing two timelines using matplotlib (reliable PNG export).
     
-    This function uses matplotlib's broken_barh for Gantt charts, which reliably
-    exports to PNG without the kaleido issues that affect plotly on Windows.
+    This function aligns two timelines by their relative time from start, NOT by absolute
+    timestamp. This is critical because the two runs typically happen at different times
+    but should be compared starting from their respective beginnings.
     
     Args:
-        timeline_a: Timeline DataFrame from first source
+        timeline_a: Timeline DataFrame from first source (requires StartTime, EndTime, EventClass, EventValue)
         timeline_b: Timeline DataFrame from second source  
         label_a: Label for first timeline (default "Original")
         label_b: Label for second timeline (default "Replay")
         title: Chart title
-        divergence_start: Optional start time to center the view
-        divergence_end: Optional end time to center the view
+        divergence_start: Timestamp in timeline_a where divergence was detected (for centering view)
+        divergence_end: Optional end time of divergence window
         output_path: Path to save the plot (PNG, PDF, SVG supported)
         window_minutes: Time window to show around divergence (default 5 min)
         event_classes: Optional list of event classes to include
         dpi: Resolution for PNG output (default 150)
+        align_by_time_delta: If True, align timelines by relative time from their respective
+                            starts. If False, use absolute timestamps (only works if both
+                            timelines have the same absolute time range).
+        time_offset_b: Time offset in seconds to apply to timeline B. Positive values
+                      shift B's events to the right (later in time). Use this when the
+                      raw events started at different points in the signal cycle.
     
     Returns:
         matplotlib Figure object, or None if matplotlib not available
@@ -1071,6 +1793,18 @@ def create_comparison_gantt_matplotlib(
             'TSP Service', 'TSP Call'
         ]
     
+    # Get the start times BEFORE filtering by event_classes.
+    # This ensures the time reference matches what compute_timeline_offset() used.
+    # If we computed start_a after filtering to e.g. ['Green','Yellow','Red'],
+    # the first Green might start later than the first overall event, creating
+    # a drift between the offset and the rendering.
+    start_a = timeline_a['StartTime'].min() if not timeline_a.empty else None
+    start_b = timeline_b['StartTime'].min() if not timeline_b.empty else None
+    
+    if start_a is None and start_b is None:
+        warnings.warn("No events found in either timeline")
+        return None
+    
     # Filter timelines to relevant event classes
     df_a = timeline_a[timeline_a['EventClass'].isin(event_classes)].copy()
     df_b = timeline_b[timeline_b['EventClass'].isin(event_classes)].copy()
@@ -1079,42 +1813,95 @@ def create_comparison_gantt_matplotlib(
         warnings.warn("No matching events found in either timeline")
         return None
     
-    # Determine time window
-    if divergence_start is not None:
-        center_time = divergence_start
-    else:
-        min_src_a = df_a['StartTime'].min() if not df_a.empty else pd.Timestamp.max
-        min_src_b = df_b['StartTime'].min() if not df_b.empty else pd.Timestamp.max
-        center_time = min(min_src_a, min_src_b)
-        if center_time == pd.Timestamp.max:
-            return None
+    # Ensure EventValue is numeric
+    if not df_a.empty:
+        df_a['EventValue'] = pd.to_numeric(df_a['EventValue'], errors='coerce')
+    if not df_b.empty:
+        df_b['EventValue'] = pd.to_numeric(df_b['EventValue'], errors='coerce')
     
-    # Calculate window
-    window_start = center_time - timedelta(minutes=window_minutes / 2)
-    window_end = (divergence_end or center_time) + timedelta(minutes=window_minutes / 2)
+    # Calculate time deltas from respective starts
+    if align_by_time_delta:
+        # Each timeline is relative to its own start time
+        if not df_a.empty:
+            df_a['TimeDelta'] = (df_a['StartTime'] - start_a).dt.total_seconds()
+            df_a['EndDelta'] = (df_a['EndTime'] - start_a).dt.total_seconds()
+        if not df_b.empty:
+            # Apply time offset to timeline B (shifts B's events in time relative to A)
+            df_b['TimeDelta'] = (df_b['StartTime'] - start_b).dt.total_seconds() + time_offset_b
+            df_b['EndDelta'] = (df_b['EndTime'] - start_b).dt.total_seconds() + time_offset_b
+        
+        # Convert divergence_start to time delta (it's a timestamp from timeline_a)
+        if divergence_start is not None and start_a is not None:
+            divergence_delta = (divergence_start - start_a).total_seconds()
+        else:
+            divergence_delta = None
+        
+        if divergence_end is not None and start_a is not None:
+            divergence_end_delta = (divergence_end - start_a).total_seconds()
+        else:
+            divergence_end_delta = divergence_delta
+    else:
+        # Use absolute timestamps - both timelines must have same time range
+        common_start = min(t for t in [start_a, start_b] if t is not None)
+        if not df_a.empty:
+            df_a['TimeDelta'] = (df_a['StartTime'] - common_start).dt.total_seconds()
+            df_a['EndDelta'] = (df_a['EndTime'] - common_start).dt.total_seconds()
+        if not df_b.empty:
+            df_b['TimeDelta'] = (df_b['StartTime'] - common_start).dt.total_seconds() + time_offset_b
+            df_b['EndDelta'] = (df_b['EndTime'] - common_start).dt.total_seconds()
+        
+        if divergence_start is not None:
+            divergence_delta = (divergence_start - common_start).total_seconds()
+        else:
+            divergence_delta = None
+        
+        if divergence_end is not None:
+            divergence_end_delta = (divergence_end - common_start).total_seconds()
+        else:
+            divergence_end_delta = divergence_delta
+    
+    # Determine the time window to display
+    max_time_a = df_a['EndDelta'].max() if not df_a.empty else 0
+    max_time_b = df_b['EndDelta'].max() if not df_b.empty else 0
+    total_duration_seconds = max(max_time_a, max_time_b)
+    
+    window_seconds = window_minutes * 60
+    
+    if divergence_delta is not None:
+        # Center window around divergence
+        window_start_sec = max(0, divergence_delta - window_seconds / 2)
+        window_end_sec = (divergence_end_delta or divergence_delta) + window_seconds / 2
+    else:
+        # Show from start, limited by window_minutes
+        window_start_sec = 0
+        window_end_sec = min(total_duration_seconds, window_seconds)
     
     # Filter to window
-    df_a = df_a[(df_a['EndTime'] >= window_start) & (df_a['StartTime'] <= window_end)].copy()
-    df_b = df_b[(df_b['EndTime'] >= window_start) & (df_b['StartTime'] <= window_end)].copy()
+    if not df_a.empty:
+        df_a = df_a[(df_a['EndDelta'] >= window_start_sec) & (df_a['TimeDelta'] <= window_end_sec)].copy()
+    if not df_b.empty:
+        df_b = df_b[(df_b['EndDelta'] >= window_start_sec) & (df_b['TimeDelta'] <= window_end_sec)].copy()
     
-    # Calculate relative time
-    zero_time = window_start
+    # Calculate relative positions within the window
+    if not df_a.empty:
+        df_a['RelStart'] = df_a['TimeDelta'] - window_start_sec
+        df_a['RelEnd'] = df_a['EndDelta'] - window_start_sec
+        df_a['Duration'] = df_a['RelEnd'] - df_a['RelStart']
+        df_a['Source'] = label_a
     
-    def to_relative_seconds(ts):
-        return (ts - zero_time).total_seconds()
+    if not df_b.empty:
+        df_b['RelStart'] = df_b['TimeDelta'] - window_start_sec
+        df_b['RelEnd'] = df_b['EndDelta'] - window_start_sec
+        df_b['Duration'] = df_b['RelEnd'] - df_b['RelStart']
+        df_b['Source'] = label_b
     
-    # Prepare data
-    df_a['RelStart'] = df_a['StartTime'].apply(to_relative_seconds)
-    df_a['RelEnd'] = df_a['EndTime'].apply(to_relative_seconds)
-    df_a['Duration'] = df_a['RelEnd'] - df_a['RelStart']
-    df_a['Source'] = label_a
+    # Combine dataframes
+    dfs_to_concat = [df for df in [df_a, df_b] if not df.empty]
+    if not dfs_to_concat:
+        warnings.warn("No events in the time window")
+        return None
     
-    df_b['RelStart'] = df_b['StartTime'].apply(to_relative_seconds)
-    df_b['RelEnd'] = df_b['EndTime'].apply(to_relative_seconds)
-    df_b['Duration'] = df_b['RelEnd'] - df_b['RelStart']
-    df_b['Source'] = label_b
-    
-    combined_df = pd.concat([df_a, df_b], ignore_index=True)
+    combined_df = pd.concat(dfs_to_concat, ignore_index=True)
     
     if combined_df.empty:
         warnings.warn("No events in the time window")
@@ -1122,28 +1909,42 @@ def create_comparison_gantt_matplotlib(
     
     # Create row labels
     def create_base_label(event_class, event_value):
+        val = int(float(event_value)) if pd.notna(event_value) else 0
         if event_class in ['Green', 'Yellow', 'Red']:
-            return f"Ph {int(event_value)}"
+            return f"Ph {val}"
         elif event_class in ['Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red']:
-            return f"Ovlp {int(event_value)}"
+            return f"Ovlp {val}"
         else:
-            return f"{event_class} {int(event_value)}"
+            return f"{event_class} {val}"
     
     combined_df['BaseLabel'] = [create_base_label(ec, ev) for ec, ev in 
                                  zip(combined_df['EventClass'], combined_df['EventValue'])]
-    combined_df['SortKey'] = [_get_sort_key(ec, int(ev)) for ec, ev in 
+    combined_df['SortKey'] = [_get_sort_key(ec, int(float(ev)) if pd.notna(ev) else 0) for ec, ev in 
                               zip(combined_df['EventClass'], combined_df['EventValue'])]
     combined_df['RowLabel'] = combined_df['BaseLabel'] + " (" + combined_df['Source'] + ")"
-    combined_df['Color'] = [_get_event_color(ec, int(ev)) for ec, ev in 
+    combined_df['Color'] = [_get_event_color(ec, int(float(ev)) if pd.notna(ev) else 0) for ec, ev in 
                             zip(combined_df['EventClass'], combined_df['EventValue'])]
     
     # Build row order (interleaved: label_a above label_b for each phase)
-    unique_base = combined_df[['BaseLabel', 'SortKey']].drop_duplicates().sort_values('SortKey')
+    # Only include rows that actually have data in at least one timeline
+    # Dedup on BaseLabel only - different EventClasses (Green/Yellow/Red) share
+    # the same BaseLabel (e.g., "Ph 2") but have different SortKeys. We want
+    # ONE row per phase per source, not one row per phase per EventClass.
+    base_sort = combined_df.groupby('BaseLabel')['SortKey'].min().reset_index()
+    base_sort = base_sort.sort_values('SortKey')
+    
     row_labels = []
-    for _, row in unique_base.iterrows():
+    seen_labels = set()
+    for _, row in base_sort.iterrows():
         base = row['BaseLabel']
-        row_labels.append(f"{base} ({label_a})")
-        row_labels.append(f"{base} ({label_b})")
+        if base in seen_labels:
+            continue
+        seen_labels.add(base)
+        # Only add a row if it has events in that timeline
+        if any((combined_df['BaseLabel'] == base) & (combined_df['Source'] == label_a)):
+            row_labels.append(f"{base} ({label_a})")
+        if any((combined_df['BaseLabel'] == base) & (combined_df['Source'] == label_b)):
+            row_labels.append(f"{base} ({label_b})")
     
     # Map row labels to y positions
     row_to_y = {label: i for i, label in enumerate(row_labels)}
@@ -1165,27 +1966,34 @@ def create_comparison_gantt_matplotlib(
             linewidth=0.5
         )
     
-    # Add divergence line if specified
-    if divergence_start is not None:
-        div_x = to_relative_seconds(divergence_start)
-        ax.axvline(x=div_x, color='red', linestyle='--', linewidth=2, label='Divergence')
+    # Add divergence marker if specified
+    if divergence_delta is not None:
+        div_x_start = divergence_delta - window_start_sec
+        div_x_end = (divergence_end_delta - window_start_sec) if divergence_end_delta is not None else div_x_start
+        window_width = window_end_sec - window_start_sec
+        
+        if div_x_start <= window_width and div_x_end >= 0:
+            # Clamp to visible window
+            vis_start = max(0, div_x_start)
+            vis_end = min(window_width, div_x_end)
+            
+            if vis_end > vis_start + 1.0:
+                # Wide enough to show as a shaded region
+                ax.axvspan(vis_start, vis_end, alpha=0.15, color='red', label='Divergence')
+                ax.axvline(x=vis_start, color='red', linestyle='--', linewidth=1.5)
+                ax.axvline(x=vis_end, color='red', linestyle='--', linewidth=1.5)
+            else:
+                # Narrow divergence - just show a single line
+                ax.axvline(x=vis_start, color='red', linestyle='--', linewidth=2, label='Divergence')
     
     # Configure axes
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels)
-    ax.set_xlabel('Time (seconds from window start)')
+    ax.set_xlabel('Time (seconds from aligned start)')
     ax.set_title(title)
-    ax.set_xlim(0, (window_end - window_start).total_seconds())
+    ax.set_xlim(0, window_end_sec - window_start_sec)
     ax.invert_yaxis()  # Put first row at top
     ax.grid(axis='x', alpha=0.3)
-    
-    # Add legend for signal colors
-    legend_patches = [
-        mpatches.Patch(color=SIGNAL_COLORS['Green'], label='Green'),
-        mpatches.Patch(color=SIGNAL_COLORS['Yellow'], label='Yellow'),
-        mpatches.Patch(color=SIGNAL_COLORS['Red'], label='Red'),
-    ]
-    ax.legend(handles=legend_patches, loc='upper right', fontsize=8)
     
     plt.tight_layout()
     
@@ -1297,9 +2105,29 @@ def compare_and_visualize(
         print(f"{'='*60}")
         print(f"  Match Percentage:  {result.match_percentage:.1f}%  (threshold: ≥{thresholds.match_threshold}%)")
         print(f"    {'⚠️  BELOW THRESHOLD' if result.match_percentage < thresholds.match_threshold else '✓ OK'}")
-        print(f"  Events in A: {result.sequence_dtw.sequence_length_a}")
-        print(f"  Events in B: {result.sequence_dtw.sequence_length_b}")
+        print(f"  Timestamp groups in A: {result.sequence_dtw.sequence_length_a}")
+        print(f"  Timestamp groups in B: {result.sequence_dtw.sequence_length_b}")
+        print(f"  Alignment: trimmed {result.alignment_offset} groups "
+              f"({result.alignment_trim_seconds_a:.1f}s from A, "
+              f"{result.alignment_trim_seconds_b:.1f}s from B)")
         print(f"  Divergences: {len(result.divergence_windows)}")
+        
+        if result.divergence_windows:
+            for i, div in enumerate(result.divergence_windows, 1):
+                if div.description:
+                    print(f"    {i}. {div.description}")
+                else:
+                    print(f"    {i}. A: {div.original_start_seconds_a:.1f}s - "
+                          f"{div.original_end_seconds_a:.1f}s")
+        
+        if result.timing_stats:
+            ts = result.timing_stats
+            residual = ts.get('alignment_residual', 0.0)
+            residual_str = f" (residual={residual:+.1f}s)" if abs(residual) > 0.05 else ""
+            print(f"  Timing: jitter_std={ts['std_diff']:.3f}s, "
+                  f"max={ts['max_abs_diff']:.3f}s, "
+                  f"p95={ts['p95_abs_diff']:.3f}s{residual_str}")
+        
         print(f"{'='*60}")
         
         if result.exceeds_threshold:
@@ -1310,79 +2138,85 @@ def compare_and_visualize(
     
     if should_plot:
         # Find divergence time from the first divergence window
-            divergence_start = None
-            divergence_end = None
+        divergence_start = None
+        divergence_end = None
+        
+        if result.divergence_windows:
+            # Get prepared events to find actual timestamps
+            df_a_prep = prepare_events_for_comparison(df_a, event_ids=event_ids)
+            df_b_prep = prepare_events_for_comparison(df_b, event_ids=event_ids)
             
-            if result.divergence_windows:
-                # Get prepared events to find actual timestamps
-                df_a_prep = prepare_events_for_comparison(df_a, event_ids=event_ids)
-                df_b_prep = prepare_events_for_comparison(df_b, event_ids=event_ids)
+            if not df_a_prep.empty and not df_b_prep.empty:
+                first_div = result.divergence_windows[0]
                 
-                if not df_a_prep.empty and not df_b_prep.empty:
-                    first_div = result.divergence_windows[0]
-                    
-                    # Get actual timestamps
-                    if first_div.start_index_a < len(df_a_prep):
-                        divergence_start = df_a_prep.iloc[first_div.start_index_a]['timestamp']
-                    if first_div.end_index_a < len(df_a_prep):
-                        divergence_end = df_a_prep.iloc[first_div.end_index_a]['timestamp']
+                # Get actual timestamps
+                if first_div.start_index_a < len(df_a_prep):
+                    divergence_start = df_a_prep.iloc[first_div.start_index_a]['timestamp']
+                if first_div.end_index_a < len(df_a_prep):
+                    divergence_end = df_a_prep.iloc[first_div.end_index_a]['timestamp']
+        
+        # If no divergence found, use the middle of the data
+        if divergence_start is None:
+            df_a_prep = prepare_events_for_comparison(df_a, event_ids=event_ids)
+            if not df_a_prep.empty:
+                mid_idx = len(df_a_prep) // 2
+                divergence_start = df_a_prep.iloc[mid_idx]['timestamp']
+                divergence_end = divergence_start
+        
+        try:
+            # Use atspm timeline generator
+            print("Generating timelines with atspm...")
+            timeline_a = generate_timeline(df_a, device_id=device_id)
+            timeline_b = generate_timeline(df_b, device_id=device_id)
             
-            # If no divergence found, use the middle of the data
-            if divergence_start is None:
-                df_a_prep = prepare_events_for_comparison(df_a, event_ids=event_ids)
-                if not df_a_prep.empty:
-                    mid_idx = len(df_a_prep) // 2
-                    divergence_start = df_a_prep.iloc[mid_idx]['timestamp']
-                    divergence_end = divergence_start
-            
-            try:
-                # Use atspm timeline generator
-                print("Generating timelines with atspm...")
-                timeline_a = generate_timeline(df_a, device_id=device_id)
-                timeline_b = generate_timeline(df_b, device_id=device_id)
+            if timeline_a.empty or timeline_b.empty:
+                warnings.warn("No timeline events generated. Check that data contains phase/overlap events.")
+            else:
+                # Compute timeline alignment using cross-correlation
+                time_offset = compute_timeline_offset(timeline_a, timeline_b)
                 
-                if timeline_a.empty or timeline_b.empty:
-                    warnings.warn("No timeline events generated. Check that data contains phase/overlap events.")
-                else:
-                    # Generate output filename
-                    if output_name is None:
-                        output_name = f"comparison_{label_a}_vs_{label_b}".replace(' ', '_')
+                # Generate output filename
+                if output_name is None:
+                    output_name = f"comparison_{label_a}_vs_{label_b}".replace(' ', '_')
+                
+                # Default to .png if not specified
+                if not output_name.lower().endswith(('.html', '.png', '.jpeg', '.jpg', '.webp', '.pdf', '.svg')):
+                    output_name += ".png"
                     
-                    # Default to .png if not specified
-                    if not output_name.lower().endswith(('.html', '.png', '.jpeg', '.jpg', '.webp', '.pdf', '.svg')):
-                        output_name += ".png"
-                        
-                    output_path = Path(output_dir) / output_name
-                    
-                    print(f"Creating Gantt chart with {len(timeline_a)} events (A) and {len(timeline_b)} events (B)...")
-                    
-                    # Use matplotlib for all outputs (reliable export, no kaleido issues)
-                    if HAS_MATPLOTLIB:
-                        # Ensure we use a supported static extension
-                        if not output_path.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
-                            output_path = output_path.with_suffix('.png')
+                output_path = Path(output_dir) / output_name
+                
+                print(f"Creating Gantt chart with {len(timeline_a)} events (A) and {len(timeline_b)} events (B)...")
+                print(f"Timeline alignment offset: {time_offset:.1f}s")
+                
+                # Use matplotlib for all outputs (reliable export, no kaleido issues)
+                if HAS_MATPLOTLIB:
+                    # Ensure we use a supported static extension
+                    if not output_path.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
+                        output_path = output_path.with_suffix('.png')
 
-                        fig = create_comparison_gantt_matplotlib(
-                            timeline_a=timeline_a,
-                            timeline_b=timeline_b,
-                            label_a=label_a,
-                            label_b=label_b,
-                            title=f"Comparison: {label_a} vs {label_b}",
-                            divergence_start=divergence_start,
-                            divergence_end=divergence_end,
-                            output_path=output_path,
-                            window_minutes=window_minutes
-                        )
-                        plt.close(fig)  # Clean up
-                    else:
-                        warnings.warn("matplotlib not installed. Install with: pip install matplotlib")
-                    
-                    result.plot_path = str(output_path)
+                    fig = create_comparison_gantt_matplotlib(
+                        timeline_a=timeline_a,
+                        timeline_b=timeline_b,
+                        label_a=label_a,
+                        label_b=label_b,
+                        title=f"Comparison: {label_a} vs {label_b}",
+                        divergence_start=divergence_start,
+                        divergence_end=divergence_end,
+                        output_path=output_path,
+                        window_minutes=window_minutes,
+                        align_by_time_delta=True,
+                        time_offset_b=time_offset
+                    )
+                    plt.close(fig)  # Clean up
+                else:
+                    warnings.warn("matplotlib not installed. Install with: pip install matplotlib")
                 
-            except Exception as e:
-                import traceback
-                warnings.warn(f"Failed to generate visualization: {e}")
-                traceback.print_exc()
+                result.plot_path = str(output_path)
+            
+        except Exception as e:
+            import traceback
+            warnings.warn(f"Failed to generate visualization: {e}")
+            traceback.print_exc()
     
     return result
 

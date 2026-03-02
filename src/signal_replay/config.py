@@ -32,6 +32,7 @@ class SignalConfig:
         cycle_length: Cycle length in seconds for coordinated signals (0 = disabled, default)
         incompatible_pairs: List of phase/overlap pairs that should never be active together. Optional - if not provided, conflict checking is disabled.
         cycle_offset: Offset in seconds within the cycle to start playback (0 = cycle boundary)
+        tod_align: If True, align replay events to wall-clock time-of-day from input timestamps
         limit_minutes: Limit input events to the last N minutes (0 = no limit)
         buffer_minutes: Include additional buffer minutes before the last N minutes (0 = no buffer)
         http_port: Port for HTTP data collection. Defaults to udp_port for localhost, 80 for remote hosts. Use None to disable.
@@ -42,6 +43,7 @@ class SignalConfig:
     cycle_length: int = 0
     incompatible_pairs: Optional[List[Tuple[str, str]]] = None
     cycle_offset: float = 0.0
+    tod_align: bool = False
     limit_minutes: float = 0.0
     buffer_minutes: float = 0.0
     http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
@@ -88,6 +90,12 @@ class SignalConfig:
         # Validate cycle_offset
         if not isinstance(self.cycle_offset, (int, float)) or self.cycle_offset < 0:
             raise ValueError(f"cycle_offset must be a non-negative number, got {self.cycle_offset}")
+
+        # Validate TOD alignment mode
+        if not isinstance(self.tod_align, bool):
+            raise ValueError(f"tod_align must be a boolean, got {type(self.tod_align)}")
+        if self.tod_align and self.cycle_length > 0:
+            raise ValueError("tod_align=True is incompatible with cycle_length > 0")
         
         # Normalize and validate incompatible_pairs
         # None means no conflict checking (convert to empty list for internal use)
@@ -128,6 +136,10 @@ class SimulationConfig:
         controller_type: Type of controller (currently only "MAXTIME" supported)
         simulation_speed: Speed multiplier for the simulation (1.0 = real-time)
         collection_interval_minutes: How often to collect data from controllers (default: 5)
+        post_replay_settle_seconds: Wait this long after replay completes before final collection
+        snmp_timeout_seconds: SNMP response timeout used for replay commands
+        show_progress_logs: If True, print periodic "Sent x/y events" progress logs
+        progress_log_interval_seconds: Interval between replay progress logs
     """
     signals: List[SignalConfig]
     events: Union[pd.DataFrame, str, Path]
@@ -137,6 +149,10 @@ class SimulationConfig:
     controller_type: str = "MAXTIME"
     simulation_speed: float = 1.0
     collection_interval_minutes: float = 5.0
+    post_replay_settle_seconds: float = 10.0
+    snmp_timeout_seconds: float = 2.0
+    show_progress_logs: bool = False
+    progress_log_interval_seconds: float = 60.0
     
     def __post_init__(self):
         # Validate signals list
@@ -170,6 +186,28 @@ class SimulationConfig:
         # Validate collection_interval_minutes
         if not isinstance(self.collection_interval_minutes, (int, float)) or self.collection_interval_minutes <= 0:
             raise ValueError(f"collection_interval_minutes must be a positive number, got {self.collection_interval_minutes}")
+
+        # Validate post_replay_settle_seconds
+        if not isinstance(self.post_replay_settle_seconds, (int, float)) or self.post_replay_settle_seconds < 0:
+            raise ValueError(f"post_replay_settle_seconds must be a non-negative number, got {self.post_replay_settle_seconds}")
+
+        # Validate snmp_timeout_seconds
+        if not isinstance(self.snmp_timeout_seconds, (int, float)) or self.snmp_timeout_seconds <= 0:
+            raise ValueError(f"snmp_timeout_seconds must be a positive number, got {self.snmp_timeout_seconds}")
+
+        # Validate show_progress_logs
+        if not isinstance(self.show_progress_logs, bool):
+            raise ValueError(f"show_progress_logs must be a boolean, got {type(self.show_progress_logs)}")
+
+        # Validate progress_log_interval_seconds
+        if (
+            not isinstance(self.progress_log_interval_seconds, (int, float))
+            or self.progress_log_interval_seconds <= 0
+        ):
+            raise ValueError(
+                "progress_log_interval_seconds must be a positive number, "
+                f"got {self.progress_log_interval_seconds}"
+            )
         
         # Validate db_path
         if not isinstance(self.db_path, str):

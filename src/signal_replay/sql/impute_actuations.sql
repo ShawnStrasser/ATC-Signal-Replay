@@ -57,7 +57,7 @@ interpolate_PED_ONs AS (
     WHERE EventId = 89 AND PrevEventId = 89
 ),
 combined AS (
-    SELECT * FROM raw_data
+    SELECT TimeStamp, DeviceId, EventId, Detector, DetectorType FROM raw_data
     UNION ALL
     SELECT * FROM interpolate_OFFS_rapid
     UNION ALL

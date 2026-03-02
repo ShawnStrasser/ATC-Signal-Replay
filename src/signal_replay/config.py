@@ -7,13 +7,6 @@ from typing import Union, List, Tuple, Optional
 from pathlib import Path
 import pandas as pd
 
-try:
-    import pyarrow as pa
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
-    pa = None
-
 # Sentinel value to indicate "use default"
 _USE_DEFAULT = object()
 

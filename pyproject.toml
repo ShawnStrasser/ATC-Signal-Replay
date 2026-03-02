@@ -31,7 +31,8 @@ dependencies = [
     "atspm",
     "pysnmplib>=5.0.24",
     "dtaidistance",
-    "matplotlib"
+    "matplotlib",
+    "pyyaml"
 ]
 
 [project.optional-dependencies]

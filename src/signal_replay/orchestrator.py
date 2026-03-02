@@ -6,7 +6,7 @@ import threading
 import time
 from copy import copy
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import pandas as pd
@@ -24,7 +24,8 @@ from .comparison import (
     store_comparison_result,
     generate_timeline,
     prepare_events_for_comparison,
-    HAS_ATSPM
+    HAS_ATSPM,
+    HAS_MATPLOTLIB,
 )
 
 
@@ -129,8 +130,14 @@ class ATCSimulation:
         stop_on_conflict: bool = False,
         db_path: str = "./atc_replay.duckdb",
         simulation_speed: float = 1.0,
+        collection_interval_minutes: float = 5.0,
+        post_replay_settle_seconds: float = 10.0,
+        snmp_timeout_seconds: float = 2.0,
+        show_progress_logs: bool = False,
+        progress_log_interval_seconds: float = 60.0,
         comparison_thresholds: Optional[ComparisonThresholds] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        skip_comparison: bool = False,
         debug: bool = False
     ):
         """
@@ -145,13 +152,21 @@ class ATCSimulation:
             stop_on_conflict: Stop simulation on first conflict
             db_path: Path to DuckDB database
             simulation_speed: Speed multiplier (1.0 = real-time)
+            collection_interval_minutes: How often to poll controller event logs
+            post_replay_settle_seconds: Wait after replay before final collection
+            snmp_timeout_seconds: SNMP response timeout for replay sends
+            show_progress_logs: If True, print periodic replay send progress
+            progress_log_interval_seconds: Seconds between progress log lines
             comparison_thresholds: Thresholds for triggering comparison alerts.
                 If None, uses defaults (sequence=0.05, timing=0.02, match=95%).
             output_dir: Directory to save comparison plots when thresholds exceeded.
                 If None, no plots are generated.
+            skip_comparison: If True, skip the post-replay comparison analysis.
+                Useful when comparison is done separately (e.g., in a report step).
             debug: Enable debug output
         """
         self.debug = debug
+        self.skip_comparison = skip_comparison
         self.comparison_thresholds = comparison_thresholds or ComparisonThresholds()
         self.output_dir = Path(output_dir) if output_dir else None
         
@@ -181,7 +196,15 @@ class ATCSimulation:
                 stop_on_conflict=stop_on_conflict,
                 db_path=db_path,
                 simulation_speed=simulation_speed,
+                collection_interval_minutes=collection_interval_minutes,
+                post_replay_settle_seconds=post_replay_settle_seconds,
+                snmp_timeout_seconds=snmp_timeout_seconds,
+                show_progress_logs=show_progress_logs,
+                progress_log_interval_seconds=progress_log_interval_seconds,
             )
+
+        if any(sig.tod_align for sig in self.config.signals) and self.config.simulation_speed != 1.0:
+            raise ValueError("simulation_speed must be 1.0 when any signal uses tod_align=True")
         
         # Initialize database
         self.db = DatabaseManager(self.config.db_path)
@@ -192,7 +215,9 @@ class ATCSimulation:
             print(f"Existing runs found in database. Starting new runs from {self._run_offset + 1}")
         
         # Store input events for comparison
+        t0 = time.time()
         self._store_input_events()
+        print(f"  Input events stored in {time.time() - t0:.1f}s")
         
         # State tracking
         self._current_run: int = 0
@@ -200,6 +225,7 @@ class ATCSimulation:
         self._stop_event: threading.Event = threading.Event()
         self._conflicts_found: List[Dict[str, Any]] = []
         self._completed_runs: List[int] = []
+        self._failed_signals_by_run: Dict[int, List[str]] = {}
         self._comparison_results: Optional[Dict[str, List[ComparisonResult]]] = None
     
     def _store_input_events(self) -> None:
@@ -208,13 +234,23 @@ class ATCSimulation:
         This stores the original phase/overlap events from the source data,
         not the detector actuations. This allows meaningful comparison between
         the source data and the replay output events.
+        
+        Also caches run duration from each replay to avoid recreating them later.
         """
+        self._cached_durations: Dict[str, float] = {}
+        
         for signal_config in self.config.signals:
             replay = SignalReplay(
                 signal_config,
                 simulation_speed=self.config.simulation_speed,
+                snmp_timeout_seconds=self.config.snmp_timeout_seconds,
+                show_progress_logs=self.config.show_progress_logs,
+                progress_log_interval_seconds=self.config.progress_log_interval_seconds,
                 debug=self.debug
             )
+            
+            # Cache duration so _get_estimated_duration doesn't recreate replays
+            self._cached_durations[signal_config.device_id] = replay.get_run_duration()
             
             # Get source comparison events (phase/overlap events)
             comparison_events = replay.get_source_comparison_events()
@@ -228,19 +264,25 @@ class ATCSimulation:
         replay = SignalReplay(
             signal_config,
             simulation_speed=self.config.simulation_speed,
+            snmp_timeout_seconds=self.config.snmp_timeout_seconds,
+            show_progress_logs=self.config.show_progress_logs,
+            progress_log_interval_seconds=self.config.progress_log_interval_seconds,
             debug=self.debug
         )
         return replay.run()
     
-    def _run_all_signals(self) -> Dict[str, datetime]:
+    def _run_all_signals(self) -> Tuple[Dict[str, datetime], List[str]]:
         """
         Run replay for all signals in parallel and return start times.
         
         This method BLOCKS until all signal replays have completed.
         Multiple signals run in parallel via ThreadPoolExecutor, but this
         method waits for all of them to finish before returning.
+        
+        Individual signal failures are logged but do not abort other signals.
         """
         start_times = {}
+        failed_signals = []
         
         with ThreadPoolExecutor(max_workers=len(self.config.signals)) as executor:
             futures = {
@@ -250,19 +292,39 @@ class ATCSimulation:
             
             for future in as_completed(futures):
                 device_id = futures[future]
-                start_time = future.result()
-                start_times[device_id] = start_time
+                try:
+                    start_time = future.result()
+                    start_times[device_id] = start_time
+                except Exception as exc:
+                    failed_signals.append(device_id)
+                    print(f"*** Signal {device_id} failed: {exc}")
         
-        return start_times
+        if failed_signals:
+            print(f"\n*** {len(failed_signals)}/{len(self.config.signals)} signals failed: "
+                  f"{', '.join(failed_signals)}")
+            print(f"    Continuing with {len(start_times)} successful signals.")
+        
+        return start_times, failed_signals
     
     def _get_estimated_duration(self) -> float:
-        """Get estimated simulation duration in seconds."""
+        """Get estimated simulation duration in seconds.
+        
+        Uses cached durations from _store_input_events to avoid
+        recreating expensive SignalReplay instances.
+        """
+        if self._cached_durations:
+            return max(self._cached_durations.values()) if self._cached_durations else 0.0
+        
+        # Fallback: create replays (should not normally be reached)
         max_duration = 0.0
         
         for signal_config in self.config.signals:
             replay = SignalReplay(
                 signal_config,
                 simulation_speed=self.config.simulation_speed,
+                snmp_timeout_seconds=self.config.snmp_timeout_seconds,
+                show_progress_logs=self.config.show_progress_logs,
+                progress_log_interval_seconds=self.config.progress_log_interval_seconds,
                 debug=self.debug
             )
             duration = replay.get_run_duration()
@@ -300,14 +362,22 @@ class ATCSimulation:
             Dict with simulation results including:
             - completed_runs: List of completed run numbers
             - conflicts: List of detected conflicts
+            - failed_signals_by_run: Dict of run_number -> failed device IDs
             - stopped_early: Whether simulation stopped due to conflict
             - comparison_summary: DTW comparison summary string
         """
         print(f"Starting ATC simulation with {len(self.config.signals)} signals, "
               f"{self.config.simulation_replays} replays")
         
+        tod_mode = any(sig.tod_align for sig in self.config.signals)
+        t0 = time.time()
         estimated_duration = self._get_estimated_duration()
-        print(f"Estimated duration per run: {int(estimated_duration // 60):02d}:{int(estimated_duration % 60):02d}")
+        duration_str = f"{int(estimated_duration // 3600):d}h {int((estimated_duration % 3600) // 60):02d}m"
+        if tod_mode:
+            print(f"Replay data spans ~{duration_str} (TOD-align: events sent at real wall-clock times)")
+        else:
+            print(f"Estimated duration per run: {duration_str} "
+                  f"(computed in {time.time() - t0:.1f}s)")
         
         # Build device configs for collector
         # Structure: {device_id: (ip_port, incompatible_pairs, http_port)}
@@ -326,6 +396,7 @@ class ATCSimulation:
         )
         
         stopped_early = False
+        collection_error = False
         
         for run_idx in range(1, self.config.simulation_replays + 1):
             run_num = run_idx + self._run_offset
@@ -340,26 +411,67 @@ class ATCSimulation:
             
             # Reset stop event for this run
             run_stop_event = threading.Event()
+            collection_error_event = threading.Event()
             
             # Start data collection in background thread
             collection_thread = threading.Thread(
                 target=collector.run_collection_loop,
                 args=(run_num, datetime.now(), run_stop_event, self._on_conflict_detected),
+                kwargs={"error_event": collection_error_event},
                 daemon=True
             )
             collection_thread.start()
             
             # Run all signals - this BLOCKS until all replays complete
             # No additional sleep needed since _run_all_signals waits for completion
-            start_times = self._run_all_signals()
+            print(f"Sending events to {len(self.config.signals)} controllers...")
+            start_times, failed_signals = self._run_all_signals()
+            if failed_signals:
+                self._failed_signals_by_run[run_num] = failed_signals
+                print(
+                    f"Run {run_num} signal failures: "
+                    + ", ".join(failed_signals)
+                )
             self._simulation_start_time = min(start_times.values()) if start_times else datetime.now()
+
+            if not start_times:
+                print(f"\n*** Aborting run {run_num}: all signals failed.")
+                stopped_early = True
+                collection_error = True
+                run_stop_event.set()
+                collection_thread.join(timeout=60)
+                break
+            
+            # Check if collection thread hit a fatal error during replay
+            if collection_error_event.is_set():
+                print("\n*** Aborting: data collection failed (controller unreachable).")
+                stopped_early = True
+                collection_error = True
+                break
             
             # Stop collection for this run
             run_stop_event.set()
-            collection_thread.join(timeout=30)
+            collection_thread.join(timeout=60)
             
-            # Final data collection for this run
-            collector.collect_once(run_num, self._simulation_start_time)
+            # Ensure collection thread has fully released file handles
+            if collection_thread.is_alive():
+                print("Warning: collection thread still running, waiting for it to finish...")
+                collection_thread.join(timeout=120)
+
+            if self.config.post_replay_settle_seconds > 0:
+                time.sleep(self.config.post_replay_settle_seconds)
+            
+            # Final data collection for this run (with retry for file lock release)
+            for _attempt in range(3):
+                try:
+                    collector.collect_once(run_num, self._simulation_start_time)
+                    break
+                except Exception as e:
+                    if _attempt < 2 and "being used by another process" in str(e):
+                        print(f"  Retrying collection (file lock)...")
+                        time.sleep(5)
+                    else:
+                        raise
             
             self._completed_runs.append(run_num)
             print(f"Run {run_num} completed")
@@ -371,14 +483,21 @@ class ATCSimulation:
                 break
         
         # Run comparison analysis
-        print("\n--- Running Comparison Analysis ---")
-        self._run_comparison()
+        if collection_error:
+            print("\n--- Skipping comparison (collection failed) ---")
+        elif self.skip_comparison:
+            pass  # comparison deferred to report step
+        else:
+            print("\n--- Running Comparison Analysis ---")
+            self._run_comparison()
         
         # Build results
         results = {
             'completed_runs': self._completed_runs,
             'conflicts': self._conflicts_found,
+            'failed_signals_by_run': self._failed_signals_by_run,
             'stopped_early': stopped_early,
+            'collection_error': collection_error,
             'comparison_summary': self.get_comparison_summary()
         }
         
@@ -391,12 +510,23 @@ class ATCSimulation:
         """Run DTW comparison analysis on all collected data with threshold checks."""
         device_ids = [sig.device_id for sig in self.config.signals]
         
-        self._comparison_results = compare_all_runs(
-            self.db,
-            device_ids,
-            self._completed_runs,
-            include_input_comparison=True
-        )
+        # Retry with delay to handle file-lock release lag on network shares
+        for attempt in range(5):
+            try:
+                self._comparison_results = compare_all_runs(
+                    self.db,
+                    device_ids,
+                    self._completed_runs,
+                    include_input_comparison=True
+                )
+                break
+            except Exception as e:
+                if attempt < 4 and "being used by another process" in str(e):
+                    wait = 3 * (attempt + 1)
+                    print(f"  Database locked, retrying in {wait}s... (attempt {attempt + 1}/5)")
+                    time.sleep(wait)
+                else:
+                    raise
         
         # Check thresholds and generate plots for each comparison
         self._check_thresholds_and_plot()
@@ -439,9 +569,9 @@ class ATCSimulation:
             if self.debug:
                 print("Cannot generate plots: 'atspm' package not installed")
             return
-        if not HAS_PLOTLY:
+        if not HAS_MATPLOTLIB:
             if self.debug:
-                print("Cannot generate plots: 'plotly' package not installed")
+                print("Cannot generate plots: 'matplotlib' package not installed")
             return
         
         try:
@@ -517,6 +647,11 @@ class ATCSimulation:
         
         print(f"\nCompleted Runs: {len(self._completed_runs)}")
         print(f"Conflicts Found: {len(self._conflicts_found)}")
+        if self._failed_signals_by_run:
+            print("Signal Failures by Run:")
+            for run_num in sorted(self._failed_signals_by_run):
+                failed = ", ".join(self._failed_signals_by_run[run_num])
+                print(f"  Run {run_num}: {failed}")
         
         if self._conflicts_found:
             print("\nConflicts:")

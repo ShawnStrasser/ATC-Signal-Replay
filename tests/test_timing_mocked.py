@@ -7,6 +7,8 @@ requiring a live device. They mock SNMP and HTTP calls.
 
 import pytest
 import time
+import asyncio
+import threading
 from datetime import datetime, timedelta
 from typing import List
 from unittest.mock import patch, MagicMock
@@ -64,8 +66,8 @@ class TestOrchestratorTimingWithMocks:
         return create_synthetic_events(duration_seconds=5.0, events_per_second=2.0)
     
     @patch('signal_replay.collector.fetch_output_data')
-    @patch('signal_replay.ntcip.send_ntcip')
-    @patch('signal_replay.ntcip.reset_all_detectors')
+    @patch('signal_replay.replay.send_ntcip')
+    @patch('signal_replay.replay.reset_all_detectors')
     def test_no_double_wait_single_run(
         self,
         mock_reset: MagicMock,
@@ -116,12 +118,14 @@ class TestOrchestratorTimingWithMocks:
         actual_duration = time.time() - start
         
         # With mocks (no real SNMP), overhead should be minimal
-        # Allow 15% overhead + 2s fixed overhead for thread scheduling
+        # Account for post_replay_settle_seconds (default 10s) and thread scheduling
         # If double-wait exists, actual will be ~2x expected (FAIL)
-        max_allowed = expected_duration * 1.15 + 2.0
+        settle = sim_config.post_replay_settle_seconds
+        max_allowed = expected_duration + settle + 3.0
         
         assert actual_duration <= max_allowed, (
-            f"Single-run took {actual_duration:.1f}s but expected ~{expected_duration:.1f}s. "
+            f"Single-run took {actual_duration:.1f}s but expected ~{expected_duration:.1f}s "
+            f"(+{settle:.0f}s settle). "
             f"Max allowed: {max_allowed:.1f}s. "
             f"Ratio: {actual_duration / expected_duration:.2f}x. "
             f"This suggests the double-wait bug where orchestrator waits for "
@@ -131,8 +135,8 @@ class TestOrchestratorTimingWithMocks:
         assert len(results['completed_runs']) == 1
     
     @patch('signal_replay.collector.fetch_output_data')
-    @patch('signal_replay.ntcip.send_ntcip')
-    @patch('signal_replay.ntcip.reset_all_detectors')
+    @patch('signal_replay.replay.send_ntcip')
+    @patch('signal_replay.replay.reset_all_detectors')
     def test_no_double_wait_multiple_runs(
         self,
         mock_reset: MagicMock,
@@ -181,14 +185,15 @@ class TestOrchestratorTimingWithMocks:
         actual_duration = time.time() - start
         
         # With mocks, overhead should be minimal
-        # Allow 15% overhead + 2s fixed overhead per run
+        # Account for post_replay_settle_seconds (default 10s) per run
         # Double-wait bug would make ratio ~2x (FAIL)
-        max_allowed = expected_total * 1.15 + (2.0 * num_runs)
+        settle = sim_config.post_replay_settle_seconds
+        max_allowed = expected_total + (settle * num_runs) + (3.0 * num_runs)
         
         assert actual_duration <= max_allowed, (
             f"Multi-run took {actual_duration:.1f}s "
             f"(avg {actual_duration / num_runs:.1f}s/run) but expected "
-            f"~{expected_total:.1f}s total ({expected_per_run:.1f}s/run). "
+            f"~{expected_total:.1f}s total ({expected_per_run:.1f}s/run +{settle:.0f}s settle). "
             f"Max allowed: {max_allowed:.1f}s. "
             f"Ratio: {actual_duration / expected_total:.2f}x. "
             f"This suggests the double-wait bug."
@@ -230,8 +235,8 @@ class TestSignalReplayTiming:
         # Should be approximately 3 seconds
         assert 2.0 <= expected <= 4.0, f"Expected ~3s, got {expected}"
     
-    @patch('signal_replay.ntcip.send_ntcip')
-    @patch('signal_replay.ntcip.reset_all_detectors')
+    @patch('signal_replay.replay.send_ntcip')
+    @patch('signal_replay.replay.reset_all_detectors')
     def test_replay_runs_in_expected_time(
         self,
         mock_reset: MagicMock,
@@ -267,3 +272,89 @@ class TestSignalReplayTiming:
         assert actual >= expected - 0.5, (
             f"Replay too fast: {actual:.2f}s vs expected {expected:.2f}s"
         )
+
+    def test_empty_activation_feed_raises_clear_error(self, mock_ip, mock_port):
+        """Non-detector-only logs should fail early with a clear error."""
+        events = pd.DataFrame({
+            "timestamp": [datetime(2024, 1, 1, 12, 0, 0), datetime(2024, 1, 1, 12, 0, 1)],
+            "event_id": [1, 10],  # No replayable detector events
+            "parameter": [1, 1],
+            "device_id": ["test", "test"],
+        })
+
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+        )
+        config.events = events
+
+        with pytest.raises(ValueError, match="has no replayable detector events"):
+            sr.SignalReplay(config, simulation_speed=1.0)
+
+    @patch("signal_replay.replay.reset_all_detectors")
+    @patch("signal_replay.replay.send_ntcip")
+    def test_run_waits_for_pending_executor_sends_inside_event_loop(
+        self,
+        mock_send: MagicMock,
+        mock_reset: MagicMock,
+        mock_ip,
+        mock_port,
+    ):
+        """run() should return only after fire-and-forget sends finish."""
+        events = create_synthetic_events(duration_seconds=2.0, events_per_second=20.0, detector_groups=[1])
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+            http_port=None,
+        )
+        config.events = events
+
+        sent_counter = {"count": 0}
+        lock = threading.Lock()
+
+        def slow_send(*_args, **_kwargs):
+            time.sleep(0.05)
+            with lock:
+                sent_counter["count"] += 1
+
+        mock_send.side_effect = slow_send
+
+        replay = sr.SignalReplay(config, simulation_speed=1.0)
+        expected_calls = len(replay.activation_feed)
+
+        async def _run_inside_loop():
+            replay.run()
+
+        asyncio.run(_run_inside_loop())
+
+        assert sent_counter["count"] == expected_calls
+
+    @patch("signal_replay.replay.send_ntcip")
+    def test_send_command_uses_configured_snmp_timeout(
+        self,
+        mock_send: MagicMock,
+        mock_ip,
+        mock_port,
+        short_events,
+    ):
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+        )
+        config.events = short_events
+        replay = sr.SignalReplay(config, simulation_speed=1.0, snmp_timeout_seconds=2.0)
+
+        row = replay.activation_feed.iloc[0]
+        replay._send_command_sync(row)
+
+        assert mock_send.call_count == 1
+        assert mock_send.call_args.kwargs["timeout"] == 2.0

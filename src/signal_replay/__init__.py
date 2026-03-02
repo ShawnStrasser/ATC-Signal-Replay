@@ -32,14 +32,28 @@ from .comparison import (
     format_comparison_summary,
     load_events,
     generate_timeline,
+    generate_phase_difference_summary,
+    format_phase_differences,
     create_comparison_gantt_matplotlib,
+    create_multi_divergence_plots,
     store_comparison_result,
     find_alignment_offset,
     calculate_timeline_offset,
     compute_timeline_offset,
 )
+from .test_suite import (
+    TestType,
+    TestScenario,
+    TestBatch,
+    FirmwareTestSuite,
+    ScenarioResult,
+    save_to_yaml,
+    load_from_yaml,
+)
+from .batch_runner import BatchRunner, compare_firmware
+from .report import generate_report, load_annotations
 from .ntcip import send_ntcip, reset_all_detectors
-from . import collector, comparison, config, ntcip, orchestrator, replay
+from . import collector, comparison, config, ntcip, orchestrator, replay, test_suite, batch_runner, report
 
 __version__ = "1.0.0"
 __all__ = [
@@ -71,8 +85,22 @@ __all__ = [
     "format_comparison_summary",
     "load_events",
     "generate_timeline",
+    "generate_phase_difference_summary",
+    "format_phase_differences",
     "create_comparison_gantt_matplotlib",
+    "create_multi_divergence_plots",
     "store_comparison_result",
+    "TestType",
+    "TestScenario",
+    "TestBatch",
+    "FirmwareTestSuite",
+    "ScenarioResult",
+    "save_to_yaml",
+    "load_from_yaml",
+    "BatchRunner",
+    "compare_firmware",
+    "generate_report",
+    "load_annotations",
     "send_ntcip",
     "reset_all_detectors",
     "collector",
@@ -81,4 +109,7 @@ __all__ = [
     "ntcip",
     "orchestrator",
     "replay",
+    "test_suite",
+    "batch_runner",
+    "report",
 ]

@@ -10,7 +10,7 @@ import time
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Union, Optional, Tuple, List
+from typing import Union, Optional, Tuple, List, Set
 from importlib import resources
 from jinja2 import Template
 
@@ -46,6 +46,9 @@ class SignalReplay:
         simulation_speed: float = 1.0,
         limit_minutes: Optional[float] = None,
         buffer_minutes: Optional[float] = None,
+        snmp_timeout_seconds: float = 2.0,
+        show_progress_logs: bool = False,
+        progress_log_interval_seconds: float = 60.0,
         debug: bool = False
     ):
         """
@@ -56,6 +59,9 @@ class SignalReplay:
             simulation_speed: Speed multiplier for playback (1.0 = real-time)
             limit_minutes: Limit input events to the last N minutes (0 = no limit)
             buffer_minutes: Include buffer minutes before the last N minutes (0 = no buffer)
+            snmp_timeout_seconds: SNMP response timeout in seconds for replay sends
+            show_progress_logs: If True, print periodic "Sent x/y events" updates
+            progress_log_interval_seconds: Seconds between periodic progress updates
             debug: Enable debug output
         """
         self.config = config
@@ -63,10 +69,14 @@ class SignalReplay:
         self.ip_port = config.ip_port
         self.cycle_length = config.cycle_length
         self.cycle_offset = config.cycle_offset
+        self.tod_align = config.tod_align
         self.incompatible_pairs = config.incompatible_pairs
         self.simulation_speed = simulation_speed
         self.limit_minutes = config.limit_minutes if limit_minutes is None else limit_minutes
         self.buffer_minutes = config.buffer_minutes if buffer_minutes is None else buffer_minutes
+        self.snmp_timeout_seconds = snmp_timeout_seconds
+        self.show_progress_logs = show_progress_logs
+        self.progress_log_interval_seconds = progress_log_interval_seconds
         self.debug = debug
         
         self.input_data: Optional[pd.DataFrame] = None
@@ -76,6 +86,7 @@ class SignalReplay:
         self.input_window_start: Optional[datetime] = None
         self.input_window_end: Optional[datetime] = None
         self.input_buffer_start: Optional[datetime] = None
+        self._pending_sends: Set[asyncio.Future] = set()
         
         # Load and process events
         self._load_events()
@@ -141,6 +152,10 @@ class SignalReplay:
         # Ensure timestamp is datetime
         if not pd.api.types.is_datetime64_any_dtype(df['TimeStamp']):
             df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
+        
+        # Keep only the expected columns to avoid duplicate/extra column issues
+        expected_cols = ['TimeStamp', 'DeviceId', 'EventId', 'Detector', 'DetectorType']
+        df = df[expected_cols]
         
         self.input_data = df.sort_values('TimeStamp').reset_index(drop=True)
     
@@ -227,6 +242,11 @@ class SignalReplay:
         sql_feed = _get_sql_template('generate_activation_feed.sql')
         self.activation_feed = con.execute(sql_feed).df()
         con.close()
+
+        if self.activation_feed is None or self.activation_feed.empty:
+            raise ValueError(
+                f"Scenario {self.device_id} has no replayable detector events - check the log file"
+            )
         
         # Add cumulative sleep time (adjusted for simulation speed)
         self.activation_feed['sleep_time_cumulative'] = (
@@ -351,17 +371,15 @@ class SignalReplay:
             """
             return duckdb.sql(sql).df()
     
-    async def _send_command(self, row) -> None:
-        """Send a single SNMP command via executor (non-blocking)."""
-        loop = asyncio.get_event_loop()
+    def _send_command_sync(self, row) -> None:
+        """Send a single SNMP command (called from background thread)."""
         try:
-            await loop.run_in_executor(
-                None,
-                send_ntcip,
+            send_ntcip(
                 self.ip_port,
                 row.group_number,
                 row.state_integer,
-                row.DetectorType
+                row.DetectorType,
+                timeout=self.snmp_timeout_seconds,
             )
         except Exception as exc:
             if self.debug:
@@ -369,7 +387,20 @@ class SignalReplay:
                     f"[{self.device_id}] SNMP send failed for group {row.group_number} "
                     f"type {row.DetectorType}: {exc}"
                 )
-    
+
+    async def _send_command(self, row) -> None:
+        """Fire-and-forget SNMP command — dispatches to thread pool without waiting."""
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(None, self._send_command_sync, row)
+        self._pending_sends.add(future)
+        future.add_done_callback(self._pending_sends.discard)
+
+    async def _wait_for_pending_sends(self) -> None:
+        """Wait until all dispatched SNMP sends have completed."""
+        if not self._pending_sends:
+            return
+        await asyncio.gather(*list(self._pending_sends), return_exceptions=True)
+
     async def _run_async(self) -> None:
         """
         Run the async SNMP command replay using sequential dispatch.
@@ -383,22 +414,102 @@ class SignalReplay:
         (one task per device), not at the event level.
         """
         activation_feed = self.activation_feed
+
+        if self.tod_align:
+            if self.simulation_start_time is None:
+                self.simulation_start_time = datetime.now()
+
+            # Shift all event timestamps so the earliest event's date maps to
+            # today.  Events on subsequent dates (e.g. after midnight) naturally
+            # land on tomorrow, the day after, etc.
+            min_event_date = pd.to_datetime(activation_feed['TimeStamp'].min()).date()
+            date_shift = self.simulation_start_time.date() - min_event_date
+
+            replay_start = self.simulation_start_time
+            skipped_events = 0
+            first_target = None
+
+            # Pre-compute shifted timestamps to avoid slow per-row iteration
+            shifted_ts = pd.to_datetime(activation_feed['TimeStamp']) + date_shift
+            mask = shifted_ts >= replay_start
+            first_valid_idx = mask.idxmax() if mask.any() else None
+
+            if first_valid_idx is not None:
+                first_target = shifted_ts.loc[first_valid_idx]
+                skipped_events = int((shifted_ts < replay_start).sum())
+                print(f"[{self.device_id}] TOD align: date_shift={date_shift.days}d, "
+                      f"skipping {skipped_events}/{len(activation_feed)} old events, "
+                      f"first event at {first_target:%H:%M:%S}")
+            else:
+                print(f"[{self.device_id}] TOD align: ALL {len(activation_feed)} events "
+                      f"are before {replay_start:%H:%M:%S} — nothing to send!")
+                return
+
+            # Slice to only the events we need (avoids iterating through skipped rows)
+            active_feed = activation_feed.loc[first_valid_idx:]
+            active_shifted = shifted_ts.loc[first_valid_idx:]
+            total_to_send = len(active_feed)
+
+            # Show wait time if first event is in the future
+            first_delay = (first_target.to_pydatetime() - datetime.now()).total_seconds()
+            if first_delay > 5:
+                print(f"[{self.device_id}] Waiting {first_delay:.0f}s until first event...")
+
+            sent_count = 0
+            last_progress = time.time()
+            for idx, row in active_feed.iterrows():
+                target_time = active_shifted.loc[idx].to_pydatetime()
+
+                delay = (target_time - datetime.now()).total_seconds()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                await self._send_command(row)
+                sent_count += 1
+
+                # Print progress every 60 seconds
+                now = time.time()
+                if self.show_progress_logs and now - last_progress >= self.progress_log_interval_seconds:
+                    print(f"[{self.device_id}] Sent {sent_count}/{total_to_send} events")
+                    last_progress = now
+
+            await self._wait_for_pending_sends()
+            print(f"[{self.device_id}] Complete — sent {sent_count} events")
+            return
+
         start_time = asyncio.get_event_loop().time()
-        
+        total_events = len(activation_feed)
+        sent_count = 0
+        last_progress = time.time()
+
         for _, row in activation_feed.iterrows():
             # Calculate delay from start
             current_time = asyncio.get_event_loop().time()
             delay = row.sleep_time_cumulative - (current_time - start_time)
-            
+
             if delay > 0:
                 await asyncio.sleep(delay)
-            
+
             # Send command (non-blocking via executor)
             await self._send_command(row)
+            sent_count += 1
+
+            # Print progress every 60 seconds
+            now = time.time()
+            if self.show_progress_logs and now - last_progress >= self.progress_log_interval_seconds:
+                print(f"[{self.device_id}] Sent {sent_count}/{total_events} events")
+                last_progress = now
+
+        await self._wait_for_pending_sends()
+        print(f"[{self.device_id}] Complete — sent {sent_count} events")
     
     def _run_in_thread(self) -> None:
         """Run the async replay in a new event loop in a separate thread."""
-        reset_all_detectors(self.ip_port, debug=self.debug)
+        reset_all_detectors(
+            self.ip_port,
+            debug=self.debug,
+            timeout=self.snmp_timeout_seconds,
+        )
         self._wait_until_next_cycle()
         self.simulation_start_time = datetime.now()
         
@@ -409,6 +520,9 @@ class SignalReplay:
     
     def _wait_until_next_cycle(self) -> None:
         """Wait until the next cycle boundary for coordinated signals."""
+        if self.tod_align:
+            return
+
         if self.cycle_length == 0 or self.original_start_time is None:
             return
 
@@ -439,7 +553,11 @@ class SignalReplay:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # No event loop running, safe to use asyncio.run
-            reset_all_detectors(self.ip_port, debug=self.debug)
+            reset_all_detectors(
+                self.ip_port,
+                debug=self.debug,
+                timeout=self.snmp_timeout_seconds,
+            )
             self._wait_until_next_cycle()
             self.simulation_start_time = datetime.now()
             asyncio.run(self._run_async())
@@ -455,6 +573,9 @@ class SignalReplay:
 def create_replays(
     configs: List[SignalConfig],
     simulation_speed: float = 1.0,
+    snmp_timeout_seconds: float = 2.0,
+    show_progress_logs: bool = False,
+    progress_log_interval_seconds: float = 60.0,
     debug: bool = False
 ) -> List[SignalReplay]:
     """
@@ -463,12 +584,23 @@ def create_replays(
     Args:
         configs: List of SignalConfig objects
         simulation_speed: Speed multiplier for playback
+        snmp_timeout_seconds: SNMP response timeout in seconds
+        show_progress_logs: If True, print periodic "Sent x/y events" updates
+        progress_log_interval_seconds: Seconds between periodic progress updates
         debug: Enable debug output
     
     Returns:
         List of SignalReplay instances
     """
     return [
-        SignalReplay(config, simulation_speed=simulation_speed, debug=debug)
+        SignalReplay(
+            config,
+            simulation_speed=simulation_speed,
+            snmp_timeout_seconds=snmp_timeout_seconds,
+            show_progress_logs=show_progress_logs,
+            progress_log_interval_seconds=progress_log_interval_seconds,
+            debug=debug,
+        )
         for config in configs
     ]
+

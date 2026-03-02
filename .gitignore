@@ -1,13 +1,6 @@
 # Environment
 test_async_env/
 
-# Test folders
-2C039_CycleFault/
-6th_Homedale_Preempt/
-OR99W_Baker_Conflict/
-PedOverlapFlash/
-Pendelton TSP Testing/
-
 # Python
 __pycache__/
 *.pyc
@@ -28,3 +21,15 @@ test_package.ipynb
 test_output_compare.ipynb
 version_testing/
 experiments/
+
+# firmware_validation - agency-specific data (not for git)
+firmware_validation/databases/
+firmware_validation/databases.xlsx
+firmware_validation/logs/
+firmware_validation/logs - Copy/
+firmware_validation/conflict_monitor/
+firmware_validation/results/
+firmware_validation/test_suite.yaml
+firmware_validation/get_data.ipynb
+firmware_validation/~$databases.xlsx
+firmware_validation/logs- test/

@@ -57,16 +57,19 @@ from . import collector, comparison, config, ntcip, orchestrator, replay, test_s
 
 __version__ = "1.0.0"
 __all__ = [
+    # Core simulation
     "ATCSimulation",
     "SimulationConfig",
     "SignalConfig",
     "SignalReplay",
     "create_replays",
+    # Data collection
     "DatabaseManager",
     "DataCollector",
     "ConflictRecord",
     "fetch_output_data",
     "check_conflicts",
+    # Comparison — types and constants
     "COMPARISON_EVENT_IDS",
     "DEFAULT_SEQUENCE_THRESHOLD",
     "DEFAULT_TIMING_THRESHOLD",
@@ -75,21 +78,17 @@ __all__ = [
     "ComparisonResult",
     "ComparisonThresholds",
     "ComparisonAnalysis",
+    # Comparison — public functions
     "prepare_events_for_comparison",
-    "encode_categorical_sequence",
-    "compute_dtw",
     "compare_runs",
     "compare_all_runs",
     "compare_event_sequences",
     "compare_and_visualize",
     "format_comparison_summary",
-    "load_events",
     "generate_timeline",
     "generate_phase_difference_summary",
     "format_phase_differences",
-    "create_comparison_gantt_matplotlib",
-    "create_multi_divergence_plots",
-    "store_comparison_result",
+    # Firmware validation
     "TestType",
     "TestScenario",
     "TestBatch",
@@ -101,15 +100,7 @@ __all__ = [
     "compare_firmware",
     "generate_report",
     "load_annotations",
+    # NTCIP / SNMP
     "send_ntcip",
     "reset_all_detectors",
-    "collector",
-    "comparison",
-    "config",
-    "ntcip",
-    "orchestrator",
-    "replay",
-    "test_suite",
-    "batch_runner",
-    "report",
 ]

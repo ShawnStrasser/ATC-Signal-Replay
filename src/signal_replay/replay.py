@@ -14,12 +14,7 @@ from typing import Union, Optional, Tuple, List, Set
 from importlib import resources
 from jinja2 import Template
 
-try:
-    import pyarrow as pa
-    HAS_PYARROW = True
-except ImportError:
-    HAS_PYARROW = False
-    pa = None
+import pyarrow as pa
 
 from .ntcip import send_ntcip, reset_all_detectors
 from .config import SignalConfig
@@ -98,7 +93,7 @@ class SignalReplay:
         
         if isinstance(events, pd.DataFrame):
             self._load_from_dataframe(events)
-        elif HAS_PYARROW and isinstance(events, pa.Table):
+        elif isinstance(events, pa.Table):
             self._load_from_arrow(events)
         elif isinstance(events, (str, Path)):
             self._load_from_path(str(events))
@@ -284,7 +279,7 @@ class SignalReplay:
         # Load based on event source type
         if isinstance(events, pd.DataFrame):
             comparison_df = self._load_comparison_from_dataframe(events)
-        elif HAS_PYARROW and isinstance(events, pa.Table):
+        elif isinstance(events, pa.Table):
             comparison_df = self._load_comparison_from_dataframe(events.to_pandas())
         elif isinstance(events, (str, Path)):
             comparison_df = self._load_comparison_from_path(str(events))

@@ -13,7 +13,7 @@ authors = [
     {name = "ATC Signal Replay Contributors"}
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -23,16 +23,22 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 keywords = ["traffic", "signal", "controller", "NTCIP", "SNMP", "replay", "simulation"]
 
 dependencies = [
-    "atspm",
     "pysnmplib>=5.0.24",
+    "pandas",
     "dtaidistance",
+    "jinja2",
+    "requests",
     "matplotlib",
-    "pyyaml"
+    "pyyaml",
+    "atspm",
+    "pyarrow",
 ]
 
 [project.optional-dependencies]
@@ -44,10 +50,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/ATC-Signal-Replay"
-Documentation = "https://github.com/your-org/ATC-Signal-Replay#readme"
-Repository = "https://github.com/your-org/ATC-Signal-Replay"
-Issues = "https://github.com/your-org/ATC-Signal-Replay/issues"
+Homepage = "https://github.com/ShawnStrasser/ATC-Signal-Replay"
+Documentation = "https://github.com/ShawnStrasser/ATC-Signal-Replay#readme"
+Repository = "https://github.com/ShawnStrasser/ATC-Signal-Replay"
+Issues = "https://github.com/ShawnStrasser/ATC-Signal-Replay/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

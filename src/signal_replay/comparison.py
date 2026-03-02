@@ -31,25 +31,11 @@ from pathlib import Path
 import warnings
 import duckdb
 
-try:
-    from dtaidistance import dtw
-    HAS_DTAIDISTANCE = True
-except ImportError:
-    HAS_DTAIDISTANCE = False
-
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.colors import to_rgba
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-
-try:
-    from atspm import SignalDataProcessor
-    HAS_ATSPM = True
-except ImportError:
-    HAS_ATSPM = False
+from dtaidistance import dtw
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import to_rgba
+from atspm import SignalDataProcessor
 
 
 # Event IDs to include in comparison
@@ -313,12 +299,6 @@ def compute_dtw(
     Returns:
         DTWResult with distance, path, and lengths
     """
-    if not HAS_DTAIDISTANCE:
-        raise ImportError(
-            "dtaidistance package is required for DTW comparison. "
-            "Install with: pip install dtaidistance"
-        )
-    
     if len(seq_a) == 0 or len(seq_b) == 0:
         return DTWResult(
             distance=float('inf'),
@@ -1693,12 +1673,6 @@ def generate_timeline(
     Returns:
         Timeline DataFrame with StartTime, EndTime, Duration, EventClass, EventValue, IsValid
     """
-    if not HAS_ATSPM:
-        raise ImportError(
-            "The 'atspm' package is required for timeline generation. "
-            "Install with: pip install atspm"
-        )
-    
     # Normalize column names for atspm
     df = events.copy()
     col_map = {}
@@ -1990,10 +1964,6 @@ def create_comparison_gantt_matplotlib(
     Returns:
         matplotlib Figure object, or None if matplotlib not available
     """
-    if not HAS_MATPLOTLIB:
-        warnings.warn("Matplotlib is required for this function. Install with: pip install matplotlib")
-        return None
-    
     # Default event classes for signal visualization
     if event_classes is None:
         event_classes = [
@@ -2239,10 +2209,6 @@ def create_multi_divergence_plots(
 
     Returns list of generated file paths.
     """
-    if not HAS_MATPLOTLIB:
-        warnings.warn("Matplotlib is required for divergence plot generation")
-        return []
-
     if timeline_a.empty or timeline_b.empty:
         return []
 
@@ -2468,27 +2434,24 @@ def compare_and_visualize(
                 print(f"Timeline alignment offset: {time_offset:.1f}s")
                 
                 # Use matplotlib for all outputs (reliable export, no kaleido issues)
-                if HAS_MATPLOTLIB:
-                    # Ensure we use a supported static extension
-                    if not output_path.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
-                        output_path = output_path.with_suffix('.png')
+                # Ensure we use a supported static extension
+                if not output_path.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
+                    output_path = output_path.with_suffix('.png')
 
-                    fig = create_comparison_gantt_matplotlib(
-                        timeline_a=timeline_a,
-                        timeline_b=timeline_b,
-                        label_a=label_a,
-                        label_b=label_b,
-                        title=f"Comparison: {label_a} vs {label_b}",
-                        divergence_start=divergence_start,
-                        divergence_end=divergence_end,
-                        output_path=output_path,
-                        window_minutes=window_minutes,
-                        align_by_time_delta=True,
-                        time_offset_b=time_offset
-                    )
-                    plt.close(fig)  # Clean up
-                else:
-                    warnings.warn("matplotlib not installed. Install with: pip install matplotlib")
+                fig = create_comparison_gantt_matplotlib(
+                    timeline_a=timeline_a,
+                    timeline_b=timeline_b,
+                    label_a=label_a,
+                    label_b=label_b,
+                    title=f"Comparison: {label_a} vs {label_b}",
+                    divergence_start=divergence_start,
+                    divergence_end=divergence_end,
+                    output_path=output_path,
+                    window_minutes=window_minutes,
+                    align_by_time_delta=True,
+                    time_offset_b=time_offset
+                )
+                plt.close(fig)  # Clean up
                 
                 result.plot_path = str(output_path)
             

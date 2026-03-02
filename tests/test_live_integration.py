@@ -24,8 +24,10 @@ import signal_replay as sr
 
 
 # Test device configuration
-# This device should be accessible for live testing
-LIVE_DEVICE_IP_PORT: Tuple[str, int] = ('167.131.72.35', 161)
+# Set TEST_CONTROLLER_IP env var to enable live tests (e.g. TEST_CONTROLLER_IP=192.168.1.100)
+_raw_ip = os.environ.get('TEST_CONTROLLER_IP', '')
+_ip, _, _port_str = _raw_ip.partition(':')
+LIVE_DEVICE_IP_PORT: Tuple[str, int] = (_ip, int(_port_str) if _port_str else 161)
 
 # HTTP port for data collection (may differ from SNMP port)
 LIVE_DEVICE_HTTP_PORT: int = 80
@@ -78,21 +80,23 @@ def create_synthetic_events(
 
 # Custom marker for live device tests
 live_device = pytest.mark.skipif(
-    not is_device_reachable(LIVE_DEVICE_IP_PORT),
-    reason=f"Live device {LIVE_DEVICE_IP_PORT[0]}:{LIVE_DEVICE_IP_PORT[1]} not reachable"
+    not _ip or not is_device_reachable(LIVE_DEVICE_IP_PORT),
+    reason=f"Live device not configured (set TEST_CONTROLLER_IP) or not reachable"
 )
 
 # Custom marker for tests needing HTTP collection
 live_device_http = pytest.mark.skipif(
-    not is_device_reachable(LIVE_DEVICE_IP_PORT) or 
+    not _ip or not is_device_reachable(LIVE_DEVICE_IP_PORT) or
     not is_http_reachable(LIVE_DEVICE_IP_PORT[0], LIVE_DEVICE_HTTP_PORT),
-    reason=f"Live device HTTP endpoint {LIVE_DEVICE_IP_PORT[0]}:{LIVE_DEVICE_HTTP_PORT} not reachable"
+    reason=f"Live device HTTP endpoint not configured or not reachable"
 )
 
 
 @pytest.fixture(scope="module")
 def live_ip_port() -> Tuple[str, int]:
     """Provide the live device IP/port."""
+    if not _ip:
+        pytest.skip("TEST_CONTROLLER_IP env var not set")
     if not is_device_reachable(LIVE_DEVICE_IP_PORT):
         pytest.skip(f"Live device not reachable: {LIVE_DEVICE_IP_PORT}")
     return LIVE_DEVICE_IP_PORT

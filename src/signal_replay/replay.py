@@ -16,7 +16,7 @@ from jinja2 import Template
 
 import pyarrow as pa
 
-from .ntcip import send_ntcip, reset_all_detectors
+from .ntcip import send_ntcip, reset_all_detectors, async_send_ntcip, async_reset_all_detectors
 from .config import SignalConfig
 
 
@@ -366,29 +366,27 @@ class SignalReplay:
             """
             return duckdb.sql(sql).df()
     
-    def _send_command_sync(self, row) -> None:
-        """Send a single SNMP command (called from background thread)."""
-        try:
-            send_ntcip(
-                self.ip_port,
-                row.group_number,
-                row.state_integer,
-                row.DetectorType,
-                timeout=self.snmp_timeout_seconds,
-            )
-        except Exception as exc:
-            if self.debug:
-                print(
-                    f"[{self.device_id}] SNMP send failed for group {row.group_number} "
-                    f"type {row.DetectorType}: {exc}"
-                )
-
     async def _send_command(self, row) -> None:
-        """Fire-and-forget SNMP command — dispatches to thread pool without waiting."""
-        loop = asyncio.get_event_loop()
-        future = loop.run_in_executor(None, self._send_command_sync, row)
-        self._pending_sends.add(future)
-        future.add_done_callback(self._pending_sends.discard)
+        """Send a single SNMP command asynchronously (fire-and-forget)."""
+        async def _safe_send():
+            try:
+                await async_send_ntcip(
+                    self.ip_port,
+                    row.group_number,
+                    row.state_integer,
+                    row.DetectorType,
+                    timeout=self.snmp_timeout_seconds,
+                )
+            except Exception as exc:
+                if self.debug:
+                    print(
+                        f"[{self.device_id}] SNMP send failed for group {row.group_number} "
+                        f"type {row.DetectorType}: {exc}"
+                    )
+
+        task = asyncio.ensure_future(_safe_send())
+        self._pending_sends.add(task)
+        task.add_done_callback(self._pending_sends.discard)
 
     async def _wait_for_pending_sends(self) -> None:
         """Wait until all dispatched SNMP sends have completed."""
@@ -500,16 +498,16 @@ class SignalReplay:
     
     def _run_in_thread(self) -> None:
         """Run the async replay in a new event loop in a separate thread."""
-        reset_all_detectors(
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        new_loop.run_until_complete(async_reset_all_detectors(
             self.ip_port,
             debug=self.debug,
             timeout=self.snmp_timeout_seconds,
-        )
+        ))
         self._wait_until_next_cycle()
         self.simulation_start_time = datetime.now()
         
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
         new_loop.run_until_complete(self._run_async())
         new_loop.close()
     
@@ -548,11 +546,11 @@ class SignalReplay:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # No event loop running, safe to use asyncio.run
-            reset_all_detectors(
+            asyncio.run(async_reset_all_detectors(
                 self.ip_port,
                 debug=self.debug,
                 timeout=self.snmp_timeout_seconds,
-            )
+            ))
             self._wait_until_next_cycle()
             self.simulation_start_time = datetime.now()
             asyncio.run(self._run_async())

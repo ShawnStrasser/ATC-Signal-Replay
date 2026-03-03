@@ -52,7 +52,7 @@ from .test_suite import (
 )
 from .batch_runner import BatchRunner, compare_firmware
 from .report import generate_report, load_annotations
-from .ntcip import send_ntcip, reset_all_detectors
+from .ntcip import send_ntcip, reset_all_detectors, async_send_ntcip, async_reset_all_detectors
 from . import collector, comparison, config, ntcip, orchestrator, replay, test_suite, batch_runner, report
 
 __version__ = "0.0.0"
@@ -103,4 +103,6 @@ __all__ = [
     # NTCIP / SNMP
     "send_ntcip",
     "reset_all_detectors",
+    "async_send_ntcip",
+    "async_reset_all_detectors",
 ]

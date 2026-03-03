@@ -11,7 +11,7 @@ import asyncio
 import threading
 from datetime import datetime, timedelta
 from typing import List
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import pandas as pd
 
 import signal_replay as sr
@@ -66,12 +66,12 @@ class TestOrchestratorTimingWithMocks:
         return create_synthetic_events(duration_seconds=5.0, events_per_second=2.0)
     
     @patch('signal_replay.collector.fetch_output_data')
-    @patch('signal_replay.replay.send_ntcip')
-    @patch('signal_replay.replay.reset_all_detectors')
+    @patch('signal_replay.replay.async_send_ntcip', new_callable=AsyncMock)
+    @patch('signal_replay.replay.async_reset_all_detectors', new_callable=AsyncMock)
     def test_no_double_wait_single_run(
         self,
-        mock_reset: MagicMock,
-        mock_send: MagicMock,
+        mock_reset: AsyncMock,
+        mock_send: AsyncMock,
         mock_fetch: MagicMock,
         mock_ip,
         mock_port,
@@ -135,12 +135,12 @@ class TestOrchestratorTimingWithMocks:
         assert len(results['completed_runs']) == 1
     
     @patch('signal_replay.collector.fetch_output_data')
-    @patch('signal_replay.replay.send_ntcip')
-    @patch('signal_replay.replay.reset_all_detectors')
+    @patch('signal_replay.replay.async_send_ntcip', new_callable=AsyncMock)
+    @patch('signal_replay.replay.async_reset_all_detectors', new_callable=AsyncMock)
     def test_no_double_wait_multiple_runs(
         self,
-        mock_reset: MagicMock,
-        mock_send: MagicMock,
+        mock_reset: AsyncMock,
+        mock_send: AsyncMock,
         mock_fetch: MagicMock,
         mock_ip,
         mock_port,
@@ -235,12 +235,12 @@ class TestSignalReplayTiming:
         # Should be approximately 3 seconds
         assert 2.0 <= expected <= 4.0, f"Expected ~3s, got {expected}"
     
-    @patch('signal_replay.replay.send_ntcip')
-    @patch('signal_replay.replay.reset_all_detectors')
+    @patch('signal_replay.replay.async_send_ntcip', new_callable=AsyncMock)
+    @patch('signal_replay.replay.async_reset_all_detectors', new_callable=AsyncMock)
     def test_replay_runs_in_expected_time(
         self,
-        mock_reset: MagicMock,
-        mock_send: MagicMock,
+        mock_reset: AsyncMock,
+        mock_send: AsyncMock,
         mock_ip,
         mock_port,
         short_events
@@ -294,12 +294,12 @@ class TestSignalReplayTiming:
         with pytest.raises(ValueError, match="has no replayable detector events"):
             sr.SignalReplay(config, simulation_speed=1.0)
 
-    @patch("signal_replay.replay.reset_all_detectors")
-    @patch("signal_replay.replay.send_ntcip")
+    @patch("signal_replay.replay.async_reset_all_detectors", new_callable=AsyncMock)
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
     def test_run_waits_for_pending_executor_sends_inside_event_loop(
         self,
-        mock_send: MagicMock,
-        mock_reset: MagicMock,
+        mock_send: AsyncMock,
+        mock_reset: AsyncMock,
         mock_ip,
         mock_port,
     ):
@@ -316,12 +316,10 @@ class TestSignalReplayTiming:
         config.events = events
 
         sent_counter = {"count": 0}
-        lock = threading.Lock()
 
-        def slow_send(*_args, **_kwargs):
-            time.sleep(0.05)
-            with lock:
-                sent_counter["count"] += 1
+        async def slow_send(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            sent_counter["count"] += 1
 
         mock_send.side_effect = slow_send
 
@@ -335,10 +333,10 @@ class TestSignalReplayTiming:
 
         assert sent_counter["count"] == expected_calls
 
-    @patch("signal_replay.replay.send_ntcip")
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
     def test_send_command_uses_configured_snmp_timeout(
         self,
-        mock_send: MagicMock,
+        mock_send: AsyncMock,
         mock_ip,
         mock_port,
         short_events,
@@ -354,7 +352,13 @@ class TestSignalReplayTiming:
         replay = sr.SignalReplay(config, simulation_speed=1.0, snmp_timeout_seconds=2.0)
 
         row = replay.activation_feed.iloc[0]
-        replay._send_command_sync(row)
+
+        # _send_command is async, run it in a loop
+        async def _test():
+            await replay._send_command(row)
+            await replay._wait_for_pending_sends()
+
+        asyncio.run(_test())
 
         assert mock_send.call_count == 1
         assert mock_send.call_args.kwargs["timeout"] == 2.0

@@ -8,13 +8,13 @@ version = "0.0.0"
 description = "Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     {name = "Shawn Strasser"}
 ]
 
 dependencies = [
-    "pysnmplib>=5.0.24",
+    "pysnmp>=7.0,<8.0",
     "pandas",
     "dtaidistance",
     "jinja2",

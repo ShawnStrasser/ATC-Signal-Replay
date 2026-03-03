@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "signal-replay"
+name = "signal_replay"
 version = "0.0.0"
 description = "Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP"
 readme = "README.md"

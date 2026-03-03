@@ -33,3 +33,6 @@ firmware_validation/test_suite.yaml
 firmware_validation/get_data.ipynb
 firmware_validation/~$databases.xlsx
 firmware_validation/logs- test/
+
+
+dist/

@@ -1,19 +1,18 @@
-# Signal-Replay
+# Signal-Replay (beta release)
 
 Replay historical traffic signal events to test ATC controllers for **bug replication**, **software validation**, and **behavior comparison**.
 
-Signal-Replay reads high-resolution event logs, replays detector actuations via NTCIP/SNMP, collects output events from controllers, monitors for phase conflicts, and uses Dynamic Time Warping (DTW) to compare controller behavior across runs. It can send calls to any controller but data collection currently only works with MAXTIME controllers.
+Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian and preempt inputs via NTCIP/SNMP, collects output events from controllers, monitors for phase conflicts, and uses Dynamic Time Warping (DTW) to compare controller behavior across runs. It can send calls to any controller but data collection currently only works with MAXTIME controllers, open an issue or submit pull request to add other controllers.
 
 ## Features
 
 - **Replay** hi-res detector events to any ATC controller via NTCIP SNMP
 - **Detect conflicts** between incompatible phase/overlap pairs
-- **Compare runs** using group-level DTW with Jaccard distance
-- **Multi-signal** coordinated replay with parallel execution
-- **Time-of-day alignment** mode (`tod_align`) for replaying events at real wall-clock times
+- **Compare runs** for sequence and timing similarity
+- **Multi-signal** replay with parallel execution
+- **Time-of-day alignment** for replaying events at real wall-clock times
 - **Cycle synchronization** for coordinated signal replay with offsets
-- **DuckDB storage** for SQL-based analysis of events, conflicts, and comparisons
-- **Matplotlib Gantt charts** for visual comparison of phase timing
+- **Timeline charts** for visual comparison of phase timing
 - **Batch runner & HTML reports** for firmware validation workflows (experimental)
 
 ## Installation

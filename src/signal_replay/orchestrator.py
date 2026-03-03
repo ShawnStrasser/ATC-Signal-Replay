@@ -24,8 +24,6 @@ from .comparison import (
     store_comparison_result,
     generate_timeline,
     prepare_events_for_comparison,
-    HAS_ATSPM,
-    HAS_MATPLOTLIB,
 )
 
 
@@ -565,15 +563,6 @@ class ATCSimulation:
     
     def _generate_comparison_plot(self, device_id: str, result: ComparisonResult) -> None:
         """Generate Gantt chart for a comparison that exceeded thresholds."""
-        if not HAS_ATSPM:
-            if self.debug:
-                print("Cannot generate plots: 'atspm' package not installed")
-            return
-        if not HAS_MATPLOTLIB:
-            if self.debug:
-                print("Cannot generate plots: 'matplotlib' package not installed")
-            return
-        
         try:
             # Get events for both runs
             if result.run_a == "input":
@@ -612,23 +601,22 @@ class ATCSimulation:
             output_path = self.output_dir / f"{output_name}.png"
             
             # Create Gantt chart
-            if HAS_MATPLOTLIB:
-                from .comparison import create_comparison_gantt_matplotlib
-                import matplotlib.pyplot as plt
-                
-                fig = create_comparison_gantt_matplotlib(
-                    timeline_a=timeline_a,
-                    timeline_b=timeline_b,
-                    label_a=f"Run {label_a}" if label_a != "input" else "Input",
-                    label_b=f"Run {label_b}",
-                    title=f"Device {device_id}: {label_a} vs {label_b}",
-                    divergence_start=divergence_start,
-                    divergence_end=divergence_end,
-                    output_path=output_path,
-                    window_minutes=5.0
-                )
-                if fig:
-                    plt.close(fig)
+            from .comparison import create_comparison_gantt_matplotlib
+            import matplotlib.pyplot as plt
+
+            fig = create_comparison_gantt_matplotlib(
+                timeline_a=timeline_a,
+                timeline_b=timeline_b,
+                label_a=f"Run {label_a}" if label_a != "input" else "Input",
+                label_b=f"Run {label_b}",
+                title=f"Device {device_id}: {label_a} vs {label_b}",
+                divergence_start=divergence_start,
+                divergence_end=divergence_end,
+                output_path=output_path,
+                window_minutes=5.0
+            )
+            if fig:
+                plt.close(fig)
             
             result.plot_path = str(output_path)
             

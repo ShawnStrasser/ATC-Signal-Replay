@@ -122,6 +122,14 @@ class DivergenceWindow:
 
 
 @dataclass
+class ChunkScore:
+    """Match score for a single rolling window chunk."""
+    center_seconds: float     # Center of the window in seconds from analysis start
+    match_percentage: float   # DTW match % for this chunk (interior only)
+    window_seconds: float     # Window duration used
+
+
+@dataclass
 class ComparisonResult:
     """Complete comparison result between two runs."""
     device_id: str
@@ -144,6 +152,10 @@ class ComparisonResult:
     # How much time was trimmed from each sequence during alignment
     alignment_trim_seconds_a: float = 0.0
     alignment_trim_seconds_b: float = 0.0
+    # Rolling chunk scores for time-localised diagnostics
+    chunk_scores: List[ChunkScore] = field(default_factory=list)
+    # Temporal shift applied during alignment (seconds added to B's time_delta)
+    temporal_shift_seconds: float = 0.0
     
     def format_summary(self) -> str:
         """Return a human-readable summary of the comparison."""
@@ -1130,7 +1142,8 @@ def compute_timeline_offset(
             end_sec = (row['EndTime'] - start_time).total_seconds()
             start_bin = max(0, int(start_sec / resolution))
             end_bin = min(n_bins, int(end_sec / resolution) + 1)
-            key = (row['EventClass'], int(float(row['EventValue'])))
+            ev = row['EventValue']
+            key = (row['EventClass'], int(float(ev)) if pd.notna(ev) else 0)
             for b in range(start_bin, end_bin):
                 states[b].add(key)
         return [frozenset(s) for s in states]
@@ -1160,6 +1173,323 @@ def compute_timeline_offset(
             best_lag = lag
     
     return best_lag * resolution
+
+
+def find_temporal_offset(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    search_range: float = 200.0,
+    resolution: float = 0.1,
+    window_sec: float = 1800.0,
+) -> float:
+    """
+    Find the temporal offset to align B with A using cross-correlation.
+
+    Instead of positional matching (which can lock onto cyclic false matches),
+    this searches for the time shift that maximises exact event-set matches
+    within the first ``window_sec`` seconds of data.
+
+    Uses a two-pass coarse-to-fine approach: first sweeps the full range at
+    1 s resolution (~400 iterations), then refines ±2 s around the best
+    coarse hit at 0.1 s resolution (~40 iterations).  Total ~440 iterations
+    instead of ~4 000, giving ~10× speed-up.
+
+    Args:
+        df_a: Prepared events DataFrame A (with time_delta, event_id, parameter).
+        df_b: Prepared events DataFrame B.
+        search_range: Maximum shift to search in each direction (seconds).
+        resolution: Final fine resolution (seconds).
+        window_sec: Only use the first N seconds of each series.
+
+    Returns:
+        Best temporal shift in seconds to **add** to B's ``time_delta`` so that
+        the two series are aligned.  Positive means B's events happen earlier
+        than A's by that many seconds.
+    """
+    groups_a = _group_events_by_timestamp(df_a)
+    groups_b = _group_events_by_timestamp(df_b)
+
+    # Build quantised time -> hash lookup for A
+    a_hash: Dict[int, int] = {}      # quantised key -> hash of event set
+    for td, evset in groups_a:
+        if td > window_sec:
+            break
+        a_hash[round(td / resolution)] = hash(evset)
+
+    # Build parallel arrays for B within the window
+    b_times_q: List[int] = []        # quantised time_delta values
+    b_hashes: List[int] = []
+    for td, evset in groups_b:
+        if td > window_sec:
+            break
+        b_times_q.append(round(td / resolution))
+        b_hashes.append(hash(evset))
+
+    if not b_times_q or not a_hash:
+        return 0.0
+
+    def _count_matches(shift_q: int) -> int:
+        count = 0
+        for j in range(len(b_times_q)):
+            key = b_times_q[j] + shift_q
+            if key in a_hash and a_hash[key] == b_hashes[j]:
+                count += 1
+        return count
+
+    # Pass 1: coarse search at 1.0s resolution
+    coarse_step = round(1.0 / resolution)  # 10 quanta per coarse step
+    coarse_start = round(-search_range / resolution)
+    coarse_end = round(search_range / resolution)
+
+    best_q = 0
+    best_count = 0
+    for sq in range(coarse_start, coarse_end + 1, coarse_step):
+        c = _count_matches(sq)
+        if c > best_count:
+            best_count = c
+            best_q = sq
+
+    # Pass 2: fine search ±2s around best coarse hit
+    fine_range = round(2.0 / resolution)  # ±20 quanta
+    fine_start = best_q - fine_range
+    fine_end = best_q + fine_range
+    for sq in range(fine_start, fine_end + 1):
+        c = _count_matches(sq)
+        if c > best_count:
+            best_count = c
+            best_q = sq
+
+    return best_q * resolution
+
+
+# ---------------------------------------------------------------------------
+# Rolling chunked DTW
+# ---------------------------------------------------------------------------
+
+def _rolling_chunk_dtw(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    window_sec: float = 2700.0,
+    step_sec: float = 2400.0,
+    clip_sec: float = 60.0,
+) -> List[ChunkScore]:
+    """
+    Run DTW on rolling windows and return per-chunk match scores.
+
+    Each window of ``window_sec`` duration slides forward by ``step_sec``.
+    DTW is computed on each window, but only the interior (after clipping
+    ``clip_sec`` from both edges) contributes to the match score. This avoids
+    penalising chunk boundaries that split a signal cycle.
+
+    Args:
+        df_a: Prepared events (already temporally aligned).
+        df_b: Prepared events (already temporally aligned).
+        window_sec: Duration of each rolling window in seconds.
+        step_sec: Step size between windows in seconds.
+        clip_sec: Seconds to clip from each edge when scoring.
+
+    Returns:
+        List of :class:`ChunkScore` for every window.
+    """
+    max_time = min(df_a['time_delta'].max(), df_b['time_delta'].max())
+    scores: List[ChunkScore] = []
+    start = 0.0
+
+    while start + window_sec <= max_time:
+        c_start = start
+        c_end = start + window_sec
+
+        ca = df_a[(df_a['time_delta'] >= c_start) & (df_a['time_delta'] < c_end)].copy()
+        cb = df_b[(df_b['time_delta'] >= c_start) & (df_b['time_delta'] < c_end)].copy()
+
+        if ca.empty or cb.empty:
+            start += step_sec
+            continue
+
+        ca['time_delta'] = ca['time_delta'] - c_start
+        cb['time_delta'] = cb['time_delta'] - c_start
+
+        ga = _group_events_by_timestamp(ca)
+        gb = _group_events_by_timestamp(cb)
+
+        if len(ga) < 5 or len(gb) < 5:
+            start += step_sec
+            continue
+
+        dtw_r, match_pct, dist_m = _dtw_with_jaccard(ga, gb)
+
+        # Score only the interior (clipped edges)
+        if clip_sec > 0 and dtw_r.warping_path:
+            interior_matches = 0
+            interior_total = 0
+            for i, j in dtw_r.warping_path:
+                t_a = ga[i][0]
+                t_b = gb[j][0]
+                if (t_a >= clip_sec and t_a <= (window_sec - clip_sec)
+                        and t_b >= clip_sec and t_b <= (window_sec - clip_sec)):
+                    interior_total += 1
+                    if dist_m[i, j] == 0.0:
+                        interior_matches += 1
+            if interior_total > 0:
+                match_pct = interior_matches / interior_total * 100
+
+        center = c_start + window_sec / 2
+        scores.append(ChunkScore(
+            center_seconds=center,
+            match_percentage=match_pct,
+            window_seconds=window_sec,
+        ))
+        start += step_sec
+
+    return scores
+
+
+def render_sparkline_svg(
+    chunk_scores: List[ChunkScore],
+    width: int = 1400,
+    height: int = 220,
+    pass_threshold: float = 95.0,
+    warn_threshold: float = 85.0,
+) -> str:
+    """
+    Render an inline SVG sparkline showing match percentage over time.
+
+    Each chunk becomes a vertical bar whose colour indicates quality:
+    - Green (>= pass_threshold)
+    - Orange (>= warn_threshold)
+    - Red   (< warn_threshold)
+
+    A thin horizontal reference line is drawn at the pass threshold.
+
+    Args:
+        chunk_scores: Per-chunk match scores.
+        width: SVG width in pixels.
+        height: SVG height in pixels.
+        pass_threshold: Green threshold (default 95%).
+        warn_threshold: Orange/red boundary (default 85%).
+
+    Returns:
+        Self-contained SVG string suitable for embedding in HTML.
+    """
+    if not chunk_scores:
+        return ""
+
+    n = len(chunk_scores)
+    margin_left = 64    # space for Y-axis labels
+    margin_bottom = 34  # space for X-axis labels
+    margin_top = 14
+    margin_right = 18
+    plot_w = width - margin_left - margin_right
+    plot_h = height - margin_bottom - margin_top
+    bar_w = max(1.0, plot_w / n)
+    y_min, y_max = 0.0, 100.0  # Full 0-100% range
+
+    def _y(pct: float) -> float:
+        clamped = max(y_min, min(pct, y_max))
+        return margin_top + plot_h - (clamped - y_min) / (y_max - y_min) * plot_h
+
+    def _color(pct: float) -> str:
+        if pct >= pass_threshold:
+            return "#1b8a2e"
+        if pct >= warn_threshold:
+            return "#e8710a"
+        return "#c5221f"
+
+    bars = []
+    for i, cs in enumerate(chunk_scores):
+        x = margin_left + i * bar_w
+        pct = cs.match_percentage
+        y = _y(pct)
+        h = _y(y_min) - y  # bar height from bottom of plot
+        bars.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
+            f'height="{h:.1f}" fill="{_color(pct)}" opacity="0.85">'
+            f'<title>{cs.center_seconds / 3600:.1f}h: {pct:.1f}%</title></rect>'
+        )
+
+    # Reference dashed line at 100% (top)
+    ref_y_100 = _y(100.0)
+    ref_100 = (
+        f'<line x1="{margin_left}" y1="{ref_y_100:.1f}" '
+        f'x2="{width - margin_right}" y2="{ref_y_100:.1f}" '
+        f'stroke="#bbb" stroke-width="0.5" stroke-dasharray="3,2" />'
+    )
+
+    # Plot area background
+    bg = (
+        f'<rect x="{margin_left}" y="{margin_top}" '
+        f'width="{plot_w}" height="{plot_h}" fill="#f8f9fa" rx="2" />'
+    )
+
+    # Y-axis labels and grid lines
+    y_labels_svg = []
+    for pct_val in [0, 25, 50, 75, 100]:
+        yp = _y(float(pct_val))
+        y_labels_svg.append(
+            f'<text x="{margin_left - 3}" y="{yp + 3:.1f}" '
+            f'font-size="12" fill="#5f6368" font-family="sans-serif" '
+            f'text-anchor="end">{pct_val}%</text>'
+        )
+        y_labels_svg.append(
+            f'<line x1="{margin_left}" y1="{yp:.1f}" '
+            f'x2="{width - margin_right}" y2="{yp:.1f}" '
+            f'stroke="#e0e0e0" stroke-width="0.3" />'
+        )
+
+    # X-axis labels in HH:MM format at clean minute intervals
+    x_labels_svg = []
+    if chunk_scores:
+        first_sec = chunk_scores[0].center_seconds
+        last_sec = chunk_scores[-1].center_seconds
+        span_sec = last_sec - first_sec
+        if span_sec > 0:
+            # Pick a clean minute-based interval: 1, 5, 10, 30, 60, 120, 300, 600 min
+            target_labels = 6
+            raw_step_min = (span_sec / 60) / target_labels
+            minute_steps = [1, 5, 10, 30, 60, 120, 300, 600]
+            step_min = minute_steps[0]
+            for ms in minute_steps:
+                if ms >= raw_step_min:
+                    step_min = ms
+                    break
+            else:
+                step_min = minute_steps[-1]
+            step_s = step_min * 60
+            # Start at the first clean multiple of step_s at or after first_sec
+            first_label = (int(first_sec) // step_s + 1) * step_s
+            label_secs = list(range(first_label, int(last_sec) + 1, step_s))
+            for ls in label_secs:
+                frac = (ls - first_sec) / span_sec
+                xp = margin_left + frac * plot_w
+                y_label = margin_top + plot_h + 14
+                h_val, rem = divmod(int(ls), 3600)
+                m_val = rem // 60
+                x_labels_svg.append(
+                    f'<text x="{xp:.1f}" y="{y_label}" '
+                    f'font-size="12" fill="#5f6368" font-family="sans-serif" '
+                    f'text-anchor="middle">{h_val:02d}:{m_val:02d}</text>'
+                )
+
+    # Axes lines (L-shape: left + bottom)
+    axes = (
+        f'<line x1="{margin_left}" y1="{margin_top}" '
+        f'x2="{margin_left}" y2="{margin_top + plot_h}" '
+        f'stroke="#666" stroke-width="0.8" />'
+        f'<line x1="{margin_left}" y1="{margin_top + plot_h}" '
+        f'x2="{width - margin_right}" y2="{margin_top + plot_h}" '
+        f'stroke="#666" stroke-width="0.8" />'
+    )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" '
+        f'preserveAspectRatio="xMidYMid meet" '
+        f'style="display:block;width:100%;height:auto;vertical-align:middle;">'
+        f'{bg}{"".join(y_labels_svg)}{"".join(bars)}'
+        f'{ref_100}{axes}{"".join(x_labels_svg)}</svg>'
+    )
+    return svg
 
 
 def compare_runs(
@@ -1215,26 +1545,40 @@ def compare_runs(
     df_a = prepare_events_for_comparison(events_a, start_time_a, event_ids=event_ids)
     df_b = prepare_events_for_comparison(events_b, start_time_b, event_ids=event_ids)
     
-    # Auto-alignment: Find optimal offset to align the sequences
+    # Auto-alignment: temporal cross-correlation to find the best time shift,
+    # then apply a small positional trim if needed.
     alignment_offset = 0
     trim_seconds_a = 0.0
     trim_seconds_b = 0.0
+    temporal_shift = 0.0
     
     if auto_align and not df_a.empty and not df_b.empty:
-        alignment_offset, pre_align_match = find_alignment_offset(df_a, df_b)
-        
+        # Step 1: Find the true temporal shift via cross-correlation.
+        # This avoids the cyclic false-match problem of positional alignment.
+        temporal_shift = find_temporal_offset(df_a, df_b)
+        if abs(temporal_shift) > 0.05:
+            df_b = df_b.copy()
+            df_b['time_delta'] = df_b['time_delta'] + temporal_shift
+            df_b = df_b[df_b['time_delta'] >= 0].reset_index(drop=True)
+
+        # Step 2: Positional alignment to skip leading gaps (e.g. sparse
+        # startup periods) and fine-tune residual offsets.  max_offset=50
+        # is safe here because temporal cross-correlation already resolved
+        # cyclic ambiguity, and the per-group penalty (0.15 %) prevents
+        # the positional pass from drifting onto a wrong cycle.
+        alignment_offset, pre_align_match = find_alignment_offset(
+            df_a, df_b, max_offset=50, align_seconds=360.0
+        )
         raw_groups_a = _group_events_by_timestamp(df_a)
         raw_groups_b = _group_events_by_timestamp(df_b)
         
         if alignment_offset > 0 and alignment_offset < len(raw_groups_b):
-            # Skip first N timestamp groups from B
             trim_seconds_b = raw_groups_b[alignment_offset][0]
             df_b = df_b[df_b['time_delta'] >= trim_seconds_b].reset_index(drop=True)
             if not df_b.empty:
                 new_start = df_b['timestamp'].min()
                 df_b['time_delta'] = (df_b['timestamp'] - new_start).dt.total_seconds()
         elif alignment_offset < 0 and -alignment_offset < len(raw_groups_a):
-            # Skip first N timestamp groups from A
             trim_seconds_a = raw_groups_a[-alignment_offset][0]
             df_a = df_a[df_a['time_delta'] >= trim_seconds_a].reset_index(drop=True)
             if not df_a.empty:
@@ -1287,7 +1631,9 @@ def compare_runs(
                 sequence_length_b=0
             ),
             divergence_windows=[],
-            match_percentage=0.0
+            match_percentage=0.0,
+            chunk_scores=[],
+            temporal_shift_seconds=0.0,
         )
     
     # ===== GROUP-LEVEL DTW =====
@@ -1296,17 +1642,54 @@ def compare_runs(
     groups_a = _group_events_by_timestamp(df_a)
     groups_b = _group_events_by_timestamp(df_b)
     
-    # Run DTW with Jaccard distance on the groups
-    sequence_dtw, match_percentage, dist_matrix = _dtw_with_jaccard(groups_a, groups_b)
+    # ===== ROLLING CHUNKED DTW =====
+    # Use rolling windows (45 min window, 40 min step, 60 s edge clip) for
+    # the official match score.  Much faster than full-series DTW and provides
+    # per-chunk diagnostics (sparkline data).
+    chunk_scores = _rolling_chunk_dtw(
+        df_a, df_b,
+        window_sec=2700.0,   # 45 minutes
+        step_sec=2400.0,     # 40 minutes (5 min overlap)
+        clip_sec=60.0,       # 60 s clipped from each edge
+    )
+
+    if chunk_scores:
+        match_percentage = sum(c.match_percentage for c in chunk_scores) / len(chunk_scores)
+    else:
+        # Fallback to full-series DTW for very short data
+        sequence_dtw_fallback, match_percentage, dist_matrix_fallback = _dtw_with_jaccard(groups_a, groups_b)
+
+    # ===== FULL-SERIES DTW FOR DIVERGENCE DETECTION =====
+    # We still need the warping path for divergence detection and timing stats.
+    # For datasets that fit, run full DTW; for very large ones, skip divergence
+    # detection (the per-chunk sparkline provides the diagnostic equivalent).
+    full_dtw_cells = len(groups_a) * len(groups_b)
+    MAX_DTW_CELLS = 50_000_000  # ~400 MB, ~35s — acceptable
+
+    if full_dtw_cells <= MAX_DTW_CELLS:
+        sequence_dtw, _full_match, dist_matrix = _dtw_with_jaccard(groups_a, groups_b)
+    else:
+        # Too large for full DTW — synthesize a minimal DTWResult.
+        # Divergence windows will be derived from chunk_scores instead.
+        sequence_dtw = DTWResult(
+            distance=0.0,
+            normalized_distance=0.0,
+            warping_path=[],
+            sequence_length_a=len(groups_a),
+            sequence_length_b=len(groups_b),
+        )
+        dist_matrix = np.array([])
     
     # ===== SETTLE PERIOD ADJUSTMENT =====
     # If settle_minutes is set, recompute match_percentage excluding the
-    # settling period from both sequences.  Also exclude the tail where one
-    # sequence has ended and DTW is just stretching the other — only score the
-    # overlapping middle portion.  Divergences in the settle window are
-    # suppressed via alignment_grace_seconds below.
+    # settling period from the chunk scores.
     settle_seconds = settle_minutes * 60.0
-    if settle_seconds > 0 and sequence_dtw.warping_path:
+    if settle_seconds > 0 and chunk_scores:
+        # Keep only chunks whose center is past the settle period
+        settled_chunks = [c for c in chunk_scores if c.center_seconds >= settle_seconds]
+        if settled_chunks:
+            match_percentage = sum(c.match_percentage for c in settled_chunks) / len(settled_chunks)
+    elif settle_seconds > 0 and sequence_dtw.warping_path:
         # Find the overlap window: both A and B must be past settle and
         # within the shorter sequence's duration
         max_time_a = groups_a[-1][0] if groups_a else 0.0
@@ -1327,33 +1710,70 @@ def compare_runs(
             match_percentage = settled_matches / settled_total * 100
     
     # ===== DIVERGENCE DETECTION =====
-    # Find gaps (one side skips ahead) and mismatches (different events)
-    grace = max(30.0, settle_seconds)  # At least 30s, or settle period
-    divergences = _find_group_divergences(
-        sequence_dtw.warping_path,
-        dist_matrix,
-        groups_a,
-        groups_b,
-        trim_seconds_a=trim_seconds_a,
-        trim_seconds_b=trim_seconds_b,
-        alignment_grace_seconds=grace,
-    )
-    
-    # Filter out tail divergences past the overlap window
-    # (where one sequence has ended and DTW is stretching the other)
-    # A divergence is a tail artifact if either side's END reaches the
-    # overlap boundary, meaning it's caused by one sequence being longer.
-    if groups_a and groups_b:
-        max_time_a = groups_a[-1][0] if groups_a else 0.0
-        max_time_b = groups_b[-1][0] if groups_b else 0.0
-        overlap_end = min(max_time_a, max_time_b)
-        # 5s tolerance — divergences ending within 5s of overlap_end are tail artifacts
-        tail_margin = 5.0
-        divergences = [
-            d for d in divergences
-            if (d.end_time_delta_a < (overlap_end - tail_margin)
-                and d.end_time_delta_b < (overlap_end - tail_margin))
-        ]
+    _use_chunk_divergences = not sequence_dtw.warping_path
+
+    if not _use_chunk_divergences:
+        # Full DTW available — use warping path for precise divergences
+        grace = max(30.0, settle_seconds)  # At least 30s, or settle period
+        divergences = _find_group_divergences(
+            sequence_dtw.warping_path,
+            dist_matrix,
+            groups_a,
+            groups_b,
+            trim_seconds_a=trim_seconds_a,
+            trim_seconds_b=trim_seconds_b,
+            alignment_grace_seconds=grace,
+        )
+        # Filter out tail divergences past the overlap window
+        if groups_a and groups_b:
+            max_time_a = groups_a[-1][0] if groups_a else 0.0
+            max_time_b = groups_b[-1][0] if groups_b else 0.0
+            overlap_end = min(max_time_a, max_time_b)
+            tail_margin = 5.0
+            divergences = [
+                d for d in divergences
+                if (d.end_time_delta_a < (overlap_end - tail_margin)
+                    and d.end_time_delta_b < (overlap_end - tail_margin))
+            ]
+    else:
+        # Full DTW was skipped — run local DTW on each failing chunk to
+        # find precise divergence points (same quality as full-DTW method).
+        _pass = 95.0
+        divergences = []
+        for cs in chunk_scores:
+            if cs.match_percentage < _pass:
+                half_w = cs.window_seconds / 2.0
+                c_start = max(0.0, cs.center_seconds - half_w)
+                c_end = cs.center_seconds + half_w
+                # Extract local groups for this chunk
+                local_a = df_a[(df_a['time_delta'] >= c_start) & (df_a['time_delta'] < c_end)].copy()
+                local_b = df_b[(df_b['time_delta'] >= c_start) & (df_b['time_delta'] < c_end)].copy()
+                if local_a.empty or local_b.empty:
+                    continue
+                # Shift to chunk-local time
+                local_a['time_delta'] = local_a['time_delta'] - c_start
+                local_b['time_delta'] = local_b['time_delta'] - c_start
+                lg_a = _group_events_by_timestamp(local_a)
+                lg_b = _group_events_by_timestamp(local_b)
+                if len(lg_a) < 2 or len(lg_b) < 2:
+                    continue
+                local_dtw, _, local_dist = _dtw_with_jaccard(lg_a, lg_b)
+                local_divs = _find_group_divergences(
+                    local_dtw.warping_path,
+                    local_dist,
+                    lg_a,
+                    lg_b,
+                    trim_seconds_a=c_start + trim_seconds_a,
+                    trim_seconds_b=c_start + trim_seconds_b,
+                    alignment_grace_seconds=0.0,
+                )
+                # Shift divergence times back to global coordinates
+                for d in local_divs:
+                    d.start_time_delta_a += c_start
+                    d.end_time_delta_a += c_start
+                    d.start_time_delta_b += c_start
+                    d.end_time_delta_b += c_start
+                divergences.extend(local_divs)
     
     # ===== TIMING ANALYSIS =====
     # For matched groups, compare how much the timing differs
@@ -1365,18 +1785,28 @@ def compare_runs(
     )
     
     # ===== TIMING DTW =====
-    # DTW on the time-delta sequences (for backward compatibility)
+    # DTW on the time-delta sequences (for backward compatibility).
+    # Skip for very large datasets (same size threshold as sequence DTW).
     time_a = np.array([t for t, _ in groups_a], dtype=float)
     time_b = np.array([t for t, _ in groups_b], dtype=float)
-    max_time = max(time_a.max() if len(time_a) > 0 else 0,
-                   time_b.max() if len(time_b) > 0 else 0)
-    if max_time > 0:
-        time_a_norm = time_a / max_time
-        time_b_norm = time_b / max_time
+    if full_dtw_cells <= MAX_DTW_CELLS:
+        max_time = max(time_a.max() if len(time_a) > 0 else 0,
+                       time_b.max() if len(time_b) > 0 else 0)
+        if max_time > 0:
+            time_a_norm = time_a / max_time
+            time_b_norm = time_b / max_time
+        else:
+            time_a_norm = time_a
+            time_b_norm = time_b
+        timing_dtw = compute_dtw(time_a_norm, time_b_norm, categorical=False)
     else:
-        time_a_norm = time_a
-        time_b_norm = time_b
-    timing_dtw = compute_dtw(time_a_norm, time_b_norm, categorical=False)
+        timing_dtw = DTWResult(
+            distance=0.0,
+            normalized_distance=0.0,
+            warping_path=[],
+            sequence_length_a=len(groups_a),
+            sequence_length_b=len(groups_b),
+        )
     
     return ComparisonResult(
         device_id=device_id,
@@ -1390,6 +1820,8 @@ def compare_runs(
         timing_stats=timing_stats,
         alignment_trim_seconds_a=trim_seconds_a,
         alignment_trim_seconds_b=trim_seconds_b,
+        chunk_scores=chunk_scores,
+        temporal_shift_seconds=temporal_shift,
     )
 
 
@@ -1791,6 +2223,7 @@ def generate_phase_difference_summary(
             stats[key] = {
                 'count': len(grp),
                 'total_seconds': float(grp['Duration'].sum()),
+                'avg_seconds': float(grp['Duration'].mean()) if len(grp) > 0 else 0.0,
             }
         return stats
 
@@ -1801,8 +2234,8 @@ def generate_phase_difference_summary(
 
     results = []
     for ec, ev in all_keys:
-        sa = stats_a.get((ec, ev), {'count': 0, 'total_seconds': 0.0})
-        sb = stats_b.get((ec, ev), {'count': 0, 'total_seconds': 0.0})
+        sa = stats_a.get((ec, ev), {'count': 0, 'total_seconds': 0.0, 'avg_seconds': 0.0})
+        sb = stats_b.get((ec, ev), {'count': 0, 'total_seconds': 0.0, 'avg_seconds': 0.0})
         count_delta = sb['count'] - sa['count']
         dur_delta = sb['total_seconds'] - sa['total_seconds']
 
@@ -1820,6 +2253,8 @@ def generate_phase_difference_summary(
         # Simplify the state name
         state = ec.replace('Overlap ', '')
 
+        avg_delta = sb['avg_seconds'] - sa['avg_seconds']
+
         results.append({
             'label': label,
             'state': state,
@@ -1828,13 +2263,17 @@ def generate_phase_difference_summary(
             'count_a': sa['count'],
             'count_b': sb['count'],
             'count_delta': count_delta,
-            'duration_a': sa['total_seconds'],
-            'duration_b': sb['total_seconds'],
-            'duration_delta': dur_delta,
+            'duration_a': sa['avg_seconds'],
+            'duration_b': sb['avg_seconds'],
+            'duration_delta': avg_delta,
+            'total_duration_a': sa['total_seconds'],
+            'total_duration_b': sb['total_seconds'],
+            'total_duration_delta': dur_delta,
         })
 
-    # Sort by absolute duration delta, largest first
-    results.sort(key=lambda r: abs(r['duration_delta']), reverse=True)
+    # Sort: prioritze cases where a count is zero (completely missing phase/state),
+    # then sort by absolute total duration delta (largest first).
+    results.sort(key=lambda r: (r['count_a'] == 0 or r['count_b'] == 0, abs(r['total_duration_delta'])), reverse=True)
     return results
 
 
@@ -1851,13 +2290,13 @@ def format_phase_differences(diffs: List[Dict], label_a: str = "Original", label
         # Count
         if d['count_delta'] != 0:
             sign = '+' if d['count_delta'] > 0 else ''
-            parts.append(f"count: {d['count_a']}→{d['count_b']} ({sign}{d['count_delta']})")
+            parts.append(f"count: {d['count_a']}->{d['count_b']} ({sign}{d['count_delta']})")
         else:
             parts.append(f"count: {d['count_a']}")
 
         # Duration
         sign = '+' if d['duration_delta'] > 0 else ''
-        parts.append(f"dur: {d['duration_a']:.1f}s→{d['duration_b']:.1f}s ({sign}{d['duration_delta']:.1f}s)")
+        parts.append(f"dur: {d['duration_a']:.1f}s->{d['duration_b']:.1f}s ({sign}{d['duration_delta']:.1f}s)")
 
         lines.append("  ".join(parts))
 
@@ -2045,14 +2484,32 @@ def create_comparison_gantt_matplotlib(
     max_time_b = df_b['EndDelta'].max() if not df_b.empty else 0
     total_duration_seconds = max(max_time_a, max_time_b)
     
-    window_seconds = window_minutes * 60
+    MAX_WINDOW_SECONDS = 15.0 * 60  # Hard cap at 15 minutes
+    window_seconds = min(window_minutes * 60, MAX_WINDOW_SECONDS)
     
     if divergence_delta is not None:
-        # Center window around divergence
-        window_start_sec = max(0, divergence_delta - window_seconds / 2)
-        window_end_sec = (divergence_end_delta or divergence_delta) + window_seconds / 2
+        div_end = divergence_end_delta if divergence_end_delta is not None else divergence_delta
+        div_duration = div_end - divergence_delta
+
+        if div_duration < 10.0 * 60:
+            # Short divergence: center the window on it, but clamp to data bounds
+            div_center = (divergence_delta + div_end) / 2.0
+            window_start_sec = div_center - window_seconds / 2.0
+            window_end_sec = div_center + window_seconds / 2.0
+            # Clamp to data bounds
+            if window_start_sec < 0:
+                window_end_sec -= window_start_sec  # shift right
+                window_start_sec = 0
+            if window_end_sec > total_duration_seconds:
+                window_start_sec -= (window_end_sec - total_duration_seconds)
+                window_end_sec = total_duration_seconds
+                window_start_sec = max(0, window_start_sec)
+        else:
+            # Long divergence: start 5 min before, show 10 min after start
+            window_start_sec = max(0, divergence_delta - 5.0 * 60)
+            window_end_sec = window_start_sec + MAX_WINDOW_SECONDS
     else:
-        # Show from start, limited by window_minutes
+        # Show from start, limited by window
         window_start_sec = 0
         window_end_sec = min(total_duration_seconds, window_seconds)
     
@@ -2120,21 +2577,20 @@ def create_comparison_gantt_matplotlib(
         if base in seen_labels:
             continue
         seen_labels.add(base)
-        # Only add a row if it has events in that timeline
-        if any((combined_df['BaseLabel'] == base) & (combined_df['Source'] == label_a)):
-            row_labels.append(f"{base} ({label_a})")
-        if any((combined_df['BaseLabel'] == base) & (combined_df['Source'] == label_b)):
-            row_labels.append(f"{base} ({label_b})")
+        # Always add BOTH rows for each phase so the visual comparison is easy.
+        # If one timeline has no data for this phase, its row will be empty.
+        row_labels.append(f"{base} ({label_a})")
+        row_labels.append(f"{base} ({label_b})")
     
     # Map row labels to y positions
     row_to_y = {label: i for i, label in enumerate(row_labels)}
     
     # Create figure
-    fig_height = max(6, 0.4 * len(row_labels))
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    fig_height = max(5.0, 0.34 * len(row_labels))
+    fig, ax = plt.subplots(figsize=(18, fig_height))
     
     # Plot bars using broken_barh
-    bar_height = 0.8
+    bar_height = 0.72
     for _, event in combined_df.iterrows():
         y_pos = row_to_y.get(event['RowLabel'], 0)
         color = event['Color']
@@ -2168,18 +2624,38 @@ def create_comparison_gantt_matplotlib(
     # Configure axes
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels)
-    ax.set_xlabel('Time from analysis start')
-    ax.set_title(title)
+    ax.set_xlabel('Time from analysis start', fontsize=13, fontweight='semibold', labelpad=10)
+    ax.set_title(title, fontsize=17, fontweight='bold', pad=14)
     ax.set_xlim(window_start_sec, window_end_sec)
     ax.invert_yaxis()  # Put first row at top
     ax.grid(axis='x', alpha=0.3)
+    ax.tick_params(axis='x', labelsize=12)
+    ax.tick_params(axis='y', labelsize=11)
 
-    # Format x-axis as MM:SS
+    for label in ax.get_yticklabels():
+        label.set_fontweight('medium')
+
+    # Format x-axis as HH:MM at clean minute intervals
     import matplotlib.ticker as mticker
-    def _fmt_mmss(x, _pos=None):
-        m, s = divmod(int(x), 60)
-        return f'{m:02d}:{s:02d}'
-    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_mmss))
+    def _fmt_hhmm(x, _pos=None):
+        h, rem = divmod(int(x), 3600)
+        m = rem // 60
+        return f'{h:02d}:{m:02d}'
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_hhmm))
+    # Set ticks at clean minute intervals
+    vis_span = window_end_sec - window_start_sec
+    if vis_span <= 5 * 60:
+        tick_step = 60       # 1 min
+    elif vis_span <= 15 * 60:
+        tick_step = 5 * 60   # 5 min
+    elif vis_span <= 60 * 60:
+        tick_step = 10 * 60  # 10 min
+    else:
+        tick_step = 30 * 60  # 30 min
+    first_tick = (int(window_start_sec) // tick_step + 1) * tick_step
+    ticks = list(range(first_tick, int(window_end_sec) + 1, tick_step))
+    if ticks:
+        ax.set_xticks(ticks)
     
     plt.tight_layout()
     
@@ -2187,8 +2663,9 @@ def create_comparison_gantt_matplotlib(
     if output_path:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(str(output_path), dpi=dpi, bbox_inches='tight')
-        print(f"Saved comparison chart to: {output_path}")
+        # Force a large bounding box to ensure the chart isn't shrunk
+        fig.savefig(str(output_path), dpi=dpi, bbox_inches=None)
+        print(f"Saved comparison chart (fixed scale) to: {output_path}")
     
     return fig
 

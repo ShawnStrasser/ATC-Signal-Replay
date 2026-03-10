@@ -47,28 +47,28 @@ _REPORT_TEMPLATE = Template("""\
   --link: #1a73e8;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; font-size: 16px; }
 
 /* Header */
 .header { background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: white; padding: 32px 40px; }
-.header h1 { font-size: 28px; font-weight: 600; margin-bottom: 4px; }
-.header .subtitle { opacity: 0.85; font-size: 15px; }
-.header .generated { opacity: 0.65; font-size: 13px; margin-top: 8px; }
+.header h1 { font-size: 32px; font-weight: 700; margin-bottom: 4px; }
+.header .subtitle { opacity: 0.9; font-size: 17px; }
+.header .generated { opacity: 0.72; font-size: 14px; margin-top: 8px; }
 
 /* Layout */
-.container { max-width: 1200px; margin: 0 auto; padding: 24px 40px 64px; }
+.container { max-width: 1600px; margin: 0 auto; padding: 24px 40px 64px; }
 
 /* Cards */
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 20px; overflow: hidden; }
 .card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
-.card-header h2 { font-size: 18px; font-weight: 600; }
+.card-header h2 { font-size: 22px; font-weight: 700; }
 .card-body { padding: 20px; }
 
 /* Summary tiles */
 .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
 .tile { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; text-align: center; }
-.tile .value { font-size: 36px; font-weight: 700; }
-.tile .label { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.tile .value { font-size: 40px; font-weight: 700; }
+.tile .label { font-size: 15px; color: var(--muted); margin-top: 4px; }
 .tile.pass .value { color: var(--pass); }
 .tile.fail .value { color: var(--fail); }
 .tile.neutral .value { color: var(--text); }
@@ -82,13 +82,13 @@ body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background
 .match-bar-fill.low   { background: var(--fail); }
 
 /* Tables */
-table { width: 100%; border-collapse: collapse; font-size: 14px; }
-th { background: var(--bg); padding: 10px 14px; text-align: left; font-weight: 600; border-bottom: 2px solid var(--border); white-space: nowrap; }
-td { padding: 10px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th { background: var(--bg); padding: 12px 14px; text-align: left; font-weight: 700; border-bottom: 2px solid var(--border); white-space: nowrap; font-size: 15px; }
+td { padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 tr:hover td { background: #f1f3f4; }
 
 /* Badge */
-.badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; letter-spacing: 0.3px; }
+.badge { display: inline-block; padding: 4px 11px; border-radius: 12px; font-size: 13px; font-weight: 700; letter-spacing: 0.3px; }
 .badge.pass { background: var(--pass); color: white; }
 .badge.fail { background: var(--fail); color: white; }
 .badge.warn { background: var(--warn); color: white; }
@@ -98,31 +98,32 @@ tr:hover td { background: #f1f3f4; }
 .scenario { margin-bottom: 32px; padding-bottom: 24px; border-bottom: 2px solid var(--border); }
 .scenario:last-child { border-bottom: none; }
 .scenario-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.scenario-header h3 { font-size: 20px; font-weight: 600; }
-.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 24px; margin-bottom: 16px; font-size: 14px; }
+.scenario-header h3 { font-size: 24px; font-weight: 700; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 24px; margin-bottom: 16px; font-size: 16px; }
 .meta-grid .label { color: var(--muted); }
-.meta-grid .val { font-weight: 500; }
+.meta-grid .val { font-weight: 600; }
 
 /* Phase diff table */
-.phase-table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: 'Cascadia Code', 'Consolas', monospace; margin: 8px 0; }
-.phase-table th { background: var(--bg); padding: 6px 10px; text-align: left; font-weight: 600; border-bottom: 2px solid var(--border); font-size: 12px; }
-.phase-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); }
+.phase-table { width: 100%; border-collapse: collapse; font-size: 14px; font-family: 'Cascadia Code', 'Consolas', monospace; margin: 8px 0; }
+.phase-table th { background: var(--bg); padding: 8px 10px; text-align: left; font-weight: 700; border-bottom: 2px solid var(--border); font-size: 13px; }
+.phase-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 .phase-table tr:hover td { background: #f1f3f4; }
 .phase-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .phase-table .pos { color: var(--pass); }
 .phase-table .neg { color: var(--fail); }
+.phase-table .warning-yellow { background-color: #fff4e5; font-weight: bold; }
 
 /* Notes */
-.notes { background: #f8f9fa; border-left: 3px solid var(--border); padding: 12px 16px; font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; margin: 12px 0; border-radius: 0 6px 6px 0; max-height: 300px; overflow-y: auto; }
+.notes { background: #f8f9fa; border-left: 3px solid var(--border); padding: 12px 16px; font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 14px; white-space: pre-wrap; word-break: break-word; margin: 12px 0; border-radius: 0 6px 6px 0; max-height: 300px; overflow-y: auto; }
 .notes.error { border-left-color: var(--fail); background: var(--fail-bg); }
 
 /* Images */
 .plot-gallery { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
 .plot-gallery img { max-width: 100%; border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
-.plot-caption { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.plot-caption { font-size: 14px; color: var(--muted); margin-top: 2px; font-weight: 600; }
 
 /* Footer */
-.footer { text-align: center; padding: 24px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); margin-top: 32px; }
+.footer { text-align: center; padding: 24px; font-size: 14px; color: var(--muted); border-top: 1px solid var(--border); margin-top: 32px; }
 
 /* Anchor offset for fixed-ish header */
 [id] { scroll-margin-top: 20px; }
@@ -131,6 +132,23 @@ a:hover { text-decoration: underline; }
 
 /* Config section */
 .config-table td:first-child { font-weight: 500; white-space: nowrap; width: 260px; }
+
+/* Sparkline */
+.sparkline-wrap {
+  display: block;
+  width: 100%;
+  padding: 14px 16px 12px;
+  background: #f8f9fa;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.sparkline-wrap svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 190px;
+}
 </style>
 </head>
 <body>
@@ -235,6 +253,9 @@ a:hover { text-decoration: underline; }
         <span class="badge {{ 'pass' if row.passed else 'fail' }}">{{ 'PASS' if row.passed else 'FAIL' }}</span>
         <span class="badge info">{{ row.test_type }}</span>
       </div>
+      {% if row.notes_column %}
+        <div style="font-weight:600; margin-bottom:12px; font-size:15px; border-left:4px solid #1a237e; padding-left:12px; color:#1a237e;">{{ row.notes_column }}</div>
+      {% endif %}
 
       <div class="meta-grid">
         {% if row.match_percentage is not none %}
@@ -242,8 +263,16 @@ a:hover { text-decoration: underline; }
         {% endif %}
         <div><span class="label">Divergences:</span> <span class="val">{{ row.num_divergences }}</span></div>
         <div><span class="label">Runs:</span> <span class="val">{{ row.runs_completed }} / {{ row.total_runs }}</span></div>
+
         {% if row.annotation %}<div><span class="label">Note:</span> <span class="val">{{ row.annotation }}</span></div>{% endif %}
       </div>
+
+      {% if row.sparkline_svg %}
+        <div style="margin:12px 0;">
+          <div style="font-weight:600;margin-bottom:6px;">Match Timeline</div>
+          <div class="sparkline-wrap">{{ row.sparkline_svg }}</div>
+        </div>
+      {% endif %}
 
       {% if row.error %}
         <div class="notes error">{{ row.error }}</div>
@@ -264,7 +293,7 @@ a:hover { text-decoration: underline; }
 
       {% if row.phase_differences %}
         <details{% if not row.passed %} open{% endif %}>
-          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Phase / Overlap Differences (top {{ [row.phase_differences|length, 10]|min }} of {{ row.phase_differences|length }})</summary>
+          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Phase / Overlap Differences (top {{ [row.phase_differences|length, 5]|min }} of {{ row.phase_differences|length }})</summary>
           <table class="phase-table">
             <thead>
               <tr>
@@ -273,18 +302,18 @@ a:hover { text-decoration: underline; }
                 <th class="num">Count (Orig)</th>
                 <th class="num">Count (New)</th>
                 <th class="num">&Delta; Count</th>
-                <th class="num">Dur Orig (s)</th>
-                <th class="num">Dur New (s)</th>
-                <th class="num">&Delta; Dur (s)</th>
+                <th class="num">Avg Dur Orig (s)</th>
+                <th class="num">Avg Dur New (s)</th>
+                <th class="num">&Delta; Avg Dur (s)</th>
               </tr>
             </thead>
             <tbody>
-            {% for d in row.phase_differences[:10] %}
+            {% for d in row.phase_differences[:5] %}
               <tr>
                 <td>{{ d.label }}</td>
                 <td>{{ d.state }}</td>
-                <td class="num">{{ d.count_a }}</td>
-                <td class="num">{{ d.count_b }}</td>
+                <td class="num{% if d.count_a == 0 %} warning-yellow{% endif %}">{{ d.count_a }}</td>
+                <td class="num{% if d.count_b == 0 %} warning-yellow{% endif %}">{{ d.count_b }}</td>
                 <td class="num {{ 'pos' if d.count_delta > 0 else ('neg' if d.count_delta < 0 else '') }}">{{ '%+d'|format(d.count_delta) if d.count_delta != 0 else '&mdash;' }}</td>
                 <td class="num">{{ '%.1f'|format(d.duration_a) }}</td>
                 <td class="num">{{ '%.1f'|format(d.duration_b) }}</td>
@@ -320,16 +349,19 @@ a:hover { text-decoration: underline; }
   <div class="card-header"><h2>Configuration</h2></div>
   <div class="card-body" style="padding:0;">
     <table class="config-table">
-      <tr><td>Suite name</td><td>{{ suite.suite_name }}</td></tr>
-      <tr><td>Firmware version</td><td>{{ suite.firmware_version }}</td></tr>
-      <tr><td>Baseline version</td><td>{{ suite.baseline_version }}</td></tr>
-      <tr><td>Collection interval</td><td>{{ suite.collection_interval_minutes }} minutes</td></tr>
-      <tr><td>Post-replay settle</td><td>{{ suite.post_replay_settle_seconds }} seconds</td></tr>
+      <thead><tr><th>Setting</th><th>Value</th><th>Description</th></tr></thead>
+      <tbody>
+      <tr><td>Suite name</td><td>{{ suite.suite_name }}</td><td>Name of this validation test suite</td></tr>
+      <tr><td>Firmware version</td><td>{{ suite.firmware_version }}</td><td>New firmware version being validated</td></tr>
+      <tr><td>Baseline version</td><td>{{ suite.baseline_version }}</td><td>Reference baseline used for comparison</td></tr>
+      <tr><td>Collection interval</td><td>{{ suite.collection_interval_minutes }} minutes</td><td>Duration of event log collection per scenario</td></tr>
+      <tr><td>Post-replay settle</td><td>{{ suite.post_replay_settle_seconds }} seconds</td><td>Wait time after log replay before collecting events</td></tr>
       {% if suite.comparison_thresholds %}
-      <tr><td>Sequence DTW threshold</td><td>{{ suite.comparison_thresholds.sequence_threshold }}</td></tr>
-      <tr><td>Timing DTW threshold</td><td>{{ suite.comparison_thresholds.timing_threshold }}</td></tr>
-      <tr><td>Match threshold</td><td>{{ suite.comparison_thresholds.match_threshold }}%</td></tr>
+      <tr><td>Sequence DTW threshold</td><td>{{ suite.comparison_thresholds.sequence_threshold }}</td><td>Max normalised DTW distance for event-sequence similarity</td></tr>
+      <tr><td>Timing DTW threshold</td><td>{{ suite.comparison_thresholds.timing_threshold }}</td><td>Max normalised DTW distance for timing similarity</td></tr>
+      <tr><td>Match threshold</td><td>{{ suite.comparison_thresholds.match_threshold }}%</td><td>Minimum DTW match percentage to pass a scenario</td></tr>
       {% endif %}
+      </tbody>
     </table>
   </div>
 </div>
@@ -371,10 +403,9 @@ def generate_report(
     match_values = [r.match_percentage for r in similarity if r.match_percentage is not None]
     avg_match = sum(match_values) / len(match_values) if match_values else 0.0
 
-    sorted_similarity = sorted(
-        similarity,
-        key=lambda r: (r.match_percentage is None, r.match_percentage or 999.0),
-    )
+    # Keep input order for both summary table and detail section
+    # (caller is expected to pre-sort by scenario name or suite order)
+    sorted_similarity = list(similarity)
 
     detail_rows = []
     for row in results:
@@ -396,11 +427,14 @@ def generate_report(
                 "runs_completed": row.runs_completed,
                 "total_runs": row.total_runs,
                 "notes": row.notes,
+                "notes_column": getattr(row, 'notes_column', ''),
                 "error": row.error,
                 "conflicts_found": row.conflicts_found,
                 "annotation": annotations.get(row.scenario_id, ""),
                 "images": encoded_images,
                 "phase_differences": getattr(row, 'phase_differences', []),
+                "sparkline_svg": getattr(row, 'sparkline_svg', ''),
+                "temporal_shift_seconds": getattr(row, 'temporal_shift_seconds', 0.0),
             }
         )
 

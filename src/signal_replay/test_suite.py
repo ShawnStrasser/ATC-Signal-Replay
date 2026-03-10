@@ -22,6 +22,7 @@ class TestScenario:
     replays: int = 1
     incompatible_pairs: Optional[List[Tuple[str, str]]] = None
     description: str = ""
+    notes_column: str = ""
     tod_align: bool = True
     cycle_length: int = 0
     cycle_offset: float = 0.0
@@ -65,7 +66,11 @@ class ScenarioResult:
     duration_seconds: float = 0.0
     error: Optional[str] = None
     notes: str = ""
+    notes_column: str = ""
     phase_differences: List[dict] = field(default_factory=list)
+    chunk_scores: List[dict] = field(default_factory=list)
+    sparkline_svg: str = ""
+    temporal_shift_seconds: float = 0.0
 
 
 def _serialize_suite(suite: FirmwareTestSuite) -> dict:
@@ -118,6 +123,7 @@ def load_from_yaml(path: str) -> FirmwareTestSuite:
                 replays=item.get("replays", 1),
                 incompatible_pairs=normalized_pairs,
                 description=item.get("description", ""),
+                notes_column=item.get("notes_column", ""),
                 tod_align=item.get("tod_align", True),
                 cycle_length=item.get("cycle_length", 0),
                 cycle_offset=item.get("cycle_offset", 0.0),

@@ -22,6 +22,7 @@ from .comparison import (
     ComparisonResult,
     ComparisonThresholds,
     ComparisonAnalysis,
+    ChunkScore,
     prepare_events_for_comparison,
     encode_categorical_sequence,
     compute_dtw,
@@ -38,8 +39,10 @@ from .comparison import (
     create_multi_divergence_plots,
     store_comparison_result,
     find_alignment_offset,
+    find_temporal_offset,
     calculate_timeline_offset,
     compute_timeline_offset,
+    render_sparkline_svg,
 )
 from .test_suite import (
     TestType,
@@ -78,6 +81,7 @@ __all__ = [
     "ComparisonResult",
     "ComparisonThresholds",
     "ComparisonAnalysis",
+    "ChunkScore",
     # Comparison — public functions
     "prepare_events_for_comparison",
     "compare_runs",
@@ -88,6 +92,8 @@ __all__ = [
     "generate_timeline",
     "generate_phase_difference_summary",
     "format_phase_differences",
+    "find_temporal_offset",
+    "render_sparkline_svg",
     # Firmware validation
     "TestType",
     "TestScenario",

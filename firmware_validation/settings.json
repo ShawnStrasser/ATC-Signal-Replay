@@ -1,0 +1,30 @@
+{
+  "controller_targets": [
+    "127.0.0.1:1041",
+    "127.0.0.1:1042",
+    "127.0.0.1:1033",
+    "127.0.0.1:1034",
+    "127.0.0.1:1035",
+    "127.0.0.1:1036",
+    "127.0.0.1:1037",
+    "127.0.0.1:1038",
+    "127.0.0.1:1039"
+  ],
+  "firmware_version": "2.15.1",
+  "baseline_version": "original_logs",
+  "catalog_file": "databases.xlsx",
+  "logs_dir": "logs",
+  "databases_dir": "databases",
+  "results_dir": "results",
+  "conflict_pairs_file": "conflict_monitor/conflict_pairs.json",
+  "comparison": {
+    "sequence_threshold": 0.05,
+    "timing_threshold": 0.02,
+    "match_threshold": 95.0,
+    "settle_minutes": 3.0,
+    "max_divergence_plots": 2,
+    "divergence_window_minutes": 5.0
+  },
+  "analysis_workers": 4,
+  "verbose": false
+}

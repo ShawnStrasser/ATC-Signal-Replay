@@ -201,6 +201,77 @@ class TestOrchestratorTimingWithMocks:
         
         assert len(results['completed_runs']) == num_runs
 
+    def test_stop_on_conflict_triggers_from_final_collection(self, temp_db_path):
+        signal = sr.SignalConfig(
+            device_id='test_device',
+            ip='127.0.0.1',
+            udp_port=1025,
+            incompatible_pairs=[('Ph2', 'OPed17')],
+            http_port=80,
+        )
+        signal.events = create_synthetic_events(duration_seconds=1.0, events_per_second=1.0)
+
+        class FakeDB:
+            def __init__(self, _db_path):
+                pass
+
+            def get_max_run_number(self):
+                return 0
+
+            def insert_input_events(self, *_args, **_kwargs):
+                return None
+
+        class FakeCollector:
+            def __init__(self, *args, **kwargs):
+                self.collect_calls = 0
+
+            def run_collection_loop(self, *args, **kwargs):
+                return None
+
+            def collect_once(
+                self,
+                run_number,
+                simulation_start_time,
+                detect_conflicts=False,
+                conflict_callback=None,
+                error_event=None,
+            ):
+                self.collect_calls += 1
+                if self.collect_calls == 1 and detect_conflicts and conflict_callback is not None:
+                    conflict_callback([
+                        sr.ConflictRecord(
+                            device_id='test_device',
+                            run_number=run_number,
+                            timestamp=simulation_start_time,
+                            conflict_details='Ph2 & OPed17',
+                        )
+                    ])
+
+        def fake_store(self):
+            self._cached_durations = {'test_device': 0.0}
+
+        with patch('signal_replay.orchestrator.DatabaseManager', FakeDB), patch(
+            'signal_replay.orchestrator.DataCollector', FakeCollector
+        ), patch.object(sr.ATCSimulation, '_store_input_events', fake_store), patch.object(
+            sr.ATCSimulation, '_run_all_signals', return_value=({'test_device': datetime.now()}, [])
+        ):
+            sim = sr.ATCSimulation(
+                signals=[signal],
+                events=None,
+                replays=2,
+                stop_on_conflict=True,
+                db_path=temp_db_path,
+                post_replay_settle_seconds=0,
+                skip_comparison=True,
+                debug=False,
+            )
+            results = sim.run()
+
+        assert results['stopped_early'] is True
+        assert results['completed_runs'] == [1]
+        assert results['conflicts']
+        assert results['conflicts'][0]['conflict_details'] == 'Ph2 & OPed17'
+
 
 class TestSignalReplayTiming:
     """Tests for the SignalReplay class timing."""
@@ -355,7 +426,8 @@ class TestSignalReplayTiming:
 
         # _send_command is async, run it in a loop
         async def _test():
-            await replay._send_command(row)
+            engine = object()  # mock; async_send_ntcip is patched so engine is unused
+            await replay._send_command(row, snmp_engine=engine)
             await replay._wait_for_pending_sends()
 
         asyncio.run(_test())

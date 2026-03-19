@@ -6,6 +6,11 @@ functions are synchronous wrappers around the underlying async implementation
 so that callers that are *not* inside an event loop (CLI scripts, tests,
 ``reset_all_detectors``) keep working unchanged.  The replay module calls
 the ``async_*`` variants directly to avoid thread-pool overhead.
+
+A single :class:`SnmpEngine` must be reused for all SNMP operations within
+an event-loop lifetime.  Creating a new engine per call leaks MIB builder
+caches, UDP transports, and asyncio dispatcher tasks — the root cause of
+the 300 MB → 21 GB growth observed 2025-06.
 """
 
 import asyncio
@@ -55,6 +60,8 @@ async def async_send_ntcip(
     detector_type: Literal['Vehicle', 'Ped', 'Preempt'],
     community: str = 'public',
     timeout: float = 2.0,
+    *,
+    snmp_engine: SnmpEngine,
 ) -> None:
     """
     Send an NTCIP SET command to update detector states on a controller.
@@ -68,6 +75,8 @@ async def async_send_ntcip(
         detector_type: Type of detector ('Vehicle', 'Ped', or 'Preempt')
         community: SNMP community string (default: 'public')
         timeout: SNMP response timeout in seconds (default: 2.0)
+        snmp_engine: Reusable SnmpEngine instance.  The caller owns the
+            engine lifecycle and must call ``close_dispatcher()`` when done.
 
     Raises:
         RuntimeError: If SNMP communication fails
@@ -75,17 +84,13 @@ async def async_send_ntcip(
     """
     oid = _oid_for(detector_type, detector_group)
 
-    snmp_engine = SnmpEngine()
-    try:
-        error_indication, error_status, error_index, var_binds = await set_cmd(
-            snmp_engine,
-            CommunityData(community, mpModel=0),
-            await UdpTransportTarget.create(ip_port, timeout=timeout, retries=0),
-            ContextData(),
-            ObjectType(oid, Integer(state_integer)),
-        )
-    finally:
-        snmp_engine.close_dispatcher()
+    error_indication, error_status, error_index, var_binds = await set_cmd(
+        snmp_engine,
+        CommunityData(community, mpModel=0),
+        await UdpTransportTarget.create(ip_port, timeout=timeout, retries=0),
+        ContextData(),
+        ObjectType(oid, Integer(state_integer)),
+    )
 
     if error_indication:
         raise RuntimeError(f'SNMP error: {error_indication}')
@@ -100,6 +105,8 @@ async def async_reset_all_detectors(
     community: str = 'public',
     debug: bool = False,
     timeout: float = 2.0,
+    *,
+    snmp_engine: SnmpEngine,
 ) -> None:
     """
     Reset all detector states to 0 for a controller (async version).
@@ -109,6 +116,7 @@ async def async_reset_all_detectors(
         community: SNMP community string (default: 'public')
         debug: If True, print debug messages
         timeout: SNMP response timeout in seconds for each reset command
+        snmp_engine: Reusable SnmpEngine instance.
 
     Note:
         Silently skips detectors that don't exist (noSuchName errors).
@@ -119,6 +127,7 @@ async def async_reset_all_detectors(
                 await async_send_ntcip(
                     ip_port, detector_group, 0, detector_type, community,
                     timeout=timeout,
+                    snmp_engine=snmp_engine,
                 )
             except RuntimeError as e:
                 err_msg = str(e)
@@ -144,6 +153,15 @@ async def async_reset_all_detectors(
 # Sync wrappers (for CLI scripts, tests, and code not inside an event loop)
 # ---------------------------------------------------------------------------
 
+async def _with_engine(coro_factory):
+    """Create a temporary SnmpEngine, run *coro_factory(engine)*, then close."""
+    engine = SnmpEngine()
+    try:
+        return await coro_factory(engine)
+    finally:
+        engine.close_dispatcher()
+
+
 def send_ntcip(
     ip_port: Tuple[str, int],
     detector_group: int,
@@ -154,10 +172,11 @@ def send_ntcip(
 ) -> None:
     """Synchronous wrapper around :func:`async_send_ntcip`."""
     asyncio.run(
-        async_send_ntcip(
+        _with_engine(lambda eng: async_send_ntcip(
             ip_port, detector_group, state_integer, detector_type,
             community, timeout,
-        )
+            snmp_engine=eng,
+        ))
     )
 
 
@@ -169,5 +188,8 @@ def reset_all_detectors(
 ) -> None:
     """Synchronous wrapper around :func:`async_reset_all_detectors`."""
     asyncio.run(
-        async_reset_all_detectors(ip_port, community, debug, timeout)
+        _with_engine(lambda eng: async_reset_all_detectors(
+            ip_port, community, debug, timeout,
+            snmp_engine=eng,
+        ))
     )

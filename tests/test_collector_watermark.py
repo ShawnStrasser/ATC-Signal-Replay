@@ -6,7 +6,7 @@ import pytest
 import requests
 from unittest.mock import patch
 
-from signal_replay.collector import DataCollector
+from signal_replay.collector import DataCollector, check_conflicts
 
 
 def _sample_df(rows):
@@ -130,7 +130,7 @@ def test_single_device_fetch_failure_does_not_block_other_devices():
         def insert_conflict(self, _conflict):
             return None
 
-    def fake_fetch(_ip, port):
+    def fake_fetch(_ip, port, since=None):
         if port == 1031:
             raise requests.exceptions.ConnectionError("boom")
         return _sample_df([[pd.Timestamp("2026-01-01 12:00:00"), 1, 1]])
@@ -141,3 +141,115 @@ def test_single_device_fetch_failure_does_not_block_other_devices():
         collector.collect_once(1, datetime(2026, 1, 1, 11, 0, 0))
 
     assert inserted["rows"] == 1
+
+
+def test_check_conflicts_detects_overlap_ped_without_off_event():
+    df = _sample_df([
+        [pd.Timestamp("2026-01-01 12:00:00"), 1, 2],
+        [pd.Timestamp("2026-01-01 12:00:01"), 67, 17],
+    ])
+
+    conflicts = check_conflicts(df, [("Ph2", "OPed17")])
+
+    assert len(conflicts) == 1
+    assert conflicts.iloc[0]["Conflict_Details"] == "Ph2 & OPed17"
+
+
+def test_check_conflicts_distinguishes_overlap_ped_from_standard_ped():
+    df = _sample_df([
+        [pd.Timestamp("2026-01-01 12:00:00"), 1, 2],
+        [pd.Timestamp("2026-01-01 12:00:01"), 67, 17],
+    ])
+
+    wrong_pair_conflicts = check_conflicts(df, [("Ph2", "Ped17")])
+    correct_pair_conflicts = check_conflicts(df, [("Ph2", "OPed17")])
+
+    assert wrong_pair_conflicts.empty
+    assert len(correct_pair_conflicts) == 1
+
+
+def test_collect_once_does_not_check_conflicts_by_default():
+    df_poll_1 = _sample_df([
+        [pd.Timestamp("2026-01-01 12:00:00"), 1, 2],
+        [pd.Timestamp("2026-01-01 12:00:01"), 67, 17],
+    ])
+
+    conflicts_seen = []
+
+    class FakeDB:
+        def __init__(self, _path):
+            pass
+
+        def insert_events(self, df, *_args):
+            return len(df)
+
+        def insert_conflict(self, conflict):
+            conflicts_seen.append(conflict)
+            return None
+
+    collector = DataCollector(
+        db_path="ignored.duckdb",
+        device_configs={"d1": (("127.0.0.1", 161), [("Ph2", "OPed17")], 80)},
+    )
+
+    with patch("signal_replay.collector.fetch_output_data", return_value=df_poll_1), patch(
+        "signal_replay.collector.DatabaseManager", FakeDB
+    ):
+        collector.collect_once(1, datetime(2026, 1, 1, 11, 0, 0))
+
+    assert len(conflicts_seen) == 0
+
+
+def test_collect_once_detects_conflict_against_full_run_when_requested():
+    df_poll_2 = _sample_df([
+        [pd.Timestamp("2026-01-01 12:00:01"), 67, 17],
+    ])
+
+    conflicts_seen = []
+    accumulated_events = pd.DataFrame([
+        {
+            "device_id": "d1",
+            "run_number": 1,
+            "timestamp": pd.Timestamp("2026-01-01 12:00:00"),
+            "event_id": 1,
+            "parameter": 2,
+        },
+        {
+            "device_id": "d1",
+            "run_number": 1,
+            "timestamp": pd.Timestamp("2026-01-01 12:00:01"),
+            "event_id": 67,
+            "parameter": 17,
+        },
+    ])
+
+    class FakeDB:
+        def __init__(self, _path):
+            pass
+
+        def insert_events(self, df, *_args):
+            return len(df)
+
+        def get_events(self, device_id=None, run_number=None, start_time=None, end_time=None):
+            return accumulated_events.copy()
+
+        def insert_conflict(self, conflict):
+            conflicts_seen.append(conflict)
+            return None
+
+    collector = DataCollector(
+        db_path="ignored.duckdb",
+        device_configs={"d1": (("127.0.0.1", 161), [("Ph2", "OPed17")], 80)},
+    )
+
+    with patch("signal_replay.collector.fetch_output_data", return_value=df_poll_2), patch(
+        "signal_replay.collector.DatabaseManager", FakeDB
+    ):
+        collector.collect_once(
+            1,
+            datetime(2026, 1, 1, 11, 0, 0),
+            detect_conflicts=True,
+        )
+
+    assert len(conflicts_seen) == 1
+    assert conflicts_seen[0].conflict_details == "Ph2 & OPed17"

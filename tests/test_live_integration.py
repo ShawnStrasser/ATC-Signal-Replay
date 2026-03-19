@@ -232,13 +232,15 @@ class TestLiveSimulationTiming:
         print(f"Actual simulation duration: {actual_duration:.2f}s")
         print(f"Ratio: {actual_duration / expected_duration:.2f}x")
         
-        # With collection overhead, allow 25% + 3s
-        # Double-wait bug would make ratio ~2x (FAIL)
-        max_allowed = expected_duration * 1.25 + 3.0
-        
+        # With collection overhead, allow 25% + settle time + 3s
+        # Double-wait bug would make ratio ~2x without settle (FAIL)
+        settle = sim_config.post_replay_settle_seconds
+        max_allowed = expected_duration * 1.25 + settle + 3.0
+
         assert actual_duration <= max_allowed, (
-            f"Simulation took {actual_duration:.2f}s but expected ~{expected_duration:.2f}s. "
-            f"Ratio: {actual_duration / expected_duration:.2f}x. "
+            f"Simulation took {actual_duration:.2f}s but expected ~{expected_duration:.2f}s "
+            f"(+{settle:.1f}s settle). "
+            f"Max allowed: {max_allowed:.2f}s. Ratio: {actual_duration / expected_duration:.2f}x. "
             f"This indicates the double-wait bug is present."
         )
         
@@ -312,15 +314,22 @@ class TestLiveDataComparison:
             http_port=LIVE_DEVICE_HTTP_PORT
         )
         
+        # Add comparison events (phase on/off) so _store_input_events has data
+        base_time = short_events['timestamp'].iloc[0]
+        comparison_rows = pd.DataFrame([
+            {'timestamp': base_time + pd.Timedelta(seconds=i), 'event_id': 1, 'parameter': 1, 'device_id': 'test'}
+            for i in range(5)
+        ])
+        combined_events = pd.concat([short_events, comparison_rows], ignore_index=True)
         sim_config = sr.SimulationConfig(
             signals=[signal_config],
-            events=short_events,
+            events=combined_events,
             simulation_replays=1,
             stop_on_conflict=False,
             db_path=temp_db_path,
             simulation_speed=1.0
         )
-        
+
         sim = sr.ATCSimulation(sim_config, debug=True)
         results = sim.run()
         

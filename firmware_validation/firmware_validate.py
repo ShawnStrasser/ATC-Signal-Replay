@@ -25,6 +25,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import shutil
+import tempfile
+
 import duckdb
 import pandas as pd
 import requests
@@ -39,10 +42,88 @@ from signal_replay.report import generate_report
 # ---------------------------------------------------------------------------
 DEV_DEVICES = ["2B085", "08042", "2C042"]
 
+# Temp directory for --test mode shifted parquet files (cleaned up on exit)
+_TEST_TMPDIR: Optional[Path] = None
+_TEST_FIRST_SEND_TIMES: Dict[str, pd.Timestamp] = {}
+_TEST_ORIGINAL_SOURCES: Dict[str, str] = {}
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 _VERBOSE = False
+
+
+def _shift_events_for_test_batch(batch: sr.TestBatch, scenarios: List[sr.TestScenario]) -> Path:
+    """Rewrite only the current batch's event sources so replay starts about
+    one minute from *now*, after controllers are ready."""
+    from datetime import datetime, timedelta
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="fw_test_"))
+    target_start = datetime.now() + timedelta(minutes=1)
+
+    log("TEST MODE: shifting current batch timestamps for fast TOD-aligned startup")
+
+    batch_scenarios = [s for s in scenarios if s.scenario_id in batch.assignments]
+
+    for scenario in batch_scenarios:
+        original_source = _TEST_ORIGINAL_SOURCES.get(scenario.scenario_id, scenario.events_source)
+        src = Path(original_source)
+        if not src.exists():
+            log(f"  {scenario.scenario_id}: source file missing, skipping shift: {src}")
+            continue
+
+        df = pd.read_parquet(src) if src.suffix == ".parquet" else pd.read_csv(src)
+
+        # Find the timestamp column
+        ts_col = None
+        for col in df.columns:
+            if col.lower() in ("timestamp", "time_stamp", "time"):
+                ts_col = col
+                break
+        if ts_col is None:
+            log(f"  {scenario.scenario_id}: no timestamp column found in {src.name}, leaving unchanged")
+            continue
+
+        df[ts_col] = pd.to_datetime(df[ts_col])
+        min_ts = df[ts_col].min()
+        max_ts = df[ts_col].max()
+
+        probe_signal = sr.SignalConfig(
+            device_id=scenario.scenario_id,
+            ip="127.0.0.1",
+            udp_port=1,
+            http_port=None,
+            cycle_length=scenario.cycle_length,
+            cycle_offset=scenario.cycle_offset,
+            tod_align=scenario.tod_align,
+        )
+        probe_signal.events = str(src)
+        probe_replay = sr.SignalReplay(probe_signal)
+        first_replay_ts = pd.to_datetime(probe_replay.activation_feed["TimeStamp"].min())
+        shift = target_start - first_replay_ts
+        df[ts_col] = df[ts_col] + shift
+
+        shifted_min = df[ts_col].min()
+        shifted_max = df[ts_col].max()
+        shifted_first_replay_ts = first_replay_ts + shift
+
+        out_path = tmp_dir / f"{scenario.scenario_id}.parquet"
+        df.to_parquet(out_path, index=False)
+
+        # Point the scenario at the shifted file
+        scenario.events_source = str(out_path)
+        _TEST_FIRST_SEND_TIMES[scenario.scenario_id] = shifted_first_replay_ts
+
+        log(
+            f"  {scenario.scenario_id}: original {min_ts:%Y-%m-%d %H:%M:%S} -> "
+            f"shifted {shifted_min:%Y-%m-%d %H:%M:%S} "
+            f"(first replay send {shifted_first_replay_ts:%Y-%m-%d %H:%M:%S}, "
+            f"last {shifted_max:%Y-%m-%d %H:%M:%S}, rows={len(df)})"
+        )
+
+    log(f"TEST MODE: current batch shifted so first replay send starts at ~{target_start:%H:%M:%S}")
+    log(f"           temp files in {tmp_dir}")
+    return tmp_dir
 
 
 def log(msg: str, *, always: bool = True) -> None:
@@ -274,6 +355,12 @@ def detect_current_batch(suite: sr.FirmwareTestSuite, batches: List[sr.TestBatch
         with open(checkpoint_path) as f:
             ck = json.load(f)
         completed = set(ck.get("completed_batches", []))
+        log(
+            f"Checkpoint found: {checkpoint_path} "
+            f"({len(completed)} completed batch(es): {sorted(completed) if completed else 'none'})"
+        )
+    else:
+        log(f"No checkpoint found at {checkpoint_path}; starting from the first batch.")
 
     for b in batches:
         if b.batch_id not in completed:
@@ -288,10 +375,15 @@ def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> dict:
         vlog(f"  [auto] DB {db_name} -> {target}")
         return True
 
-    return runner.run(
-        db_loader_callback=auto_db_loader,
-        batch_ids=[batch.batch_id],
-    )
+    try:
+        return runner.run(
+            db_loader_callback=auto_db_loader,
+            batch_ids=[batch.batch_id],
+        )
+    except KeyboardInterrupt:
+        log("\nKeyboard interrupt received. Requesting replay shutdown...")
+        runner.stop()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +764,7 @@ def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path) -> None
 # Main flow
 # ---------------------------------------------------------------------------
 def main() -> None:
-    global _VERBOSE
+    global _TEST_FIRST_SEND_TIMES, _TEST_ORIGINAL_SOURCES, _TEST_TMPDIR, _VERBOSE
 
     parser = argparse.ArgumentParser(description="Firmware validation: replay, compare, report.")
     parser.add_argument("--settings", default="settings.json", help="Path to settings JSON file")
@@ -680,9 +772,13 @@ def main() -> None:
     parser.add_argument("--report-only", action="store_true", help="Skip replay, just run analysis + report")
     parser.add_argument("--archive", action="store_true", help="Archive logs and extract new baseline after report")
     parser.add_argument("--dev", action="store_true", help="Dev mode: only run 3 test devices for fast iteration")
+    parser.add_argument("--test", "-t", action="store_true",
+                        help="Test mode: shift all event timestamps to start ~1 min from now")
     args = parser.parse_args()
 
     _VERBOSE = args.verbose
+    _TEST_FIRST_SEND_TIMES = {}
+    _TEST_ORIGINAL_SOURCES = {}
 
     # Resolve paths relative to this script's directory
     firmware_dir = Path(__file__).resolve().parent
@@ -718,6 +814,8 @@ def main() -> None:
     sr.save_to_yaml(suite, str(yaml_path))
     vlog(f"Saved: {yaml_path}")
 
+    _TEST_ORIGINAL_SOURCES = {scenario.scenario_id: scenario.events_source for scenario in scenarios}
+
     # --- Dev mode filter ---
     if args.dev:
         before = len(scenarios)
@@ -739,6 +837,12 @@ def main() -> None:
         suite.batches = batches
         log(f"DEV MODE: filtered {before} -> {len(scenarios)} scenarios ({', '.join(s.scenario_id for s in scenarios)})")
 
+    if args.test:
+        log("TEST MODE: timestamps will be shifted for the active batch right before replay starts")
+        suite.show_progress_logs = True
+        suite.progress_log_interval_seconds = 5.0
+        log("TEST MODE: progress logs enabled every 5 seconds")
+
     log(f"Scenarios: {len(scenarios)}  |  Batches: {len(batches)}")
 
     # --- File readiness ---
@@ -755,97 +859,138 @@ def main() -> None:
             status = "OK" if lf else "--"
             log(f"  {status:>2s}  {tssu:>8s}  log={lf.name if lf else 'MISSING':<30s}  db={df.name if df else '--'}")
 
-    # ======================================================================
-    # REPLAY PHASE
-    # ======================================================================
-    if not args.report_only:
-        while True:
-            current_batch, completed = detect_current_batch(suite, batches)
-            if current_batch is None:
-                log("\nAll batches complete! Proceeding to analysis.")
-                break
+    try:
+        # ======================================================================
+        # REPLAY PHASE
+        # ======================================================================
+        if not args.report_only:
+            while True:
+                current_batch, completed = detect_current_batch(suite, batches)
+                if current_batch is None:
+                    log("\nAll batches complete! Proceeding to analysis.")
+                    break
 
-            log(f"\n{'='*70}")
-            log(f"BATCH: {current_batch.batch_id}  ({len(current_batch.assignments)} scenarios)")
-            log(f"Completed so far: {sorted(completed) if completed else '(none)'}")
-            log(f"{'='*70}")
-            log("\nLoad these databases onto the controllers:")
-            for sid, tgt in current_batch.assignments.items():
-                s = next(s for s in scenarios if s.scenario_id == sid)
-                db_name = Path(s.database_name).name
-                extras = []
-                if s.test_type == sr.TestType.CONFLICT:
-                    extras.append("CONFLICT" + (" pairs=configured" if s.incompatible_pairs else " (no pairs)"))
-                if s.cycle_length:
-                    extras.append(f"CL={s.cycle_length}")
-                if s.cycle_offset:
-                    extras.append(f"Off={s.cycle_offset}")
-                if not s.tod_align:
-                    extras.append("tod_align=OFF")
-                extra_str = "  " + ", ".join(extras) if extras else ""
-                log(f"  {tgt:<22s}  <-  {db_name:<20s}{extra_str}")
+                log(f"\n{'='*70}")
+                log(f"BATCH: {current_batch.batch_id}  ({len(current_batch.assignments)} scenarios)")
+                log(f"Completed so far: {sorted(completed) if completed else '(none)'}")
+                log(f"{'='*70}")
+                log("\nLoad these databases onto the controllers:")
+                for sid, tgt in current_batch.assignments.items():
+                    s = next(s for s in scenarios if s.scenario_id == sid)
+                    db_name = Path(s.database_name).name
+                    extras = []
+                    if s.test_type == sr.TestType.CONFLICT:
+                        extras.append("CONFLICT" + (" pairs=configured" if s.incompatible_pairs else " (no pairs)"))
+                    if s.cycle_length:
+                        extras.append(f"CL={s.cycle_length}")
+                    if s.cycle_offset:
+                        extras.append(f"Off={s.cycle_offset}")
+                    if not s.tod_align:
+                        extras.append("tod_align=OFF")
+                    extra_str = "  " + ", ".join(extras) if extras else ""
+                    log(f"  {tgt:<22s}  <-  {db_name:<20s}{extra_str}")
+                    if args.test:
+                        original_path = Path(_TEST_ORIGINAL_SOURCES.get(s.scenario_id, s.events_source))
+                        if original_path.exists():
+                            preview = pd.read_parquet(original_path, columns=["timestamp"])
+                            preview["timestamp"] = pd.to_datetime(preview["timestamp"])
+                            log(
+                                f"      original first raw timestamp: {preview['timestamp'].min():%Y-%m-%d %H:%M:%S}  "
+                                f"timestamps will be shifted after controller check"
+                            )
 
-            log("")
-            input("Press ENTER when databases are loaded and controllers are ready...")
+                log("")
+                input("Press ENTER when databases are loaded and controllers are ready...")
 
-            # Controller check
-            log("\nChecking controllers...")
-            db_lookup = {s.scenario_id: Path(s.database_name).name for s in scenarios}
-            b_targets = list(current_batch.assignments.values())
-            b_labels = [f"{tgt} / {db_lookup[sid]}" for sid, tgt in current_batch.assignments.items()]
+                # Controller check
+                log("\nChecking controllers...")
+                db_lookup = {s.scenario_id: Path(s.database_name).name for s in scenarios}
+                b_targets = list(current_batch.assignments.values())
+                b_labels = [f"{tgt} / {db_lookup[sid]}" for sid, tgt in current_batch.assignments.items()]
 
-            try:
-                wait_for_controllers(b_targets, b_labels)
-            except KeyboardInterrupt:
-                log("\nController check interrupted. Continuing anyway...")
+                try:
+                    wait_for_controllers(b_targets, b_labels)
+                except KeyboardInterrupt:
+                    log("\nController check interrupted. Continuing anyway...")
 
-            # Run replay
-            log(f"\nRunning replay for {current_batch.batch_id}...")
-            checkpoint = run_batch(suite, current_batch)
-            completed_batches = checkpoint.get("completed_batches", [])
-            remaining = [b.batch_id for b in batches if b.batch_id not in completed_batches]
+                if args.test:
+                    if _TEST_TMPDIR is not None and _TEST_TMPDIR.exists():
+                        shutil.rmtree(_TEST_TMPDIR, ignore_errors=True)
+                    _TEST_FIRST_SEND_TIMES = {}
+                    _TEST_TMPDIR = _shift_events_for_test_batch(current_batch, scenarios)
 
-            if remaining:
-                log(f"\nDone with {current_batch.batch_id}. "
-                    f"Completed: {len(completed_batches)}/{len(batches)} batches.")
-                log(f"Remaining batches: {remaining}")
-                log("Run this script again for the next batch.")
-                sys.exit(0)
-            else:
-                log(f"\nAll {len(batches)} batches complete!")
+                    log("TEST MODE: current batch timing after shift:")
+                    for sid, tgt in current_batch.assignments.items():
+                        scenario = next(s for s in scenarios if s.scenario_id == sid)
+                        shifted_path = Path(scenario.events_source)
+                        preview = pd.read_parquet(shifted_path, columns=["timestamp"])
+                        preview["timestamp"] = pd.to_datetime(preview["timestamp"])
+                        first_send = _TEST_FIRST_SEND_TIMES.get(sid)
+                        first_send_text = (
+                            f"{first_send:%Y-%m-%d %H:%M:%S}"
+                            if first_send is not None
+                            else "(unknown)"
+                        )
+                        log(
+                            f"  {tgt:<22s} first raw timestamp: {preview['timestamp'].min():%Y-%m-%d %H:%M:%S}  "
+                            f"first replay send: {first_send_text}"
+                        )
 
-    # ======================================================================
-    # ANALYSIS PHASE
-    # ======================================================================
-    log(f"\n{'='*70}")
-    log("ANALYSIS: Comparing collected output to original logs")
-    log(f"{'='*70}")
+                # Run replay
+                log(f"\nRunning replay for {current_batch.batch_id}...")
+                try:
+                    checkpoint = run_batch(suite, current_batch)
+                except KeyboardInterrupt:
+                    log("Replay interrupted by user. Exiting.")
+                    sys.exit(130)
+                completed_batches = checkpoint.get("completed_batches", [])
+                remaining = [b.batch_id for b in batches if b.batch_id not in completed_batches]
 
-    results = run_analysis(suite, settings, firmware_dir)
-    passed = sum(1 for r in results if r.passed)
-    log(f"\nResults: {passed}/{len(results)} passed")
+                if remaining:
+                    log(f"\nDone with {current_batch.batch_id}. "
+                        f"Completed: {len(completed_batches)}/{len(batches)} batches.")
+                    log(f"Remaining batches: {remaining}")
+                    log("Run this script again for the next batch.")
+                    sys.exit(0)
+                else:
+                    log(f"\nAll {len(batches)} batches complete!")
 
-    # ======================================================================
-    # REPORT
-    # ======================================================================
-    log(f"\n{'='*70}")
-    log("REPORT: Generating HTML report")
-    log(f"{'='*70}")
-
-    report_path = build_report(results, suite)
-    log(f"Report saved to: {report_path}")
-    log(f"Total images embedded: {sum(len(r.plot_paths) for r in results)}")
-
-    # ======================================================================
-    # ARCHIVE (optional)
-    # ======================================================================
-    if args.archive:
+        # ======================================================================
+        # ANALYSIS PHASE
+        # ======================================================================
         log(f"\n{'='*70}")
-        log("ARCHIVE: Extracting new baseline logs")
+        log("ANALYSIS: Comparing collected output to original logs")
         log(f"{'='*70}")
-        archive_and_extract(suite, firmware_dir)
 
-    log("\nDone.")
+        results = run_analysis(suite, settings, firmware_dir)
+        passed = sum(1 for r in results if r.passed)
+        log(f"\nResults: {passed}/{len(results)} passed")
+
+        # ======================================================================
+        # REPORT
+        # ======================================================================
+        log(f"\n{'='*70}")
+        log("REPORT: Generating HTML report")
+        log(f"{'='*70}")
+
+        report_path = build_report(results, suite)
+        log(f"Report saved to: {report_path}")
+        log(f"Total images embedded: {sum(len(r.plot_paths) for r in results)}")
+
+        # ======================================================================
+        # ARCHIVE (optional)
+        # ======================================================================
+        if args.archive:
+            log(f"\n{'='*70}")
+            log("ARCHIVE: Extracting new baseline logs")
+            log(f"{'='*70}")
+            archive_and_extract(suite, firmware_dir)
+
+        log("\nDone.")
+    finally:
+        if _TEST_TMPDIR is not None and _TEST_TMPDIR.exists():
+            shutil.rmtree(_TEST_TMPDIR, ignore_errors=True)
+            vlog(f"Cleaned up test-mode temp dir: {_TEST_TMPDIR}")
 
 
 if __name__ == "__main__":

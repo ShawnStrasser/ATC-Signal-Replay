@@ -40,23 +40,6 @@ def _parse_assignment(value: str) -> Tuple[str, Optional[int], Optional[int]]:
         f"Invalid assignment '{value}'. Use host, host:port, or host:udp_port:http_port."
     )
 
-
-def _load_events(events_source: str) -> pd.DataFrame:
-    path = Path(events_source)
-    if path.suffix.lower() == ".parquet":
-        return pd.read_parquet(path)
-    if path.suffix.lower() in (".csv", ".txt"):
-        return pd.read_csv(path)
-    raise ValueError(f"Unsupported event file type: {events_source}")
-
-
-def _normalize_timestamp_col(df: pd.DataFrame) -> str:
-    for col in df.columns:
-        if col.lower() in ("timestamp", "time_stamp", "timestamp", "time"):
-            return col
-    raise ValueError(f"No timestamp column found. Columns: {list(df.columns)}")
-
-
 def _serialize_result(result: ScenarioResult) -> dict:
     data = asdict(result)
     data["test_type"] = result.test_type.value
@@ -136,6 +119,7 @@ class BatchRunner:
         self.run_dir = Path(suite.output_dir) / suite.firmware_version
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.run_dir / "checkpoint.json"
+        self._active_simulation: Optional[ATCSimulation] = None
 
         self.logger = logging.getLogger(f"signal_replay.batch_runner.{suite.firmware_version}")
         self.logger.setLevel(logging.INFO)
@@ -230,7 +214,6 @@ class BatchRunner:
                     raise RuntimeError(f"Database load callback failed for {scenario_id}")
 
         signals: List[SignalConfig] = []
-        all_events: List[pd.DataFrame] = []
 
         for scenario_id in similarity_ids:
             scenario = self._get_scenario(scenario_id)
@@ -245,19 +228,15 @@ class BatchRunner:
                 cycle_offset=scenario.cycle_offset,
                 tod_align=scenario.tod_align,
             )
+            object.__setattr__(signal_cfg, "events", scenario.events_source)
             signals.append(signal_cfg)
 
-            events_df = _load_events(scenario.events_source).copy()
-            events_df["device_id"] = scenario_id
-            all_events.append(events_df)
-
-        centralized = pd.concat(all_events, ignore_index=True)
         db_path = self.run_dir / f"{batch.batch_id}.duckdb"
         self._clear_scenario_data(db_path, similarity_ids)
 
         sim = ATCSimulation(
             signals=signals,
-            events=centralized,
+            events=None,
             replays=1,
             stop_on_conflict=False,
             db_path=str(db_path),
@@ -272,9 +251,13 @@ class BatchRunner:
             debug=self.debug,
             skip_comparison=True,
         )
-        self.logger.info(f"Starting similarity batch {batch.batch_id} with {len(similarity_ids)} scenarios")
-        sim.run()
-        self.logger.info(f"Completed similarity batch {batch.batch_id}")
+        self._active_simulation = sim
+        try:
+            self.logger.info(f"Starting similarity batch {batch.batch_id} with {len(similarity_ids)} scenarios")
+            sim.run()
+            self.logger.info(f"Completed similarity batch {batch.batch_id}")
+        finally:
+            self._active_simulation = None
         return db_path
 
     def _run_conflict_scenario(
@@ -308,15 +291,13 @@ class BatchRunner:
             cycle_offset=scenario.cycle_offset,
             tod_align=scenario.tod_align,
         )
-
-        events_df = _load_events(scenario.events_source).copy()
-        events_df["device_id"] = scenario_id
+        object.__setattr__(signal_cfg, "events", scenario.events_source)
 
         db_path = self.run_dir / f"conflict_{scenario_id}.duckdb"
         self._clear_scenario_data(db_path, [scenario_id])
         sim = ATCSimulation(
             signals=[signal_cfg],
-            events=events_df,
+            events=None,
             replays=scenario.replays,
             stop_on_conflict=True,
             db_path=str(db_path),
@@ -331,10 +312,20 @@ class BatchRunner:
             debug=self.debug,
             skip_comparison=True,
         )
-        self.logger.info(f"Starting conflict scenario {scenario_id}")
-        sim.run()
-        self.logger.info(f"Completed conflict scenario {scenario_id}")
+        self._active_simulation = sim
+        try:
+            self.logger.info(f"Starting conflict scenario {scenario_id}")
+            sim.run()
+            self.logger.info(f"Completed conflict scenario {scenario_id}")
+        finally:
+            self._active_simulation = None
         return db_path
+
+    def stop(self) -> None:
+        """Request cooperative shutdown of the active simulation, if any."""
+        if self._active_simulation is not None:
+            self.logger.warning("Stop requested for active simulation")
+            self._active_simulation.request_stop()
 
     def run(
         self,

@@ -13,7 +13,7 @@ import pandas as pd
 
 from .config import SimulationConfig, SignalConfig
 from .replay import SignalReplay, create_replays
-from .collector import DatabaseManager, DataCollector, fetch_output_data, check_conflicts
+from .collector import DatabaseManager, DataCollector, fetch_output_data, check_conflicts, _log_memory
 from .comparison import (
     compare_all_runs, 
     format_comparison_summary, 
@@ -92,6 +92,11 @@ def _distribute_events(
         object.__setattr__(signal, 'events', signal_events)
 
 
+def _signals_have_events(signals: List[SignalConfig]) -> bool:
+    """Return True when every signal already has an assigned event source."""
+    return all(signal.events is not None for signal in signals)
+
+
 class ATCSimulation:
     """
     Main orchestrator for multi-signal ATC replay simulations.
@@ -125,7 +130,7 @@ class ATCSimulation:
         signals: Optional[List[SignalConfig]] = None,
         events: Union[pd.DataFrame, str, Path, None] = None,
         replays: int = 1,
-        stop_on_conflict: bool = False,
+        stop_on_conflict: bool = True,
         db_path: str = "./atc_replay.duckdb",
         simulation_speed: float = 1.0,
         collection_interval_minutes: float = 5.0,
@@ -147,7 +152,7 @@ class ATCSimulation:
             events: REQUIRED. Centralized event source with device_id column.
                 Events are automatically filtered and distributed to signals by device_id.
             replays: Number of simulation runs (streamlined pattern)
-            stop_on_conflict: Stop simulation on first conflict
+            stop_on_conflict: Stop before the next run when a conflict is detected after final end-of-run collection
             db_path: Path to DuckDB database
             simulation_speed: Speed multiplier (1.0 = real-time)
             collection_interval_minutes: How often to poll controller event logs
@@ -173,18 +178,26 @@ class ATCSimulation:
             # Legacy pattern: SimulationConfig provided
             if signals is not None:
                 raise ValueError("Cannot specify both 'config' and 'signals'. Use one or the other.")
-            # Distribute events to all signals
-            _distribute_events(config.signals, config.events)
+            if config.events is not None:
+                # Distribute events to all signals
+                _distribute_events(config.signals, config.events)
+            elif not _signals_have_events(config.signals):
+                raise ValueError(
+                    "SimulationConfig.events is None, but one or more signals are missing an event source"
+                )
             self.config = config
         else:
             # Streamlined pattern: kwargs provided
             if signals is None:
                 raise ValueError("Must provide either 'config' or 'signals'")
-            if events is None:
-                raise ValueError("Must provide 'events' (centralized event source with device_id column)")
-            
-            # Distribute centralized events to all signals
-            _distribute_events(signals, events)
+            if events is None and not _signals_have_events(signals):
+                raise ValueError(
+                    "Must provide 'events' unless every signal already has an event source assigned"
+                )
+
+            if events is not None:
+                # Distribute centralized events to all signals
+                _distribute_events(signals, events)
             
             # Create SimulationConfig internally
             self.config = SimulationConfig(
@@ -203,6 +216,15 @@ class ATCSimulation:
 
         if any(sig.tod_align for sig in self.config.signals) and self.config.simulation_speed != 1.0:
             raise ValueError("simulation_speed must be 1.0 when any signal uses tod_align=True")
+
+        # State tracking used by replay setup and run-time shutdown.
+        self._current_run: int = 0
+        self._simulation_start_time: Optional[datetime] = None
+        self._stop_event: threading.Event = threading.Event()
+        self._conflicts_found: List[Dict[str, Any]] = []
+        self._completed_runs: List[int] = []
+        self._failed_signals_by_run: Dict[int, List[str]] = {}
+        self._comparison_results: Optional[Dict[str, List[ComparisonResult]]] = None
         
         # Initialize database
         self.db = DatabaseManager(self.config.db_path)
@@ -216,15 +238,10 @@ class ATCSimulation:
         t0 = time.time()
         self._store_input_events()
         print(f"  Input events stored in {time.time() - t0:.1f}s")
-        
-        # State tracking
-        self._current_run: int = 0
-        self._simulation_start_time: Optional[datetime] = None
-        self._stop_event: threading.Event = threading.Event()
-        self._conflicts_found: List[Dict[str, Any]] = []
-        self._completed_runs: List[int] = []
-        self._failed_signals_by_run: Dict[int, List[str]] = {}
-        self._comparison_results: Optional[Dict[str, List[ComparisonResult]]] = None
+
+        # Free centralized events DataFrame (individual signals have their own sources)
+        if isinstance(self.config.events, pd.DataFrame):
+            self.config.events = None
     
     def _store_input_events(self) -> None:
         """Store source comparison events (phase/overlap events) for each signal.
@@ -244,18 +261,22 @@ class ATCSimulation:
                 snmp_timeout_seconds=self.config.snmp_timeout_seconds,
                 show_progress_logs=self.config.show_progress_logs,
                 progress_log_interval_seconds=self.config.progress_log_interval_seconds,
+                stop_event=self._stop_event,
                 debug=self.debug
             )
-            
-            # Cache duration so _get_estimated_duration doesn't recreate replays
-            self._cached_durations[signal_config.device_id] = replay.get_run_duration()
-            
-            # Get source comparison events (phase/overlap events)
-            comparison_events = replay.get_source_comparison_events()
-            
-            if comparison_events is not None and not comparison_events.empty:
-                # Data is already in the correct format (timestamp, event_id, parameter)
-                self.db.insert_input_events(comparison_events, signal_config.device_id)
+
+            try:
+                # Cache duration so _get_estimated_duration doesn't recreate replays
+                self._cached_durations[signal_config.device_id] = replay.get_run_duration()
+
+                # Get source comparison events (phase/overlap events)
+                comparison_events = replay.get_source_comparison_events()
+
+                if comparison_events is not None and not comparison_events.empty:
+                    # Data is already in the correct format (timestamp, event_id, parameter)
+                    self.db.insert_input_events(comparison_events, signal_config.device_id)
+            finally:
+                replay.release_cached_data(keep_activation_feed=False)
     
     def _run_single_signal(self, signal_config: SignalConfig) -> datetime:
         """Run replay for a single signal and return start time."""
@@ -265,9 +286,17 @@ class ATCSimulation:
             snmp_timeout_seconds=self.config.snmp_timeout_seconds,
             show_progress_logs=self.config.show_progress_logs,
             progress_log_interval_seconds=self.config.progress_log_interval_seconds,
+            stop_event=self._stop_event,
             debug=self.debug
         )
-        return replay.run()
+        try:
+            return replay.run()
+        finally:
+            replay.release_cached_data(keep_activation_feed=False)
+
+    def request_stop(self) -> None:
+        """Request cooperative shutdown of collectors and replay workers."""
+        self._stop_event.set()
     
     def _run_all_signals(self) -> Tuple[Dict[str, datetime], List[str]]:
         """
@@ -326,6 +355,7 @@ class ATCSimulation:
                 debug=self.debug
             )
             duration = replay.get_run_duration()
+            replay.release_cached_data(keep_activation_feed=False)
             if duration > max_duration:
                 max_duration = duration
         
@@ -405,6 +435,7 @@ class ATCSimulation:
                 break
             
             print(f"\n--- Starting Run {run_num}/{self.config.simulation_replays + self._run_offset} ---")
+            _log_memory(f"[start run {run_num}]")
             self._current_run = run_num
             
             # Reset stop event for this run
@@ -423,7 +454,14 @@ class ATCSimulation:
             # Run all signals - this BLOCKS until all replays complete
             # No additional sleep needed since _run_all_signals waits for completion
             print(f"Sending events to {len(self.config.signals)} controllers...")
-            start_times, failed_signals = self._run_all_signals()
+            try:
+                start_times, failed_signals = self._run_all_signals()
+            except KeyboardInterrupt:
+                print("\nKeyboard interrupt received. Stopping active replays...")
+                self.request_stop()
+                run_stop_event.set()
+                collection_thread.join(timeout=10)
+                raise
             if failed_signals:
                 self._failed_signals_by_run[run_num] = failed_signals
                 print(
@@ -462,7 +500,12 @@ class ATCSimulation:
             # Final data collection for this run (with retry for file lock release)
             for _attempt in range(3):
                 try:
-                    collector.collect_once(run_num, self._simulation_start_time)
+                    collector.collect_once(
+                        run_num,
+                        self._simulation_start_time,
+                        detect_conflicts=True,
+                        conflict_callback=self._on_conflict_detected,
+                    )
                     break
                 except Exception as e:
                     if _attempt < 2 and "being used by another process" in str(e):
@@ -472,6 +515,7 @@ class ATCSimulation:
                         raise
             
             self._completed_runs.append(run_num)
+            _log_memory(f"[end run {run_num}]")
             print(f"Run {run_num} completed")
             
             # Check if we should stop

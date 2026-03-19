@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal_replay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP"
 readme = "README.md"
 license = {text = "MIT"}
@@ -23,6 +23,7 @@ dependencies = [
     "pyyaml",
     "atspm",
     "pyarrow",
+    "psutil",
 ]
 
 [project.optional-dependencies]

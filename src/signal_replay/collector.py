@@ -2,9 +2,12 @@
 Data collector module for polling controllers and storing results in DuckDB.
 """
 
+import gc
 import duckdb
 import logging
+import os
 import pandas as pd
+import psutil
 import requests
 import warnings
 import xml.etree.ElementTree as ET
@@ -19,6 +22,13 @@ import threading
 logger = logging.getLogger(__name__)
 
 from .config import SignalConfig
+
+
+def _log_memory(label: str = "") -> None:
+    """Log current process RSS memory usage."""
+    proc = psutil.Process(os.getpid())
+    rss_mb = proc.memory_info().rss / (1024 * 1024)
+    logger.info("Memory RSS: %.1f MB %s", rss_mb, label)
 
 
 def _get_sql_template(filename: str) -> str:
@@ -37,33 +47,44 @@ class ConflictRecord:
     conflict_details: str
 
 
-def fetch_output_data(ip: str, http_port: int = 80) -> pd.DataFrame:
+def fetch_output_data(ip: str, http_port: int = 80, since: Optional[datetime] = None) -> pd.DataFrame:
     """
     Fetch the event log from a MAXTIME controller.
     
     Args:
         ip: IP address of the controller
         http_port: HTTP port for data collection (default: 80)
+        since: If provided, only fetch events after this timestamp.
+            The controller supports a ``?since=`` query parameter.
     
     Returns:
         DataFrame with columns: TimeStamp, EventTypeID, Parameter
     """
     url = f'http://{ip}:{http_port}/v1/asclog/xml/full'
+    if since is not None:
+        since_str = since.strftime('%m-%d-%Y %H:%M:%S.0')
+        url = f'{url}?since={since_str}'
     
     response = requests.get(url, verify=False, timeout=30)
     response.raise_for_status()
     
-    root = ET.fromstring(response.text)
-    data = [event.attrib for event in root.findall('.//Event')]
+    # Parse XML incrementally to minimise peak memory.  Use .content
+    # (bytes) instead of .text (decoded str) to avoid an extra copy, then
+    # clear the tree as we extract attributes.
+    from io import BytesIO
+    data = []
+    for _event, elem in ET.iterparse(BytesIO(response.content), events=('end',)):
+        if elem.tag == 'Event':
+            attrib = elem.attrib
+            data.append({k: attrib[k] for k in attrib if k != 'ID'})
+            elem.clear()
+    del response  # release HTTP body
     
     if not data:
         return pd.DataFrame(columns=['TimeStamp', 'EventTypeID', 'Parameter'])
     
     df = pd.DataFrame(data)
-    
-    # Drop ID column if present
-    if 'ID' in df.columns:
-        df = df.drop(columns='ID')
+    del data
     
     try:
         with warnings.catch_warnings(record=True) as caught:
@@ -116,32 +137,45 @@ def check_conflicts(
     if raw_data.empty:
         return pd.DataFrame(columns=['TimeStamp', 'Conflict_Details'])
     
-    parameters = raw_data['Parameter'].unique().tolist()
-    current_states = {param: 0 for param in parameters}
+    conflict_df = _build_conflict_dataframe(raw_data, incompatible_pairs)
+    return conflict_df
+
+
+def _build_conflict_dataframe(
+    raw_data: pd.DataFrame,
+    incompatible_pairs: List[Tuple[str, str]],
+) -> pd.DataFrame:
+    """Detect conflicts from a full ordered event stream for one run."""
+    if raw_data.empty:
+        return pd.DataFrame(columns=['TimeStamp', 'Conflict_Details'])
+
+    current_states: Dict[str, int] = {}
+    for param in raw_data['Parameter'].unique().tolist():
+        current_states.setdefault(param, 0)
+
     state_records = []
-    
     for _, row in raw_data.iterrows():
         param = row['Parameter']
         state = row['state_integer']
         current_states[param] = state
-        
+
         snapshot = {'TimeStamp': row['TimeStamp']}
-        for p in parameters:
-            snapshot[p] = current_states[p]
+        for tracked_param, tracked_state in current_states.items():
+            snapshot[tracked_param] = tracked_state
         state_records.append(snapshot)
-    
+
     if not state_records:
         return pd.DataFrame(columns=['TimeStamp', 'Conflict_Details'])
-    
+
     final_df = pd.DataFrame(state_records)
-    
+
     def check_incompatibilities(row):
         conflicts = []
         for (param1, param2) in incompatible_pairs:
             if row.get(param1, 0) == 1 and row.get(param2, 0) == 1:
                 conflicts.append((param1, param2))
         return conflicts
-    
+
     final_df['Conflicts'] = final_df.apply(
         lambda row: check_incompatibilities(row), axis=1
     )
@@ -149,10 +183,10 @@ def check_conflicts(
     final_df['Conflict_Details'] = final_df['Conflicts'].apply(
         lambda x: '; '.join([f"{a} & {b}" for a, b in x]) if x else ""
     )
-    
+
     final_df = final_df.drop_duplicates(subset='TimeStamp', keep='last')
     conflict_df = final_df[final_df['Has_Conflict']][['TimeStamp', 'Conflict_Details']]
-    
+
     return conflict_df
 
 
@@ -312,40 +346,40 @@ class DatabaseManager:
         df = df[['device_id', 'run_number', 'timestamp', 'event_id', 'parameter']]
         
         con = self._connect_with_retry()
-        
-        # Use INSERT OR REPLACE for deduplication
-        con.register('new_events', df)
-        con.execute("""
-            INSERT OR REPLACE INTO events
-            SELECT * FROM new_events
-        """)
-        
-        rows_inserted = len(df)
-        con.close()
+        try:
+            # Use INSERT OR REPLACE for deduplication
+            con.register('new_events', df)
+            con.execute("""
+                INSERT OR REPLACE INTO events
+                SELECT * FROM new_events
+            """)
+            rows_inserted = len(df)
+        finally:
+            con.close()
         
         return rows_inserted
     
     def insert_conflict(self, conflict: ConflictRecord) -> None:
         """Insert a conflict record into the database if it doesn't already exist."""
         con = self._connect_with_retry()
-        
-        # Check if this exact conflict already exists
-        existing = con.execute("""
-            SELECT COUNT(*) as count FROM conflicts 
-            WHERE device_id = ? 
-            AND run_number = ? 
-            AND timestamp = ? 
-            AND conflict_details = ?
-        """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details]).fetchone()
-        
-        # Only insert if it doesn't exist
-        if existing[0] == 0:
-            con.execute("""
-                INSERT INTO conflicts (device_id, run_number, timestamp, conflict_details)
-                VALUES (?, ?, ?, ?)
-            """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details])
-        
-        con.close()
+        try:
+            # Check if this exact conflict already exists
+            existing = con.execute("""
+                SELECT COUNT(*) as count FROM conflicts 
+                WHERE device_id = ? 
+                AND run_number = ? 
+                AND timestamp = ? 
+                AND conflict_details = ?
+            """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details]).fetchone()
+            
+            # Only insert if it doesn't exist
+            if existing[0] == 0:
+                con.execute("""
+                    INSERT INTO conflicts (device_id, run_number, timestamp, conflict_details)
+                    VALUES (?, ?, ?, ?)
+                """, [conflict.device_id, conflict.run_number, conflict.timestamp, conflict.conflict_details])
+        finally:
+            con.close()
     
     def insert_input_events(self, df: pd.DataFrame, device_id: str) -> None:
         """Store input events for later comparison."""
@@ -370,12 +404,14 @@ class DatabaseManager:
         df = df[['device_id', 'timestamp', 'event_id', 'parameter']]
         
         con = self._connect_with_retry()
-        con.register('input_df', df)
-        con.execute("""
-            INSERT INTO input_events
-            SELECT * FROM input_df
-        """)
-        con.close()
+        try:
+            con.register('input_df', df)
+            con.execute("""
+                INSERT INTO input_events
+                SELECT * FROM input_df
+            """)
+        finally:
+            con.close()
     
     def get_events(
         self,
@@ -386,30 +422,31 @@ class DatabaseManager:
     ) -> pd.DataFrame:
         """Retrieve events from the database with optional filters."""
         con = self._connect_with_retry()
-        
-        query = "SELECT * FROM events WHERE 1=1"
-        params = []
-        
-        if device_id is not None:
-            query += " AND device_id = ?"
-            params.append(device_id)
-        
-        if run_number is not None:
-            query += " AND run_number = ?"
-            params.append(run_number)
-        
-        if start_time is not None:
-            query += " AND timestamp >= ?"
-            params.append(start_time)
-        
-        if end_time is not None:
-            query += " AND timestamp <= ?"
-            params.append(end_time)
-        
-        query += " ORDER BY timestamp"
-        
-        df = con.execute(query, params).df()
-        con.close()
+        try:
+            query = "SELECT * FROM events WHERE 1=1"
+            params = []
+            
+            if device_id is not None:
+                query += " AND device_id = ?"
+                params.append(device_id)
+            
+            if run_number is not None:
+                query += " AND run_number = ?"
+                params.append(run_number)
+            
+            if start_time is not None:
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+            
+            if end_time is not None:
+                query += " AND timestamp <= ?"
+                params.append(end_time)
+            
+            query += " ORDER BY timestamp"
+            
+            df = con.execute(query, params).df()
+        finally:
+            con.close()
         
         return df
     
@@ -420,52 +457,53 @@ class DatabaseManager:
     ) -> pd.DataFrame:
         """Retrieve conflicts from the database."""
         con = self._connect_with_retry()
-        
-        query = "SELECT * FROM conflicts WHERE 1=1"
-        params = []
-        
-        if device_id is not None:
-            query += " AND device_id = ?"
-            params.append(device_id)
-        
-        if run_number is not None:
-            query += " AND run_number = ?"
-            params.append(run_number)
-        
-        query += " ORDER BY timestamp"
-        
-        df = con.execute(query, params).df()
-        con.close()
+        try:
+            query = "SELECT * FROM conflicts WHERE 1=1"
+            params = []
+            
+            if device_id is not None:
+                query += " AND device_id = ?"
+                params.append(device_id)
+            
+            if run_number is not None:
+                query += " AND run_number = ?"
+                params.append(run_number)
+            
+            query += " ORDER BY timestamp"
+            
+            df = con.execute(query, params).df()
+        finally:
+            con.close()
         
         return df
     
     def get_input_events(self, device_id: Optional[str] = None) -> pd.DataFrame:
         """Retrieve stored input events."""
         con = self._connect_with_retry()
-        
-        if device_id:
-            df = con.execute(
-                "SELECT * FROM input_events WHERE device_id = ? ORDER BY timestamp",
-                [device_id]
-            ).df()
-        else:
-            df = con.execute("SELECT * FROM input_events ORDER BY timestamp").df()
-        
-        con.close()
+        try:
+            if device_id:
+                df = con.execute(
+                    "SELECT * FROM input_events WHERE device_id = ? ORDER BY timestamp",
+                    [device_id]
+                ).df()
+            else:
+                df = con.execute("SELECT * FROM input_events ORDER BY timestamp").df()
+        finally:
+            con.close()
         return df
     
     def clear_run_data(self, run_number: Optional[int] = None) -> None:
         """Clear data for a specific run or all runs."""
         con = self._connect_with_retry()
-        
-        if run_number is not None:
-            con.execute("DELETE FROM events WHERE run_number = ?", [run_number])
-            con.execute("DELETE FROM conflicts WHERE run_number = ?", [run_number])
-        else:
-            con.execute("DELETE FROM events")
-            con.execute("DELETE FROM conflicts")
-        
-        con.close()
+        try:
+            if run_number is not None:
+                con.execute("DELETE FROM events WHERE run_number = ?", [run_number])
+                con.execute("DELETE FROM conflicts WHERE run_number = ?", [run_number])
+            else:
+                con.execute("DELETE FROM events")
+                con.execute("DELETE FROM conflicts")
+        finally:
+            con.close()
 
     def clear_device_data(self, device_ids: List[str]) -> None:
         """Clear all stored data for one or more device IDs."""
@@ -514,7 +552,7 @@ class DataCollector:
             db_path: Path to DuckDB database
             device_configs: Dict mapping device_id to (ip_port, incompatible_pairs, http_port)
             collection_interval_minutes: How often to collect data
-            stop_on_conflict: Whether to signal stop when conflict detected
+            stop_on_conflict: Whether to stop before the next run when final conflict detection finds a conflict
             debug: Enable debug output
         """
         self.db_path = db_path
@@ -525,6 +563,7 @@ class DataCollector:
 
         self._stop_event = mp.Event()
         self._collector_process = None
+        self._db: Optional[DatabaseManager] = None
         self._last_seen_event_key: Dict[str, Tuple[pd.Timestamp, int, int]] = {}
         self._consecutive_insert_failures: Dict[str, int] = {}
         self._fetch_error_logged: Set[str] = set()
@@ -595,6 +634,9 @@ class DataCollector:
                 stop_event.set()
                 return
             
+            _log_memory(f"[after collect run={run_number}]")
+            gc.collect()
+
             # Sleep in small intervals so we can check stop_event frequently
             sleep_elapsed = 0
             while sleep_elapsed < self.collection_interval and not stop_event.is_set():
@@ -608,6 +650,7 @@ class DataCollector:
         self,
         run_number: int,
         simulation_start_time: datetime,
+        detect_conflicts: bool = False,
         conflict_callback: Optional[callable] = None,
         error_event: Optional[threading.Event] = None,
     ) -> None:
@@ -617,6 +660,7 @@ class DataCollector:
         Args:
             run_number: Current simulation run number
             simulation_start_time: Start time of simulation
+            detect_conflicts: Whether to check conflicts after storing events
             conflict_callback: Optional callback when conflicts found
             error_event: Optional event set when repeated DB insert failures occur
         """
@@ -632,8 +676,15 @@ class DataCollector:
                 continue
             
             ip = ip_port[0]
+            # Use the watermark timestamp (minus 10s buffer) to ask the
+            # controller for only recent events, avoiding fetching the
+            # entire log on every poll.
+            since = None
+            last_key = self._last_seen_event_key.get(device_id)
+            if last_key is not None:
+                since = (last_key[0] - pd.Timedelta(seconds=10)).to_pydatetime()
             try:
-                df = fetch_output_data(ip, http_port)
+                df = fetch_output_data(ip, http_port, since=since)
             except (
                 requests.exceptions.RequestException,
                 ET.ParseError,
@@ -667,7 +718,9 @@ class DataCollector:
 
             # Insert events into DB
             try:
-                db = DatabaseManager(self.db_path)
+                if self._db is None:
+                    self._db = DatabaseManager(self.db_path)
+                db = self._db
                 rows = db.insert_events(df, device_id, run_number, simulation_start_time)
                 self._consecutive_insert_failures[device_id] = 0
 
@@ -692,35 +745,45 @@ class DataCollector:
                         f"Repeated DB insert failures for {device_id} ({fail_count} consecutive)"
                     ) from e
                 continue
-            # Check for conflicts
+            if not detect_conflicts:
+                continue
+
             start = time.time()
-            conflicts = check_conflicts(df, incompatible_pairs)
+            run_events = db.get_events(device_id=device_id, run_number=run_number)
+            if not run_events.empty:
+                run_events = run_events.rename(columns={
+                    'timestamp': 'TimeStamp',
+                    'event_id': 'EventTypeID',
+                    'parameter': 'Parameter',
+                })
+
+            conflicts = check_conflicts(run_events, incompatible_pairs)
             if self.debug:
                 print(f"Conflict check for {device_id} took {time.time() - start:.2f} seconds")
-            if not conflicts.empty:
+            if conflicts.empty:
+                continue
+
+            if self.debug:
+                print(f"Conflicts found for {device_id}!")
+
+            conflict_records = []
+            for _, row in conflicts.iterrows():
+                conflict_records.append(ConflictRecord(
+                    device_id=device_id,
+                    run_number=run_number,
+                    timestamp=row['TimeStamp'],
+                    conflict_details=row['Conflict_Details']
+                ))
+
+            try:
+                for conflict in conflict_records:
+                    db.insert_conflict(conflict)
+            except Exception as e:
                 if self.debug:
-                    print(f"Conflicts found for {device_id}!")
-                
-                conflict_records = []
-                for _, row in conflicts.iterrows():
-                    conflict_records.append(ConflictRecord(
-                        device_id=device_id,
-                        run_number=run_number,
-                        timestamp=row['TimeStamp'],
-                        conflict_details=row['Conflict_Details']
-                    ))
-                
-                # Insert conflicts into DB
-                try:
-                    for conflict in conflict_records:
-                        db.insert_conflict(conflict)
-                except Exception as e:
-                    if self.debug:
-                        print(f"DB conflict insert failed for {device_id}: {e}")
-                
-                # Call conflict callback if provided
-                if conflict_callback:
-                    conflict_callback(conflict_records)
+                    print(f"DB conflict insert failed for {device_id}: {e}")
+
+            if conflict_callback:
+                conflict_callback(conflict_records)
     
     def stop(self) -> None:
         """Stop the collection loop."""

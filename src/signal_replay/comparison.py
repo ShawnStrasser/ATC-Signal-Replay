@@ -2052,35 +2052,36 @@ def load_events(source: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
     elif suffix == '.db':
         # SQLite database - try to find events table
         con = duckdb.connect()
-        con.execute(f"ATTACH '{path}' AS source_db (TYPE SQLITE)")
-        
-        # Try common table names
-        tables = con.execute("""
-            SELECT name FROM source_db.sqlite_master 
-            WHERE type='table'
-        """).fetchall()
-        table_names = [t[0].lower() for t in tables]
-        
-        if 'event' in table_names:
-            # MAXTIME format
-            df = con.execute("""
-                SELECT
-                    TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS timestamp,
-                    EventTypeID AS event_id,
-                    Parameter AS parameter
-                FROM source_db.Event
-                ORDER BY timestamp
-            """).df()
-        elif 'events' in table_names:
-            df = con.execute("""
-                SELECT * FROM source_db.events ORDER BY timestamp
-            """).df()
-        else:
+        try:
+            con.execute(f"ATTACH '{path}' AS source_db (TYPE SQLITE)")
+
+            # DuckDB exposes sqlite_master unqualified for attached SQLite databases.
+            tables = con.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table'
+            """).fetchall()
+            table_names = [t[0].lower() for t in tables]
+
+            if 'event' in table_names:
+                # MAXTIME format
+                return con.execute("""
+                    SELECT
+                        TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS timestamp,
+                        EventTypeID AS event_id,
+                        Parameter AS parameter
+                    FROM source_db.Event
+                    ORDER BY timestamp
+                """).df()
+            if 'events' in table_names:
+                return con.execute("""
+                    SELECT * FROM source_db.events ORDER BY timestamp
+                """).df()
+
+            raise ValueError(
+                f"No 'Event' or 'events' table found in {path}. Found tables: {[t[0] for t in tables]}"
+            )
+        finally:
             con.close()
-            raise ValueError(f"No 'Event' or 'events' table found in {path}. Found tables: {[t[0] for t in tables]}")
-        
-        con.close()
-        return df
     else:
         raise ValueError(f"Unsupported file type: {suffix}. Use .csv, .parquet, or .db")
 

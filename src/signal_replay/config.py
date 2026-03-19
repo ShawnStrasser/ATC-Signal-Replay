@@ -3,8 +3,9 @@ Configuration classes for ATC Signal Replay.
 """
 
 from dataclasses import dataclass, field
-from typing import Union, List, Tuple, Optional
 from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
 import pandas as pd
 
 # Sentinel value to indicate "use default"
@@ -42,7 +43,7 @@ class SignalConfig:
     http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
     
     # Internal: populated during simulation initialization
-    events: Union[pd.DataFrame, None] = field(default=None, init=False, repr=False)
+    events: Union[pd.DataFrame, str, Path, None] = field(default=None, init=False, repr=False)
     
     def __post_init__(self):
         # Detect if this is localhost
@@ -121,10 +122,11 @@ class SimulationConfig:
     Attributes:
         signals: List of SignalConfig objects for each signal to simulate
         events: Centralized event source (DataFrame or file path). Events are automatically
-            filtered by device_id and distributed to signals. REQUIRED.
-            The data must contain a 'device_id' column (or 'DeviceId').
+            filtered by device_id and distributed to signals. Optional when every
+            SignalConfig already has its own event source assigned.
+            The centralized data must contain a 'device_id' column (or 'DeviceId').
         simulation_replays: Number of times to replay the simulation
-        stop_on_conflict: If True, stop simulation when a conflict is detected
+        stop_on_conflict: If True, stop before the next run when a conflict is detected after final end-of-run collection
         db_path: Path to DuckDB database file (defaults to ./atc_replay.duckdb)
         controller_type: Type of controller (currently only "MAXTIME" supported)
         simulation_speed: Speed multiplier for the simulation (1.0 = real-time)
@@ -135,9 +137,9 @@ class SimulationConfig:
         progress_log_interval_seconds: Interval between replay progress logs
     """
     signals: List[SignalConfig]
-    events: Union[pd.DataFrame, str, Path]
+    events: Union[pd.DataFrame, str, Path, None]
     simulation_replays: int = 1
-    stop_on_conflict: bool = False
+    stop_on_conflict: bool = True
     db_path: str = "./atc_replay.duckdb"
     controller_type: str = "MAXTIME"
     simulation_speed: float = 1.0
@@ -164,6 +166,11 @@ class SimulationConfig:
                 f"Found different values: {non_zero_lengths}"
             )
         
+        if self.events is None and any(signal.events is None for signal in self.signals):
+            raise ValueError(
+                "events must be provided unless every signal already has an assigned event source"
+            )
+
         # Validate simulation_replays
         if not isinstance(self.simulation_replays, int) or self.simulation_replays < 1:
             raise ValueError(f"simulation_replays must be a positive integer, got {self.simulation_replays}")

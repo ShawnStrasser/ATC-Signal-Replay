@@ -185,9 +185,24 @@ def _build_conflict_dataframe(
     )
 
     final_df = final_df.drop_duplicates(subset='TimeStamp', keep='last')
-    conflict_df = final_df[final_df['Has_Conflict']][['TimeStamp', 'Conflict_Details']]
+    conflict_df = final_df[final_df['Has_Conflict']][['TimeStamp', 'Conflict_Details']].copy()
+    if conflict_df.empty:
+        return conflict_df
 
-    return conflict_df
+    conflict_df = conflict_df[conflict_df['Conflict_Details'] != ""]
+    if conflict_df.empty:
+        return conflict_df
+
+    # Report the first timestamp for each distinct conflict signature in a run.
+    conflict_df = (
+        conflict_df.sort_values('TimeStamp')
+        .groupby('Conflict_Details', as_index=False, sort=False)
+        .first()
+        .sort_values('TimeStamp')
+        .reset_index(drop=True)
+    )
+
+    return conflict_df[['TimeStamp', 'Conflict_Details']]
 
 
 class DatabaseManager:
@@ -284,11 +299,24 @@ class DatabaseManager:
                     parameter INTEGER
                 )
             """)
+
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS simulation_runs (
+                    run_number INTEGER PRIMARY KEY,
+                    status VARCHAR,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            """)
         finally:
             con.close()
     
     def get_max_run_number(self) -> int:
         """Get the maximum run number currently in the database."""
+        completed_runs = self.get_completed_run_numbers()
+        if completed_runs:
+            return completed_runs[-1]
+
         con = self._connect_with_retry()
         try:
             # Check both events and conflicts tables efficiently
@@ -303,6 +331,74 @@ class DatabaseManager:
             return int(max_run)
         except Exception:
             return 0
+        finally:
+            con.close()
+
+    def get_completed_run_numbers(self) -> List[int]:
+        """Return completed run numbers in ascending order."""
+        con = self._connect_with_retry()
+        try:
+            simulation_runs_exists = con.execute("""
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE lower(table_name) = 'simulation_runs'
+            """).fetchone()[0] > 0
+
+            if simulation_runs_exists:
+                completed = con.execute("""
+                    SELECT run_number
+                    FROM simulation_runs
+                    WHERE status = 'completed'
+                    ORDER BY run_number
+                """).fetchall()
+                if completed:
+                    return [int(row[0]) for row in completed]
+
+            fallback = con.execute("""
+                SELECT DISTINCT run_number
+                FROM (
+                    SELECT run_number FROM events
+                    UNION
+                    SELECT run_number FROM conflicts
+                )
+                WHERE run_number IS NOT NULL
+                ORDER BY run_number
+            """).fetchall()
+            return [int(row[0]) for row in fallback]
+        finally:
+            con.close()
+
+    def mark_run_started(self, run_number: int) -> None:
+        """Mark a run as started so interrupted runs can be resumed cleanly."""
+        con = self._connect_with_retry()
+        try:
+            con.execute("DELETE FROM simulation_runs WHERE run_number = ?", [run_number])
+            con.execute(
+                """
+                INSERT INTO simulation_runs (run_number, status, started_at, completed_at)
+                VALUES (?, 'running', ?, NULL)
+                """,
+                [run_number, datetime.now()],
+            )
+        finally:
+            con.close()
+
+    def mark_run_completed(self, run_number: int) -> None:
+        """Mark a run as completed."""
+        con = self._connect_with_retry()
+        try:
+            started_row = con.execute(
+                "SELECT started_at FROM simulation_runs WHERE run_number = ?",
+                [run_number],
+            ).fetchone()
+            started_at = started_row[0] if started_row and started_row[0] is not None else datetime.now()
+            con.execute("DELETE FROM simulation_runs WHERE run_number = ?", [run_number])
+            con.execute(
+                """
+                INSERT INTO simulation_runs (run_number, status, started_at, completed_at)
+                VALUES (?, 'completed', ?, ?)
+                """,
+                [run_number, started_at, datetime.now()],
+            )
         finally:
             con.close()
     
@@ -405,6 +501,7 @@ class DatabaseManager:
         
         con = self._connect_with_retry()
         try:
+            con.execute("DELETE FROM input_events WHERE device_id = ?", [device_id])
             con.register('input_df', df)
             con.execute("""
                 INSERT INTO input_events

@@ -45,6 +45,10 @@ sim = sr.ATCSimulation(
 results = sim.run()
 ```
 
+Assigning the return value is optional. `sim.run()` prints a human-readable summary,
+while `results` gives you the same outcome as structured data for notebook follow-up,
+tests, or custom logic without having to scrape printed text.
+
 The simulation will:
 1. Load events and filter by `device_id`
 2. Generate an activation feed (detector on/off SNMP commands)
@@ -61,10 +65,7 @@ The simulation will:
 Starting ATC simulation with 1 signals, 40 replays
 Estimated duration per run: 0h 32m (computed in 0.3s)
 
---- Starting Run 1/40 ---
-Sending events to 1 controllers...
-[0] Complete — sent 4231 events
-Run 1 completed
+Working on run 1 of 40
 
 Conflict detected! Stopping simulation.
 
@@ -75,7 +76,7 @@ SIMULATION COMPLETE
 ============================================================
 
 Completed Runs: 1
-Conflicts Found: 2
+Conflicts Found: 1
 
 Conflicts:
   [0] Run 1: O5 & Ph4; O5 & Ph8 at 2026-02-02 14:28:16.100000

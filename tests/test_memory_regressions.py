@@ -44,6 +44,15 @@ def test_simulation_uses_preloaded_signal_events_without_central_distribution(te
         def get_max_run_number(self):
             return 0
 
+        def clear_run_data(self, _run_number=None):
+            return None
+
+        def mark_run_started(self, _run_number):
+            return None
+
+        def mark_run_completed(self, _run_number):
+            return None
+
         def insert_input_events(self, *_args, **_kwargs):
             return None
 

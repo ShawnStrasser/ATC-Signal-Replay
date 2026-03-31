@@ -408,7 +408,7 @@ class SignalReplay:
         if self._stop_event.is_set():
             return
 
-        if not self._first_send_logged:
+        if not self._first_send_logged and self.debug:
             self._first_send_logged = True
             print(
                 f"[{self.device_id}] First command dispatched at {datetime.now():%H:%M:%S} "
@@ -516,7 +516,8 @@ class SignalReplay:
                     last_progress = now
 
             await self._wait_for_pending_sends()
-            print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
+            if self.show_progress_logs or self.debug:
+                print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
             return
 
         start_time = asyncio.get_event_loop().time()
@@ -549,7 +550,8 @@ class SignalReplay:
                 last_progress = now
 
         await self._wait_for_pending_sends()
-        print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
+        if self.show_progress_logs or self.debug:
+            print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
     
     def _run_in_thread(self) -> None:
         """Run the async replay in a new event loop in a separate thread."""

@@ -218,6 +218,15 @@ class TestOrchestratorTimingWithMocks:
             def get_max_run_number(self):
                 return 0
 
+            def clear_run_data(self, _run_number=None):
+                return None
+
+            def mark_run_started(self, _run_number):
+                return None
+
+            def mark_run_completed(self, _run_number):
+                return None
+
             def insert_input_events(self, *_args, **_kwargs):
                 return None
 
@@ -271,6 +280,72 @@ class TestOrchestratorTimingWithMocks:
         assert results['completed_runs'] == [1]
         assert results['conflicts']
         assert results['conflicts'][0]['conflict_details'] == 'Ph2 & OPed17'
+
+    def test_resume_runs_up_to_requested_total(self, temp_db_path):
+        signal = sr.SignalConfig(
+            device_id='test_device',
+            ip='127.0.0.1',
+            udp_port=1025,
+            incompatible_pairs=[],
+            http_port=None,
+        )
+        signal.events = create_synthetic_events(duration_seconds=1.0, events_per_second=1.0)
+
+        started_runs = []
+        completed_runs = []
+
+        class FakeDB:
+            def __init__(self, _db_path):
+                pass
+
+            def get_max_run_number(self):
+                return 2
+
+            def clear_run_data(self, _run_number=None):
+                return None
+
+            def mark_run_started(self, run_number):
+                started_runs.append(run_number)
+
+            def mark_run_completed(self, run_number):
+                completed_runs.append(run_number)
+
+            def insert_input_events(self, *_args, **_kwargs):
+                return None
+
+        class FakeCollector:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_collection_loop(self, *args, **kwargs):
+                return None
+
+            def collect_once(self, *args, **kwargs):
+                return None
+
+        def fake_store(self):
+            self._cached_durations = {'test_device': 0.0}
+
+        with patch('signal_replay.orchestrator.DatabaseManager', FakeDB), patch(
+            'signal_replay.orchestrator.DataCollector', FakeCollector
+        ), patch.object(sr.ATCSimulation, '_store_input_events', fake_store), patch.object(
+            sr.ATCSimulation, '_run_all_signals', return_value=({'test_device': datetime.now()}, [])
+        ):
+            sim = sr.ATCSimulation(
+                signals=[signal],
+                events=None,
+                replays=4,
+                stop_on_conflict=False,
+                db_path=temp_db_path,
+                post_replay_settle_seconds=0,
+                skip_comparison=True,
+                debug=False,
+            )
+            results = sim.run()
+
+        assert started_runs == [3, 4]
+        assert completed_runs == [3, 4]
+        assert results['completed_runs'] == [3, 4]
 
 
 class TestSignalReplayTiming:

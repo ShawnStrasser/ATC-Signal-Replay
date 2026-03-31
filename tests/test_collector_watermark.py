@@ -168,6 +168,21 @@ def test_check_conflicts_distinguishes_overlap_ped_from_standard_ped():
     assert len(correct_pair_conflicts) == 1
 
 
+def test_check_conflicts_reports_first_timestamp_per_conflict_signature():
+    df = _sample_df([
+        [pd.Timestamp("2026-01-01 12:00:00"), 1, 2],
+        [pd.Timestamp("2026-01-01 12:00:01"), 67, 17],
+        [pd.Timestamp("2026-01-01 12:00:02"), 10, 99],
+        [pd.Timestamp("2026-01-01 12:00:03"), 10, 98],
+    ])
+
+    conflicts = check_conflicts(df, [("Ph2", "OPed17")])
+
+    assert len(conflicts) == 1
+    assert conflicts.iloc[0]["TimeStamp"] == pd.Timestamp("2026-01-01 12:00:01")
+    assert conflicts.iloc[0]["Conflict_Details"] == "Ph2 & OPed17"
+
+
 def test_collect_once_does_not_check_conflicts_by_default():
     df_poll_1 = _sample_df([
         [pd.Timestamp("2026-01-01 12:00:00"), 1, 2],

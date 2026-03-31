@@ -6,7 +6,7 @@ import threading
 import time
 from copy import copy
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Union, Tuple
+from typing import List, Dict, Optional, Any, Union, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import pandas as pd
@@ -222,17 +222,21 @@ class ATCSimulation:
         self._simulation_start_time: Optional[datetime] = None
         self._stop_event: threading.Event = threading.Event()
         self._conflicts_found: List[Dict[str, Any]] = []
+        self._conflict_keys: Set[Tuple[str, int, str]] = set()
         self._completed_runs: List[int] = []
         self._failed_signals_by_run: Dict[int, List[str]] = {}
         self._comparison_results: Optional[Dict[str, List[ComparisonResult]]] = None
+        self._progress_line_active = False
+        self._progress_line_width = 0
         
         # Initialize database
         self.db = DatabaseManager(self.config.db_path)
         
-        # Determine starting run number if database already has runs
+        # Determine starting run number using completed runs so interrupted runs
+        # resume to the requested total instead of adding a fresh batch.
         self._run_offset = self.db.get_max_run_number()
         if self._run_offset > 0:
-            print(f"Existing runs found in database. Starting new runs from {self._run_offset + 1}")
+            print(f"Existing completed runs found in database: {self._run_offset}")
         
         # Store input events for comparison
         t0 = time.time()
@@ -364,6 +368,14 @@ class ATCSimulation:
     def _on_conflict_detected(self, conflicts: List) -> None:
         """Callback when conflicts are detected."""
         for conflict in conflicts:
+            conflict_key = (
+                conflict.device_id,
+                conflict.run_number,
+                conflict.conflict_details,
+            )
+            if conflict_key in self._conflict_keys:
+                continue
+
             # Create conflict dict
             conflict_dict = {
                 'device_id': conflict.device_id,
@@ -371,13 +383,24 @@ class ATCSimulation:
                 'timestamp': conflict.timestamp,
                 'conflict_details': conflict.conflict_details
             }
-            
-            # Only add if not already in the list (avoid duplicates in memory)
-            if conflict_dict not in self._conflicts_found:
-                self._conflicts_found.append(conflict_dict)
+
+            self._conflict_keys.add(conflict_key)
+            self._conflicts_found.append(conflict_dict)
         
         if self.config.stop_on_conflict:
             self._stop_event.set()
+
+    def _update_progress_line(self, message: str) -> None:
+        """Update a single transient progress line for notebook-friendly output."""
+        self._progress_line_width = max(self._progress_line_width, len(message))
+        print(f"\r{message.ljust(self._progress_line_width)}", end="", flush=True)
+        self._progress_line_active = True
+
+    def _finish_progress_line(self) -> None:
+        """Terminate the transient progress line before normal output."""
+        if self._progress_line_active:
+            print()
+            self._progress_line_active = False
     
     def run(self) -> Dict[str, Any]:
         """
@@ -425,18 +448,28 @@ class ATCSimulation:
         
         stopped_early = False
         collection_error = False
-        
-        for run_idx in range(1, self.config.simulation_replays + 1):
-            run_num = run_idx + self._run_offset
+
+        if self._run_offset >= self.config.simulation_replays:
+            print(
+                f"Requested total runs already satisfied: {self._run_offset} completed, "
+                f"target was {self.config.simulation_replays}."
+            )
+
+        for run_num in range(self._run_offset + 1, self.config.simulation_replays + 1):
             
             if self._stop_event.is_set():
                 stopped_early = True
-                print(f"\nSimulation stopped early due to conflict after run {run_num - 1}")
+                self._finish_progress_line()
+                print(f"Simulation stopped early due to conflict after run {run_num - 1}")
                 break
-            
-            print(f"\n--- Starting Run {run_num}/{self.config.simulation_replays + self._run_offset} ---")
+
+            self._update_progress_line(
+                f"Working on run {run_num} of {self.config.simulation_replays}"
+            )
             _log_memory(f"[start run {run_num}]")
             self._current_run = run_num
+            self.db.clear_run_data(run_num)
+            self.db.mark_run_started(run_num)
             
             # Reset stop event for this run
             run_stop_event = threading.Event()
@@ -453,17 +486,18 @@ class ATCSimulation:
             
             # Run all signals - this BLOCKS until all replays complete
             # No additional sleep needed since _run_all_signals waits for completion
-            print(f"Sending events to {len(self.config.signals)} controllers...")
             try:
                 start_times, failed_signals = self._run_all_signals()
             except KeyboardInterrupt:
-                print("\nKeyboard interrupt received. Stopping active replays...")
+                self._finish_progress_line()
+                print("Keyboard interrupt received. Stopping active replays...")
                 self.request_stop()
                 run_stop_event.set()
                 collection_thread.join(timeout=10)
                 raise
             if failed_signals:
                 self._failed_signals_by_run[run_num] = failed_signals
+                self._finish_progress_line()
                 print(
                     f"Run {run_num} signal failures: "
                     + ", ".join(failed_signals)
@@ -471,7 +505,8 @@ class ATCSimulation:
             self._simulation_start_time = min(start_times.values()) if start_times else datetime.now()
 
             if not start_times:
-                print(f"\n*** Aborting run {run_num}: all signals failed.")
+                self._finish_progress_line()
+                print(f"*** Aborting run {run_num}: all signals failed.")
                 stopped_early = True
                 collection_error = True
                 run_stop_event.set()
@@ -480,7 +515,8 @@ class ATCSimulation:
             
             # Check if collection thread hit a fatal error during replay
             if collection_error_event.is_set():
-                print("\n*** Aborting: data collection failed (controller unreachable).")
+                self._finish_progress_line()
+                print("*** Aborting: data collection failed (controller unreachable).")
                 stopped_early = True
                 collection_error = True
                 break
@@ -515,22 +551,28 @@ class ATCSimulation:
                         raise
             
             self._completed_runs.append(run_num)
+            self.db.mark_run_completed(run_num)
             _log_memory(f"[end run {run_num}]")
-            print(f"Run {run_num} completed")
+            self._update_progress_line(
+                f"Working on run {run_num} of {self.config.simulation_replays}"
+            )
             
             # Check if we should stop
             if self._conflicts_found and self.config.stop_on_conflict:
                 stopped_early = True
-                print("\nConflict detected! Stopping simulation.")
+                self._finish_progress_line()
+                print("Conflict detected! Stopping simulation.")
                 break
+
+        self._finish_progress_line()
         
         # Run comparison analysis
         if collection_error:
-            print("\n--- Skipping comparison (collection failed) ---")
+            print("--- Skipping comparison (collection failed) ---")
         elif self.skip_comparison:
             pass  # comparison deferred to report step
         else:
-            print("\n--- Running Comparison Analysis ---")
+            print("--- Running Comparison Analysis ---")
             self._run_comparison()
         
         # Build results
@@ -673,6 +715,7 @@ class ATCSimulation:
     
     def _print_summary(self) -> None:
         """Print final simulation summary."""
+        self._finish_progress_line()
         print("\n" + "=" * 60)
         print("SIMULATION COMPLETE")
         print("=" * 60)

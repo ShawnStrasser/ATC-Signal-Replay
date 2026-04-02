@@ -21,6 +21,7 @@ import json
 import sys
 import time
 import traceback
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -425,6 +426,99 @@ def _extract_collected_events(
     return extracted
 
 
+def _get_timestamp_col(df: pd.DataFrame) -> str:
+    """Return the timestamp column name used by a raw events DataFrame."""
+    return next(
+        (col for col in df.columns if col.lower() in ("timestamp", "time_stamp")),
+        "timestamp",
+    )
+
+
+def _date_only_shifted_copy(
+    df: pd.DataFrame,
+    ts_col: str,
+    target_ts: pd.Timestamp,
+) -> pd.DataFrame:
+    """Shift a run onto the target date while preserving time-of-day."""
+    shifted = df.copy()
+    if shifted.empty:
+        return shifted
+
+    shifted[ts_col] = pd.to_datetime(shifted[ts_col])
+    source_start = shifted[ts_col].min()
+    date_shift = target_ts.normalize() - source_start.normalize()
+    shifted[ts_col] = shifted[ts_col] + date_shift
+    return shifted
+
+
+def _prepare_analysis_inputs(
+    original: pd.DataFrame,
+    collected: pd.DataFrame,
+    *,
+    tod_align: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[datetime], Optional[datetime]]:
+    """Prepare scenario inputs for comparison/reporting.
+
+    TOD scenarios are moved onto the collected run's date and anchored to a
+    shared wall-clock reference so comparison preserves real time-of-day gaps.
+    """
+    original_prepared = original.copy()
+    collected_prepared = collected.copy()
+
+    if original_prepared.empty or collected_prepared.empty:
+        return original_prepared, collected_prepared, None, None
+
+    original_ts_col = _get_timestamp_col(original_prepared)
+    collected_ts_col = _get_timestamp_col(collected_prepared)
+    original_prepared[original_ts_col] = pd.to_datetime(original_prepared[original_ts_col])
+    collected_prepared[collected_ts_col] = pd.to_datetime(collected_prepared[collected_ts_col])
+
+    if not tod_align:
+        return original_prepared, collected_prepared, None, None
+
+    collected_start = collected_prepared[collected_ts_col].min()
+    original_prepared = _date_only_shifted_copy(original_prepared, original_ts_col, collected_start)
+    shared_start = min(
+        original_prepared[original_ts_col].min(),
+        collected_prepared[collected_ts_col].min(),
+    ).to_pydatetime()
+    return original_prepared, collected_prepared, shared_start, shared_start
+
+
+def _compute_export_shift(
+    original: pd.DataFrame,
+    collected: pd.DataFrame,
+    *,
+    original_ts_col: str,
+    collected_ts_col: str,
+    tod_align: bool,
+    group_tolerance: float,
+) -> pd.Timedelta:
+    """Return the timestamp shift to apply to original events for export."""
+    if original.empty or collected.empty:
+        return pd.Timedelta(0)
+
+    original[original_ts_col] = pd.to_datetime(original[original_ts_col])
+    collected[collected_ts_col] = pd.to_datetime(collected[collected_ts_col])
+
+    if tod_align:
+        return collected[collected_ts_col].min().normalize() - original[original_ts_col].min().normalize()
+
+    prep_a = sr.prepare_events_for_comparison(original)
+    prep_b = sr.prepare_events_for_comparison(collected)
+    if prep_a.empty or prep_b.empty:
+        return pd.Timedelta(0)
+
+    shift_sec = sr.find_temporal_offset(
+        prep_a,
+        prep_b,
+        group_tolerance=group_tolerance,
+    )
+    original_start = prep_a["timestamp"].min()
+    collected_start = prep_b["timestamp"].min()
+    return (collected_start - original_start) - pd.Timedelta(seconds=shift_sec)
+
+
 def _compare_one_scenario(args: Tuple) -> dict:
     """
     Worker function for ProcessPoolExecutor.
@@ -432,8 +526,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
     Reads from parquet files (no DuckDB needed in workers).
     """
     (scenario_id, events_source, test_type_str, collected_parquet,
-     firmware_version, plots_dir_str, settle_minutes,
-     max_plots, window_minutes, verbose, notes_column) = args
+     firmware_version, plots_dir_str, settle_minutes, group_tolerance,
+     max_plots, window_minutes, verbose, notes_column, tod_align) = args
 
     import signal_replay as sr
     import pandas as pd
@@ -443,29 +537,36 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
     original = sr.load_events(events_source)
     collected = pd.read_parquet(collected_parquet)
+    original_for_analysis, collected_for_analysis, start_time_a, start_time_b = _prepare_analysis_inputs(
+        original,
+        collected,
+        tod_align=tod_align,
+    )
 
     result = sr.compare_runs(
-        events_a=original, events_b=collected,
+        events_a=original_for_analysis, events_b=collected_for_analysis,
         device_id=scenario_id,
         run_a_label="original_logs", run_b_label=firmware_version,
-        auto_align=True, settle_minutes=settle_minutes,
+        start_time_a=start_time_a,
+        start_time_b=start_time_b,
+        auto_align=not tod_align, settle_minutes=settle_minutes,
+        group_tolerance=group_tolerance,
     )
 
     plot_paths: list = []
     timeline_a = timeline_b = None
-    if not original.empty and not collected.empty:
+    if not original_for_analysis.empty and not collected_for_analysis.empty:
         try:
             # Suppress atspm's verbose stdout unless --verbose
             _devnull = open(os.devnull, "w") if not verbose else None
             _ctx = contextlib.redirect_stdout(_devnull) if _devnull else contextlib.nullcontext()
             with _ctx:
-                timeline_a = sr.generate_timeline(original, device_id=scenario_id)
-                timeline_b = sr.generate_timeline(collected, device_id=scenario_id)
+                timeline_a = sr.generate_timeline(original_for_analysis, device_id=scenario_id)
+                timeline_b = sr.generate_timeline(collected_for_analysis, device_id=scenario_id)
             if _devnull:
                 _devnull.close()
             remove_events = [
                 "Ped Omit", "Phase Hold", "Phase Omit", "Phase Call",
-                "Transition Longway", "Transition Shortway",
             ]
             timeline_a = timeline_a[~timeline_a["EventClass"].isin(remove_events)]
             timeline_b = timeline_b[~timeline_b["EventClass"].isin(remove_events)]
@@ -478,13 +579,14 @@ def _compare_one_scenario(args: Tuple) -> dict:
             _devnull2 = open(os.devnull, "w") if not verbose else None
             _ctx2 = contextlib.redirect_stdout(_devnull2) if _devnull2 else contextlib.nullcontext()
             with _ctx2:
-                time_offset_b = sr.compute_timeline_offset(timeline_a, timeline_b)
+                time_offset_b = 0.0 if tod_align else sr.compute_timeline_offset(timeline_a, timeline_b)
                 plot_paths = sr.create_multi_divergence_plots(
                     timeline_a=timeline_a, timeline_b=timeline_b,
                     comparison_result=result, output_dir=plots_dir_str,
                     label_a="Original", label_b=firmware_version,
                     max_plots=max_plots, window_minutes=window_minutes,
                     time_offset_b=time_offset_b,
+                    align_by_time_delta=not tod_align,
                 )
             if _devnull2:
                 _devnull2.close()
@@ -498,22 +600,27 @@ def _compare_one_scenario(args: Tuple) -> dict:
     phase_diffs: list = []
     if not passed and timeline_a is not None and not timeline_a.empty and not timeline_b.empty:
         try:
-            # The two timelines come from different absolute dates (original vs.
-            # collected replay). We need to align them by relative time from
-            # their respective starts before settle-trimming and overlap-clipping.
-            start_a = timeline_a["StartTime"].min()
-            start_b = timeline_b["StartTime"].min()
-
-            tl_a_rel = timeline_a.copy()
-            tl_b_rel = timeline_b.copy()
-
-            # Convert to a common epoch (use start_a as the reference)
-            tl_b_rel["StartTime"] = start_a + (tl_b_rel["StartTime"] - start_b)
-            tl_b_rel["EndTime"] = start_a + (tl_b_rel["EndTime"] - start_b)
-
             settle_td = pd.Timedelta(minutes=settle_minutes)
-            tl_a_settled = tl_a_rel[tl_a_rel["StartTime"] >= start_a + settle_td].copy()
-            tl_b_settled = tl_b_rel[tl_b_rel["StartTime"] >= start_a + settle_td].copy()
+            if tod_align:
+                common_start = min(timeline_a["StartTime"].min(), timeline_b["StartTime"].min())
+                tl_a_settled = timeline_a[timeline_a["StartTime"] >= common_start + settle_td].copy()
+                tl_b_settled = timeline_b[timeline_b["StartTime"] >= common_start + settle_td].copy()
+            else:
+                # The two timelines come from different absolute dates (original vs.
+                # collected replay). We need to align them by relative time from
+                # their respective starts before settle-trimming and overlap-clipping.
+                start_a = timeline_a["StartTime"].min()
+                start_b = timeline_b["StartTime"].min()
+
+                tl_a_rel = timeline_a.copy()
+                tl_b_rel = timeline_b.copy()
+
+                # Convert to a common epoch (use start_a as the reference)
+                tl_b_rel["StartTime"] = start_a + (tl_b_rel["StartTime"] - start_b)
+                tl_b_rel["EndTime"] = start_a + (tl_b_rel["EndTime"] - start_b)
+
+                tl_a_settled = tl_a_rel[tl_a_rel["StartTime"] >= start_a + settle_td].copy()
+                tl_b_settled = tl_b_rel[tl_b_rel["StartTime"] >= start_a + settle_td].copy()
 
             overlap_end = min(tl_a_settled["EndTime"].max(), tl_b_settled["EndTime"].max())
             tl_a_settled = tl_a_settled[tl_a_settled["StartTime"] <= overlap_end]
@@ -575,6 +682,81 @@ def _compare_one_scenario(args: Tuple) -> dict:
     }
 
 
+def _export_device_csvs(
+    suite: sr.FirmwareTestSuite,
+    extracted_map: Dict[str, Path],
+    group_tolerance: float = 0.0,
+) -> Path:
+    """Export a combined CSV per device with original + collected events.
+
+    Each CSV lives in results/<fw_version>/device_events/<scenario_id>.csv
+    and contains a ``DeviceId`` column (``original`` vs ``new``)
+    to distinguish the two runs. Original timestamps are shifted onto the
+    new run's absolute timeline using the same temporal offset logic used
+    by the comparison / Gantt chart alignment.
+    """
+    out_dir = Path(suite.output_dir) / suite.firmware_version / "device_events"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exported = 0
+    for scenario in suite.scenarios:
+        collected_parquet = extracted_map.get(scenario.scenario_id)
+        if not collected_parquet:
+            continue
+
+        original = sr.load_events(scenario.events_source)
+        collected = pd.read_parquet(collected_parquet)
+
+        original_ts_col = _get_timestamp_col(original)
+        collected_ts_col = _get_timestamp_col(collected)
+        original[original_ts_col] = pd.to_datetime(original[original_ts_col])
+        collected[collected_ts_col] = pd.to_datetime(collected[collected_ts_col])
+
+        original_shift = _compute_export_shift(
+            original,
+            collected,
+            original_ts_col=original_ts_col,
+            collected_ts_col=collected_ts_col,
+            tod_align=scenario.tod_align,
+            group_tolerance=group_tolerance,
+        )
+        if original_shift != pd.Timedelta(0):
+            original[original_ts_col] = original[original_ts_col] + original_shift
+        if scenario.tod_align:
+            vlog(
+                f"  {scenario.scenario_id}: TOD export date shift "
+                f"{original_shift.total_seconds():+.2f}s"
+            )
+        elif original_shift != pd.Timedelta(0):
+            vlog(
+                f"  {scenario.scenario_id}: shifted original timestamps by "
+                f"{original_shift.total_seconds():+.2f}s"
+            )
+
+        if original_ts_col != "timestamp":
+            original = original.rename(columns={original_ts_col: "timestamp"})
+        if collected_ts_col != "timestamp":
+            collected = collected.rename(columns={collected_ts_col: "timestamp"})
+
+        # Drop unwanted columns, add a single DeviceId
+        drop_cols = {"device_id", "run_number"}
+        original = original.drop(columns=[c for c in original.columns if c in drop_cols], errors="ignore")
+        collected = collected.drop(columns=[c for c in collected.columns if c in drop_cols], errors="ignore")
+
+        original["DeviceId"] = "original"
+        collected["DeviceId"] = "new"
+
+        combined = pd.concat([original, collected], ignore_index=True)
+        combined = combined.sort_values(["timestamp", "event_id", "parameter", "DeviceId"]).reset_index(drop=True)
+        csv_path = out_dir / f"{scenario.scenario_id}.csv"
+        combined.to_csv(csv_path, index=False)
+        exported += 1
+        vlog(f"  {scenario.scenario_id} -> {csv_path.name} ({len(combined)} rows)")
+
+    log(f"Exported {exported} device CSV(s) to {out_dir}")
+    return out_dir
+
+
 def run_analysis(
     suite: sr.FirmwareTestSuite,
     settings: dict,
@@ -587,6 +769,7 @@ def run_analysis(
     firmware_version = suite.firmware_version
     comp = settings.get("comparison", {})
     settle_minutes = comp.get("settle_minutes", 3.0)
+    group_tolerance = comp.get("group_tolerance", 0.0)
     max_plots = comp.get("max_divergence_plots", 3)
     window_minutes = comp.get("divergence_window_minutes", 5.0)
     max_workers = settings.get("analysis_workers", 4)
@@ -612,6 +795,10 @@ def run_analysis(
     extracted_map = _extract_collected_events(suite, cp, tmp_dir)
     log(f"Extracted {len(extracted_map)} scenarios to temp parquet files.")
 
+    # Export per-device CSVs (original + collected combined)
+    log("Exporting per-device CSV files...")
+    _export_device_csvs(suite, extracted_map, group_tolerance=group_tolerance)
+
     # Build job list — all plain types for pickling (no DuckDB paths)
     jobs: list = []
     for scenario in suite.scenarios:
@@ -628,10 +815,12 @@ def run_analysis(
             firmware_version,
             str(plots_dir),
             settle_minutes,
+            group_tolerance,
             max_plots,
             window_minutes,
             _VERBOSE,
             scenario.notes_column,
+            scenario.tod_align,
         ))
 
     if not jobs:

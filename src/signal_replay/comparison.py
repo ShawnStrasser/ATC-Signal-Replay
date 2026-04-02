@@ -563,20 +563,56 @@ def find_divergence_windows(
     return divergences
 
 
-def _group_events_by_timestamp(df: pd.DataFrame) -> List[Tuple[float, frozenset]]:
+def _group_events_by_timestamp(
+    df: pd.DataFrame,
+    tolerance: float = 0.0,
+) -> List[Tuple[float, frozenset]]:
     """
     Group events by timestamp into sets of (event_id, parameter) tuples.
     
     Events at the same timestamp may appear in different order between runs.
     Grouping them into sets makes comparison order-independent.
+
+    Args:
+        df: Prepared events DataFrame with time_delta, event_id, parameter.
+        tolerance: Maximum gap (seconds) between consecutive timestamps that
+            should be merged into the same group.  0.0 means exact matching
+            (original behaviour).  A value like 0.15 merges events that are
+            within one controller tick of each other.
     
     Returns:
         List of (time_delta, frozenset_of_event_tuples)
     """
-    groups = []
-    for td, grp in df.groupby('time_delta'):
-        events = frozenset(zip(grp['event_id'].values, grp['parameter'].values))
-        groups.append((float(td), events))
+    if tolerance <= 0.0:
+        groups = []
+        for td, grp in df.groupby('time_delta'):
+            events = frozenset(zip(grp['event_id'].values, grp['parameter'].values))
+            groups.append((float(td), events))
+        return groups
+
+    # Tolerance-based merging: walk through sorted events and merge
+    # consecutive timestamps that are within *tolerance* of each other.
+    sorted_df = df.sort_values('time_delta')
+    groups: List[Tuple[float, frozenset]] = []
+    cur_events: list = []
+    cur_start: float = -1e30
+
+    for td, eid, param in zip(
+        sorted_df['time_delta'].values,
+        sorted_df['event_id'].values,
+        sorted_df['parameter'].values,
+    ):
+        td_f = float(td)
+        if cur_events and (td_f - cur_start) > tolerance:
+            groups.append((cur_start, frozenset(cur_events)))
+            cur_events = []
+        if not cur_events:
+            cur_start = td_f
+        cur_events.append((int(eid), int(param)))
+
+    if cur_events:
+        groups.append((cur_start, frozenset(cur_events)))
+
     return groups
 
 
@@ -946,7 +982,8 @@ def find_alignment_offset(
     df_a: pd.DataFrame,
     df_b: pd.DataFrame,
     max_offset: int = 50,
-    align_seconds: float = 360.0
+    align_seconds: float = 360.0,
+    group_tolerance: float = 0.0,
 ) -> Tuple[int, float]:
     """
     Find the optimal offset to align sequence B with sequence A.
@@ -978,8 +1015,8 @@ def find_alignment_offset(
         return 0, 0.0
     
     # Group events by timestamp into sets (order-independent)
-    groups_a = _group_events_by_timestamp(df_a)
-    groups_b = _group_events_by_timestamp(df_b)
+    groups_a = _group_events_by_timestamp(df_a, tolerance=group_tolerance)
+    groups_b = _group_events_by_timestamp(df_b, tolerance=group_tolerance)
     
     sets_a = [events for _, events in groups_a]
     sets_b = [events for _, events in groups_b]
@@ -1049,7 +1086,8 @@ def calculate_timeline_offset(
     events_a: pd.DataFrame,
     events_b: pd.DataFrame, 
     alignment_offset: int = 0,
-    event_ids: Optional[List[int]] = None
+    event_ids: Optional[List[int]] = None,
+    group_tolerance: float = 0.0,
 ) -> float:
     """
     Calculate the time offset (in seconds) needed to align timeline B with A.
@@ -1076,8 +1114,8 @@ def calculate_timeline_offset(
         return 0.0
     
     # Group by timestamp to get timestamp groups (same as find_alignment_offset uses)
-    groups_a = _group_events_by_timestamp(df_a)
-    groups_b = _group_events_by_timestamp(df_b)
+    groups_a = _group_events_by_timestamp(df_a, tolerance=group_tolerance)
+    groups_b = _group_events_by_timestamp(df_b, tolerance=group_tolerance)
     
     if alignment_offset > 0:
         # Skip first N timestamp groups from B
@@ -1181,6 +1219,7 @@ def find_temporal_offset(
     search_range: float = 200.0,
     resolution: float = 0.1,
     window_sec: float = 1800.0,
+    group_tolerance: float = 0.0,
 ) -> float:
     """
     Find the temporal offset to align B with A using cross-correlation.
@@ -1206,8 +1245,8 @@ def find_temporal_offset(
         the two series are aligned.  Positive means B's events happen earlier
         than A's by that many seconds.
     """
-    groups_a = _group_events_by_timestamp(df_a)
-    groups_b = _group_events_by_timestamp(df_b)
+    groups_a = _group_events_by_timestamp(df_a, tolerance=group_tolerance)
+    groups_b = _group_events_by_timestamp(df_b, tolerance=group_tolerance)
 
     # Build quantised time -> hash lookup for A
     a_hash: Dict[int, int] = {}      # quantised key -> hash of event set
@@ -1272,6 +1311,7 @@ def _rolling_chunk_dtw(
     window_sec: float = 2700.0,
     step_sec: float = 2400.0,
     clip_sec: float = 60.0,
+    group_tolerance: float = 0.0,
 ) -> List[ChunkScore]:
     """
     Run DTW on rolling windows and return per-chunk match scores.
@@ -1309,8 +1349,8 @@ def _rolling_chunk_dtw(
         ca['time_delta'] = ca['time_delta'] - c_start
         cb['time_delta'] = cb['time_delta'] - c_start
 
-        ga = _group_events_by_timestamp(ca)
-        gb = _group_events_by_timestamp(cb)
+        ga = _group_events_by_timestamp(ca, tolerance=group_tolerance)
+        gb = _group_events_by_timestamp(cb, tolerance=group_tolerance)
 
         if len(ga) < 5 or len(gb) < 5:
             start += step_sec
@@ -1504,6 +1544,7 @@ def compare_runs(
     auto_align: bool = True,
     trim_edges_minutes: float = 0.0,
     settle_minutes: float = 0.0,
+    group_tolerance: float = 0.0,
 ) -> ComparisonResult:
     """
     Compare two runs using group-level DTW on event sequences and timing.
@@ -1537,6 +1578,10 @@ def compare_runs(
             percentage and reporting divergences. Data is NOT removed — DTW
             still sees the full aligned sequence for best alignment, but the
             settling period is excluded from the results.
+        group_tolerance: Maximum gap (seconds) between consecutive timestamps
+            that should be merged into the same event group.  0.0 means exact
+            matching (original behaviour).  Use ~0.15 to absorb firmware
+            timestamp-resolution differences.
     
     Returns:
         ComparisonResult with DTW distances, divergence windows, and timing stats
@@ -1555,7 +1600,7 @@ def compare_runs(
     if auto_align and not df_a.empty and not df_b.empty:
         # Step 1: Find the true temporal shift via cross-correlation.
         # This avoids the cyclic false-match problem of positional alignment.
-        temporal_shift = find_temporal_offset(df_a, df_b)
+        temporal_shift = find_temporal_offset(df_a, df_b, group_tolerance=group_tolerance)
         if abs(temporal_shift) > 0.05:
             df_b = df_b.copy()
             df_b['time_delta'] = df_b['time_delta'] + temporal_shift
@@ -1567,10 +1612,11 @@ def compare_runs(
         # cyclic ambiguity, and the per-group penalty (0.15 %) prevents
         # the positional pass from drifting onto a wrong cycle.
         alignment_offset, pre_align_match = find_alignment_offset(
-            df_a, df_b, max_offset=50, align_seconds=360.0
+            df_a, df_b, max_offset=50, align_seconds=360.0,
+            group_tolerance=group_tolerance,
         )
-        raw_groups_a = _group_events_by_timestamp(df_a)
-        raw_groups_b = _group_events_by_timestamp(df_b)
+        raw_groups_a = _group_events_by_timestamp(df_a, tolerance=group_tolerance)
+        raw_groups_b = _group_events_by_timestamp(df_b, tolerance=group_tolerance)
         
         if alignment_offset > 0 and alignment_offset < len(raw_groups_b):
             trim_seconds_b = raw_groups_b[alignment_offset][0]
@@ -1639,8 +1685,8 @@ def compare_runs(
     # ===== GROUP-LEVEL DTW =====
     # Group events by timestamp into sets of (event_id, parameter) tuples.
     # Each group represents "what happened at this moment in time".
-    groups_a = _group_events_by_timestamp(df_a)
-    groups_b = _group_events_by_timestamp(df_b)
+    groups_a = _group_events_by_timestamp(df_a, tolerance=group_tolerance)
+    groups_b = _group_events_by_timestamp(df_b, tolerance=group_tolerance)
     
     # ===== ROLLING CHUNKED DTW =====
     # Use rolling windows (45 min window, 40 min step, 60 s edge clip) for
@@ -1651,6 +1697,7 @@ def compare_runs(
         window_sec=2700.0,   # 45 minutes
         step_sec=2400.0,     # 40 minutes (5 min overlap)
         clip_sec=60.0,       # 60 s clipped from each edge
+        group_tolerance=group_tolerance,
     )
 
     if chunk_scores:
@@ -1753,8 +1800,8 @@ def compare_runs(
                 # Shift to chunk-local time
                 local_a['time_delta'] = local_a['time_delta'] - c_start
                 local_b['time_delta'] = local_b['time_delta'] - c_start
-                lg_a = _group_events_by_timestamp(local_a)
-                lg_b = _group_events_by_timestamp(local_b)
+                lg_a = _group_events_by_timestamp(local_a, tolerance=group_tolerance)
+                lg_b = _group_events_by_timestamp(local_b, tolerance=group_tolerance)
                 if len(lg_a) < 2 or len(lg_b) < 2:
                     continue
                 local_dtw, _, local_dist = _dtw_with_jaccard(lg_a, lg_b)
@@ -2209,6 +2256,7 @@ def generate_phase_difference_summary(
     signal_classes = {
         'Green', 'Yellow', 'Red',
         'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red',
+        'Ped Service',
     }
 
     def _compute_stats(tl: pd.DataFrame) -> Dict:
@@ -2248,6 +2296,8 @@ def generate_phase_difference_summary(
             label = f"Ph {ev}"
         elif 'Overlap' in ec:
             label = f"Ovlp {ev}"
+        elif ec == 'Ped Service':
+            label = f"Ped {ev}"
         else:
             label = f"{ec} {ev}"
 
@@ -2320,6 +2370,11 @@ SIGNAL_COLORS = {
     'Overlap Trail Green': '#00FF00',
     'Overlap Yellow': '#FFFF00',
     'Overlap Red': '#FF0000',
+    'Preempt': '#FF00FF',
+    'Transition Longway': '#FF8C00',
+    'Transition Shortway': '#DAA520',
+    'Split': '#8A2BE2',
+    'Coord Pattern': '#4682B4',
 }
 
 # Phase/parameter color palette for other event types
@@ -2348,7 +2403,10 @@ def _get_sort_key(event_class: str, event_value: int) -> Tuple[int, int, int]:
     signal_order = {
         'Green': 0, 'Yellow': 1, 'Red': 2,
         'Overlap Green': 3, 'Overlap Trail Green': 4, 
-        'Overlap Yellow': 5, 'Overlap Red': 6
+        'Overlap Yellow': 5, 'Overlap Red': 6,
+        'Preempt': 7,
+        'Transition Longway': 8, 'Transition Shortway': 9,
+        'Split': 10, 'Coord Pattern': 11,
     }
     
     if event_class in signal_order:
@@ -2410,7 +2468,9 @@ def create_comparison_gantt_matplotlib(
             'Green', 'Yellow', 'Red',
             'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red',
             'Preempt', 'Ped Service',
-            'TSP Service', 'TSP Call'
+            'TSP Service', 'TSP Call',
+            'Transition Longway', 'Transition Shortway',
+            'Coord Pattern',
         ]
     
     # Get the start times BEFORE filtering by event_classes.
@@ -2682,6 +2742,7 @@ def create_multi_divergence_plots(
     window_minutes: float = 10.0,
     dpi: int = 150,
     time_offset_b: float = 0.0,
+    align_by_time_delta: bool = True,
 ) -> List[str]:
     """Create up to max_plots divergence-focused Gantt charts.
 
@@ -2720,7 +2781,7 @@ def create_multi_divergence_plots(
             output_path=output_path,
             window_minutes=window_minutes,
             dpi=dpi,
-            align_by_time_delta=True,
+            align_by_time_delta=align_by_time_delta,
             time_offset_b=time_offset_b,
         )
         if fig is not None:

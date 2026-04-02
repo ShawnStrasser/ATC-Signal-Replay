@@ -20,7 +20,13 @@ test_design.ipynb
 test_package.ipynb
 test_output_compare.ipynb
 version_testing/
-experiments/
+# Ignore all of experiments/* except the latency study script and its canonical report.
+# Note: must use glob (experiments/*) not directory (experiments/) for negations to work.
+experiments/*
+!experiments/run_latency_scaling_study.py
+!experiments/latency_scaling_runs/
+experiments/latency_scaling_runs/*
+!experiments/latency_scaling_runs/report.md
 
 # firmware_validation - agency-specific data (not for git)
 firmware_validation/databases/

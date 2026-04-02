@@ -545,6 +545,28 @@ For comparison, phase and overlap state-change events are used (phase green/yell
 
 ---
 
+## SNMP Detector Latency Calibration
+
+The SNMP SET commands that send detector actuations arrive at the controller with a measurable latency. To compensate, the replay pipeline shifts event timestamps forward by a **global offset** before sending — so the controller receives each command closer to the correct wall-clock moment.
+
+The default offset value was determined empirically using the latency scaling study in [`experiments/run_latency_scaling_study.py`](experiments/run_latency_scaling_study.py).
+
+**Latest result: 185.3 ms** (see full report at [`experiments/latency_scaling_runs/report.md`](experiments/latency_scaling_runs/report.md))
+
+### Re-running the study
+
+```bash
+# Full study (~29 min, requires 10 simulator ports running on localhost 9701–9710)
+python experiments/run_latency_scaling_study.py
+
+# Regenerate report and charts from an existing run
+python experiments/run_latency_scaling_study.py --finalize-run-dir experiments/latency_scaling_runs/<folder>
+```
+
+The study sweeps detector counts (1–40) and device counts (1–10) to quantify how latency scales, then fits a linear model and runs permutation tests. Results are saved to `experiments/latency_scaling_runs/` with a canonical summary at `experiments/latency_scaling_runs/report.md`.
+
+---
+
 ## Compatibility
 
 - **Sending actuations**: Any NTCIP 1202 v3 controller (uses standard detector actuation OIDs for vehicle, pedestrian, and preempt detectors)

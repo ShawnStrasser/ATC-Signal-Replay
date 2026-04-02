@@ -47,7 +47,12 @@ class ConflictRecord:
     conflict_details: str
 
 
-def fetch_output_data(ip: str, http_port: int = 80, since: Optional[datetime] = None) -> pd.DataFrame:
+def fetch_output_data(
+    ip: str,
+    http_port: int = 80,
+    since: Optional[datetime] = None,
+    request_timeout_seconds: float = 30,
+) -> pd.DataFrame:
     """
     Fetch the event log from a MAXTIME controller.
     
@@ -56,6 +61,7 @@ def fetch_output_data(ip: str, http_port: int = 80, since: Optional[datetime] = 
         http_port: HTTP port for data collection (default: 80)
         since: If provided, only fetch events after this timestamp.
             The controller supports a ``?since=`` query parameter.
+        request_timeout_seconds: HTTP request timeout in seconds.
     
     Returns:
         DataFrame with columns: TimeStamp, EventTypeID, Parameter
@@ -65,7 +71,7 @@ def fetch_output_data(ip: str, http_port: int = 80, since: Optional[datetime] = 
         since_str = since.strftime('%m-%d-%Y %H:%M:%S.0')
         url = f'{url}?since={since_str}'
     
-    response = requests.get(url, verify=False, timeout=30)
+    response = requests.get(url, verify=False, timeout=request_timeout_seconds)
     response.raise_for_status()
     
     # Parse XML incrementally to minimise peak memory.  Use .content

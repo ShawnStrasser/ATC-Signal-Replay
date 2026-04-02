@@ -43,6 +43,31 @@ def create_synthetic_events(
     return pd.DataFrame(events)
 
 
+def create_on_off_events(
+    idle_gap_seconds: float = 1.0,
+    detector: int = 1,
+    device_id: str = 'test_device',
+) -> pd.DataFrame:
+    """Create a simple ON/OFF detector sequence with a controllable idle gap."""
+    base_time = datetime(2024, 1, 1, 12, 0, 0)
+    return pd.DataFrame(
+        [
+            {
+                'timestamp': base_time,
+                'event_id': 82,
+                'parameter': detector,
+                'device_id': device_id,
+            },
+            {
+                'timestamp': base_time + timedelta(seconds=idle_gap_seconds),
+                'event_id': 81,
+                'parameter': detector,
+                'device_id': device_id,
+            },
+        ]
+    )
+
+
 class TestOrchestratorTimingWithMocks:
     """
     Tests for orchestrator timing using mocks.
@@ -509,3 +534,131 @@ class TestSignalReplayTiming:
 
         assert mock_send.call_count == 1
         assert mock_send.call_args.kwargs["timeout"] == 2.0
+
+
+class TestReplayReliabilityWithMocks:
+    @pytest.fixture
+    def mock_ip(self):
+        return '127.0.0.1'
+
+    @pytest.fixture
+    def mock_port(self):
+        return 1025
+
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
+    def test_send_command_retries_after_transient_failure(
+        self,
+        mock_send: AsyncMock,
+        mock_ip,
+        mock_port,
+    ):
+        events = create_on_off_events(idle_gap_seconds=0.2)
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+        )
+        config.events = events
+        replay = sr.SignalReplay(
+            config,
+            simulation_speed=1.0,
+            snmp_send_retries=1,
+            snmp_retry_backoff_seconds=0.0,
+        )
+        row = replay.activation_feed.iloc[0]
+        mock_send.side_effect = [RuntimeError("timeout"), None]
+
+        async def _test():
+            engine = object()
+            await replay._send_command(row, snmp_engine=engine)
+            await replay._wait_for_pending_sends()
+
+        asyncio.run(_test())
+
+        assert mock_send.call_count == 2
+        assert replay._final_send_failures.get(("Vehicle", 1), 0) == 0
+
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
+    def test_heartbeat_resends_latest_state_after_idle_gap(
+        self,
+        mock_send: AsyncMock,
+        mock_ip,
+        mock_port,
+    ):
+        events = create_on_off_events(idle_gap_seconds=10.0)
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+        )
+        config.events = events
+        replay = sr.SignalReplay(
+            config,
+            simulation_speed=1.0,
+            heartbeat_enabled=True,
+            heartbeat_interval_seconds=0.05,
+        )
+        row = replay.activation_feed.iloc[0]
+
+        async def _test():
+            engine = object()
+            await replay._send_command(row, snmp_engine=engine)
+            await replay._wait_for_pending_sends()
+            await asyncio.sleep(0.06)
+            heartbeat_task = asyncio.create_task(replay._heartbeat_loop(engine))
+            await asyncio.sleep(0.07)
+            replay._heartbeat_stop_requested = True
+            await heartbeat_task
+            await replay._wait_for_pending_sends()
+
+        asyncio.run(_test())
+
+        assert mock_send.call_count >= 2
+        assert mock_send.call_args_list[-1].args[2] == 1
+
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
+    def test_heartbeat_resends_zero_state_after_off_event(
+        self,
+        mock_send: AsyncMock,
+        mock_ip,
+        mock_port,
+    ):
+        events = create_on_off_events(idle_gap_seconds=0.2)
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+        )
+        config.events = events
+        replay = sr.SignalReplay(
+            config,
+            simulation_speed=1.0,
+            heartbeat_enabled=True,
+            heartbeat_interval_seconds=0.05,
+        )
+
+        on_row = replay.activation_feed.iloc[0]
+        off_row = replay.activation_feed.iloc[1]
+
+        async def _test():
+            engine = object()
+            await replay._send_command(on_row, snmp_engine=engine)
+            await replay._send_command(off_row, snmp_engine=engine)
+            await replay._wait_for_pending_sends()
+            await asyncio.sleep(0.06)
+            heartbeat_task = asyncio.create_task(replay._heartbeat_loop(engine))
+            await asyncio.sleep(0.07)
+            replay._heartbeat_stop_requested = True
+            await heartbeat_task
+            await replay._wait_for_pending_sends()
+
+        asyncio.run(_test())
+
+        assert mock_send.call_count >= 3
+        assert mock_send.call_args_list[-1].args[2] == 0

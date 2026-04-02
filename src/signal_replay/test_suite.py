@@ -47,6 +47,10 @@ class FirmwareTestSuite:
     collection_interval_minutes: float = 5.0
     post_replay_settle_seconds: float = 10.0
     snmp_timeout_seconds: float = 2.0
+    snmp_send_retries: int = 1
+    snmp_retry_backoff_seconds: float = 0.25
+    heartbeat_enabled: bool = True
+    heartbeat_interval_seconds: float = 5.0
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
 
@@ -150,6 +154,10 @@ def load_from_yaml(path: str) -> FirmwareTestSuite:
         collection_interval_minutes=data.get("collection_interval_minutes", 5.0),
         post_replay_settle_seconds=data.get("post_replay_settle_seconds", 10.0),
         snmp_timeout_seconds=data.get("snmp_timeout_seconds", 2.0),
+        snmp_send_retries=data.get("snmp_send_retries", 1),
+        snmp_retry_backoff_seconds=data.get("snmp_retry_backoff_seconds", 0.25),
+        heartbeat_enabled=data.get("heartbeat_enabled", True),
+        heartbeat_interval_seconds=data.get("heartbeat_interval_seconds", 5.0),
         show_progress_logs=data.get("show_progress_logs", False),
         progress_log_interval_seconds=data.get("progress_log_interval_seconds", 60.0),
     )

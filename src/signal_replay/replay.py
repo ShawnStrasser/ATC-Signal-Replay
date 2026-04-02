@@ -10,7 +10,7 @@ import time
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Union, Optional, Tuple, List, Set
+from typing import Union, Optional, Tuple, List, Set, Dict
 from importlib import resources
 from jinja2 import Template
 
@@ -43,6 +43,10 @@ class SignalReplay:
         limit_minutes: Optional[float] = None,
         buffer_minutes: Optional[float] = None,
         snmp_timeout_seconds: float = 2.0,
+        snmp_send_retries: int = 0,
+        snmp_retry_backoff_seconds: float = 0.25,
+        heartbeat_enabled: bool = False,
+        heartbeat_interval_seconds: float = 5.0,
         show_progress_logs: bool = False,
         progress_log_interval_seconds: float = 60.0,
         stop_event: Optional[threading.Event] = None,
@@ -57,6 +61,10 @@ class SignalReplay:
             limit_minutes: Limit input events to the last N minutes (0 = no limit)
             buffer_minutes: Include buffer minutes before the last N minutes (0 = no buffer)
             snmp_timeout_seconds: SNMP response timeout in seconds for replay sends
+            snmp_send_retries: Additional replay send attempts after the first try
+            snmp_retry_backoff_seconds: Delay between replay retry attempts
+            heartbeat_enabled: If True, periodically resend the latest state for idle groups
+            heartbeat_interval_seconds: Idle time threshold before a state heartbeat is sent
             show_progress_logs: If True, print periodic "Sent x/y events" updates
             progress_log_interval_seconds: Seconds between periodic progress updates
             debug: Enable debug output
@@ -72,6 +80,10 @@ class SignalReplay:
         self.limit_minutes = config.limit_minutes if limit_minutes is None else limit_minutes
         self.buffer_minutes = config.buffer_minutes if buffer_minutes is None else buffer_minutes
         self.snmp_timeout_seconds = snmp_timeout_seconds
+        self.snmp_send_retries = snmp_send_retries
+        self.snmp_retry_backoff_seconds = snmp_retry_backoff_seconds
+        self.heartbeat_enabled = heartbeat_enabled
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.show_progress_logs = show_progress_logs
         self.progress_log_interval_seconds = progress_log_interval_seconds
         self.debug = debug
@@ -85,6 +97,13 @@ class SignalReplay:
         self.input_window_end: Optional[datetime] = None
         self.input_buffer_start: Optional[datetime] = None
         self._pending_sends: Set[asyncio.Future] = set()
+        self._active_send_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
+        self._queued_send_reasons: Dict[Tuple[str, int], str] = {}
+        self._desired_states: Dict[Tuple[str, int], int] = {}
+        self._last_send_attempt_monotonic: Dict[Tuple[str, int], float] = {}
+        self._last_send_success_monotonic: Dict[Tuple[str, int], float] = {}
+        self._final_send_failures: Dict[Tuple[str, int], int] = {}
+        self._heartbeat_stop_requested = False
         self._first_send_logged = False
         
         # Load and process events
@@ -111,6 +130,11 @@ class SignalReplay:
             await asyncio.sleep(chunk)
             remaining -= chunk
         return not self._stop_event.is_set()
+
+    @staticmethod
+    def _command_key(group_number: int, detector_type: str) -> Tuple[str, int]:
+        """Return the per-controller state key for a detector group/type pair."""
+        return (detector_type, int(group_number))
     
     def _load_events(self) -> None:
         """Load events from the configured source."""
@@ -403,40 +427,156 @@ class SignalReplay:
             finally:
                 con.close()
     
-    async def _send_command(self, row, snmp_engine: SnmpEngine) -> None:
-        """Send a single SNMP command asynchronously (fire-and-forget)."""
+    async def _send_state_with_retries(
+        self,
+        key: Tuple[str, int],
+        state_integer: int,
+        snmp_engine: SnmpEngine,
+        reason: str,
+    ) -> bool:
+        """Send the latest desired state, retrying a few times on failure."""
+        detector_type, group_number = key
+        attempts = self.snmp_send_retries + 1
+
+        for attempt in range(1, attempts + 1):
+            self._last_send_attempt_monotonic[key] = time.monotonic()
+            try:
+                await async_send_ntcip(
+                    self.ip_port,
+                    group_number,
+                    state_integer,
+                    detector_type,
+                    timeout=self.snmp_timeout_seconds,
+                    snmp_engine=snmp_engine,
+                )
+                self._last_send_success_monotonic[key] = time.monotonic()
+                self._final_send_failures[key] = 0
+                return True
+            except Exception as exc:
+                is_final_attempt = attempt >= attempts
+                if is_final_attempt:
+                    self._final_send_failures[key] = self._final_send_failures.get(key, 0) + 1
+                    print(
+                        f"[{self.device_id}] SNMP send failed for group {group_number} "
+                        f"type {detector_type} state {state_integer} ({reason}) after "
+                        f"{attempts} attempt(s): {exc}",
+                        flush=True,
+                    )
+                    return False
+
+                if self.debug:
+                    print(
+                        f"[{self.device_id}] Retrying group {group_number} type {detector_type} "
+                        f"state {state_integer} ({reason}), attempt {attempt + 1}/{attempts}: {exc}",
+                        flush=True,
+                    )
+
+                if self.snmp_retry_backoff_seconds > 0:
+                    if not await self._sleep_interruptibly(self.snmp_retry_backoff_seconds):
+                        return False
+
+        return False
+
+    async def _enqueue_state_send(
+        self,
+        key: Tuple[str, int],
+        snmp_engine: SnmpEngine,
+        reason: str,
+    ) -> None:
+        """Queue a state send while keeping only one in-flight task per group/type."""
+        active_task = self._active_send_tasks.get(key)
+        if active_task is not None and not active_task.done():
+            self._queued_send_reasons[key] = reason
+            return
+
+        async def _worker(initial_reason: str) -> None:
+            reason_to_use = initial_reason
+            try:
+                while not self._stop_event.is_set():
+                    state_integer = self._desired_states[key]
+                    await self._send_state_with_retries(key, state_integer, snmp_engine, reason_to_use)
+
+                    pending_reason = self._queued_send_reasons.pop(key, None)
+                    desired_changed = self._desired_states.get(key) != state_integer
+                    if pending_reason is None and not desired_changed:
+                        return
+
+                    reason_to_use = pending_reason or "state-change"
+            finally:
+                current_task = self._active_send_tasks.get(key)
+                if current_task is asyncio.current_task():
+                    self._active_send_tasks.pop(key, None)
+
+        task = asyncio.create_task(_worker(reason))
+        self._active_send_tasks[key] = task
+        self._pending_sends.add(task)
+        task.add_done_callback(self._pending_sends.discard)
+
+    async def _send_command(self, row, snmp_engine: SnmpEngine, reason: str = "event") -> None:
+        """Queue a single SNMP command asynchronously while coalescing per-key sends."""
         if self._stop_event.is_set():
             return
+
+        key = self._command_key(row.group_number, row.DetectorType)
+        state_integer = int(row.state_integer)
+        self._desired_states[key] = state_integer
 
         if not self._first_send_logged and self.debug:
             self._first_send_logged = True
             print(
                 f"[{self.device_id}] First command dispatched at {datetime.now():%H:%M:%S} "
                 f"for target {pd.to_datetime(row.TimeStamp):%H:%M:%S} "
-                f"group {row.group_number} type {row.DetectorType} state {row.state_integer}",
+                f"group {row.group_number} type {row.DetectorType} state {state_integer}",
                 flush=True,
             )
 
-        async def _safe_send():
-            try:
-                await async_send_ntcip(
-                    self.ip_port,
-                    row.group_number,
-                    row.state_integer,
-                    row.DetectorType,
-                    timeout=self.snmp_timeout_seconds,
-                    snmp_engine=snmp_engine,
-                )
-            except Exception as exc:
-                if self.debug:
-                    print(
-                        f"[{self.device_id}] SNMP send failed for group {row.group_number} "
-                        f"type {row.DetectorType}: {exc}"
-                    )
+        await self._enqueue_state_send(key, snmp_engine, reason)
 
-        task = asyncio.ensure_future(_safe_send())
-        self._pending_sends.add(task)
-        task.add_done_callback(self._pending_sends.discard)
+    async def _heartbeat_loop(self, snmp_engine: SnmpEngine) -> None:
+        """Resend the latest desired state for idle groups to heal stale controller state."""
+        poll_interval = min(self.heartbeat_interval_seconds, 1.0)
+
+        while not self._heartbeat_stop_requested and not self._stop_event.is_set():
+            now = time.monotonic()
+            for key in list(self._desired_states):
+                last_attempt = self._last_send_attempt_monotonic.get(key)
+                if last_attempt is None or now - last_attempt < self.heartbeat_interval_seconds:
+                    continue
+
+                active_task = self._active_send_tasks.get(key)
+                if active_task is not None and not active_task.done():
+                    continue
+
+                detector_type, group_number = key
+                state_integer = self._desired_states[key]
+                heartbeat_row = pd.Series(
+                    {
+                        'TimeStamp': datetime.now(),
+                        'group_number': group_number,
+                        'DetectorType': detector_type,
+                        'state_integer': state_integer,
+                    }
+                )
+                await self._send_command(heartbeat_row, snmp_engine, reason="heartbeat")
+
+            if not await self._sleep_interruptibly(poll_interval):
+                return
+
+    def _print_send_summary(self) -> None:
+        """Emit a concise summary when replay ended with unresolved send failures."""
+        failed_keys = [
+            (key, count)
+            for key, count in self._final_send_failures.items()
+            if count > 0
+        ]
+        if not failed_keys:
+            return
+
+        summary = ", ".join(
+            f"{detector_type} group {group_number} ({count})"
+            for (detector_type, group_number), count in failed_keys
+        )
+        print(f"[{self.device_id}] Replay completed with unresolved SNMP send failures: {summary}", flush=True)
 
     async def _wait_for_pending_sends(self) -> None:
         """Wait until all dispatched SNMP sends have completed."""
@@ -446,9 +586,17 @@ class SignalReplay:
 
     async def _run_async_inner(self, activation_feed, snmp_engine: SnmpEngine) -> None:
         """Inner replay loop that uses a shared SnmpEngine."""
+        heartbeat_task: Optional[asyncio.Task] = None
+        self._heartbeat_stop_requested = False
+
+        if self.heartbeat_enabled:
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop(snmp_engine))
 
         if self._stop_event.is_set():
             print(f"[{self.device_id}] Stop requested before replay start", flush=True)
+            self._heartbeat_stop_requested = True
+            if heartbeat_task is not None:
+                await heartbeat_task
             return
 
         if self.tod_align:
@@ -515,7 +663,11 @@ class SignalReplay:
                     print(f"[{self.device_id}] Sent {sent_count}/{total_to_send} events", flush=True)
                     last_progress = now
 
+            self._heartbeat_stop_requested = True
+            if heartbeat_task is not None:
+                await heartbeat_task
             await self._wait_for_pending_sends()
+            self._print_send_summary()
             if self.show_progress_logs or self.debug:
                 print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
             return
@@ -549,7 +701,11 @@ class SignalReplay:
                 print(f"[{self.device_id}] Sent {sent_count}/{total_events} events", flush=True)
                 last_progress = now
 
+        self._heartbeat_stop_requested = True
+        if heartbeat_task is not None:
+            await heartbeat_task
         await self._wait_for_pending_sends()
+        self._print_send_summary()
         if self.show_progress_logs or self.debug:
             print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
     
@@ -629,6 +785,10 @@ def create_replays(
     configs: List[SignalConfig],
     simulation_speed: float = 1.0,
     snmp_timeout_seconds: float = 2.0,
+    snmp_send_retries: int = 0,
+    snmp_retry_backoff_seconds: float = 0.25,
+    heartbeat_enabled: bool = False,
+    heartbeat_interval_seconds: float = 5.0,
     show_progress_logs: bool = False,
     progress_log_interval_seconds: float = 60.0,
     stop_event: Optional[threading.Event] = None,
@@ -641,6 +801,10 @@ def create_replays(
         configs: List of SignalConfig objects
         simulation_speed: Speed multiplier for playback
         snmp_timeout_seconds: SNMP response timeout in seconds
+        snmp_send_retries: Additional replay send attempts after the first try
+        snmp_retry_backoff_seconds: Delay between replay retry attempts
+        heartbeat_enabled: If True, periodically resend the latest state for idle groups
+        heartbeat_interval_seconds: Idle time threshold before a state heartbeat is sent
         show_progress_logs: If True, print periodic "Sent x/y events" updates
         progress_log_interval_seconds: Seconds between periodic progress updates
         debug: Enable debug output
@@ -653,6 +817,10 @@ def create_replays(
             config,
             simulation_speed=simulation_speed,
             snmp_timeout_seconds=snmp_timeout_seconds,
+            snmp_send_retries=snmp_send_retries,
+            snmp_retry_backoff_seconds=snmp_retry_backoff_seconds,
+            heartbeat_enabled=heartbeat_enabled,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
             show_progress_logs=show_progress_logs,
             progress_log_interval_seconds=progress_log_interval_seconds,
             stop_event=stop_event,

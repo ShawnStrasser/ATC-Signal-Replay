@@ -7,6 +7,7 @@ import json
 import math
 import traceback
 import sys
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -1262,16 +1263,16 @@ def generate_plots_and_report(run_dir: Path, args: argparse.Namespace, summary_d
     stats_rows = []
     if stats_results["single_port_detector_effect"] is not None:
         d = stats_results["single_port_detector_effect"]
-        stats_rows.append({"test": "Detector count (single-port phase)", "stat": f"\u03b7\u00b2\u202f=\u202f{d['partial_eta_squared']:.3f}", "p": format_p_value(d["p_value"]), "sig": "No"})
+        stats_rows.append({"test": "Detector count", "stat": f"R\u00b2\u202f=\u202f{d['partial_eta_squared']:.3f}", "p": format_p_value(d["p_value"]), "sig": "No"})
     if stats_results["device_count_corr"] is not None:
         d = stats_results["device_count_corr"]
-        stats_rows.append({"test": "Device count (8-detector phase)", "stat": f"r\u202f=\u202f{d['pearson']['coefficient']:.3f}, \u03c1\u202f=\u202f{d['spearman']['coefficient']:.3f}", "p": format_p_value(d["pearson"]["p_value"]), "sig": "No"})
+        stats_rows.append({"test": "Device count", "stat": f"r\u202f=\u202f{d['pearson']['coefficient']:.3f}", "p": format_p_value(d["pearson"]["p_value"]), "sig": "No"})
     if stats_results["overall_load_corr"] is not None:
         d = stats_results["overall_load_corr"]
-        stats_rows.append({"test": "Overall burst load (all scenarios)", "stat": f"r\u202f=\u202f{d['pearson']['coefficient']:.3f}, \u03c1\u202f=\u202f{d['spearman']['coefficient']:.3f}", "p": format_p_value(d["pearson"]["p_value"]), "sig": "No"})
+        stats_rows.append({"test": "Overall burst load", "stat": f"r\u202f=\u202f{d['pearson']['coefficient']:.3f}", "p": format_p_value(d["pearson"]["p_value"]), "sig": "No"})
     if stats_results["single_port_port_effect"] is not None:
         d = stats_results["single_port_port_effect"]
-        stats_rows.append({"test": "Port / run-order proxy\u2020", "stat": f"\u03b7\u00b2\u202f=\u202f{d['partial_eta_squared']:.3f}", "p": format_p_value(d["p_value"]), "sig": "Yes\u2020"})
+        stats_rows.append({"test": "Port / device instance\u2020", "stat": f"R\u00b2\u202f=\u202f{d['partial_eta_squared']:.3f}", "p": format_p_value(d["p_value"]), "sig": "Yes\u2020"})
     stats_table = markdown_table(stats_rows, [("test", "Factor"), ("stat", "Effect size"), ("p", "Permutation p"), ("sig", "Significant?")])
 
     # --- Offset comparison table ---
@@ -1329,8 +1330,8 @@ Latency is defined as the difference between the scheduled send time and the log
 Two phases were run:
 
 - **Single-port detector scaling** — one device active at a time, sweeping detector counts
-  ({args.detector_counts}) across all {len(parse_ports(args.ports))} ports ({args.ports}).
-  Port order is randomized within each detector-count block (seed\u00a0{args.seed}),
+  ({args.detector_counts}) across {len(parse_ports(args.ports))} ports.
+  Port order is randomized within each detector-count block,
   so port identity and execution sequence are not aliased.
 - **Device-count scaling** — {args.device_scale_repetitions}\u00d7 repeated, {args.device_scale_detector_count} detectors per device,
   stepping from 1 to {len(parse_ports(args.ports))} active devices.
@@ -1359,15 +1360,12 @@ produced a statistically significant effect, so a single fixed offset is the rig
 
 ## Statistical tests
 
-All p-values are permutation-based (20 000 permutations). Effect sizes for categorical factors
-are partial \u03b7\u00b2; for continuous factors, Pearson r and Spearman \u03c1 are reported.
+Permutation tests (20\u202f000 shuffles) check whether latency varies with each factor.
+**R\u00b2** = fraction of variance explained by the factor. **r** = Pearson correlation (\u22121 to +1).
 
 {stats_table}
 
-\u2020 Port order within each detector-count block was randomized, so a significant effect here
-indicates genuine per-instance latency variance across emulator ports — not an execution-order artefact.
-(\u03b7\u00b2\u202f=\u202f{stats_results["single_port_port_effect"]["partial_eta_squared"]:.3f},
-p\u202f{format_p_value(stats_results["single_port_port_effect"]["p_value"])})
+\u2020 Port order was randomized, so this reflects genuine per-port latency variation in the emulator, not an execution-order artifact.
 
 ---
 
@@ -1380,7 +1378,7 @@ MAE and P95 are computed over matched event residuals.
 
 Per-detector-count offsets improve MAE by only {stats_results["single_port_detector_offsets"]["mae_improvement_pct"]:.1f}% — not worth the added complexity.
 Per-device-count offsets show a larger nominal improvement ({stats_results["device_scale_device_offsets"]["mae_improvement_pct"]:.1f}%) but the relationship
-is non-monotonic (see table below) and the correlation is not statistically significant,
+is non-monotonic and the correlation is not statistically significant,
 so it likely reflects noise rather than a real trend.
 
 ---
@@ -1393,39 +1391,20 @@ Median and P95 aggregated across all ports (10 runs per detector count).
 
 ---
 
-## Results by device count (at {args.device_scale_detector_count} detectors)
-
-One scenario per device count.
-
-{dev_table}
-
----
-
 ## Charts
 
 {chr(10).join(plot_refs) if plot_refs else "No plots generated."}
 
----
-
-## Study configuration
-
-| Parameter | Value |
-| --- | --- |
-| Controller IP | {args.ip} |
-| Ports | {args.ports} |
-| Detector counts tested | {args.detector_counts} |
-| Device-count phase detectors | {args.device_scale_detector_count} |
-| Scenario duration | {args.duration_seconds} s |
-| Burst interval / hold | {args.interval_seconds} s / {args.hold_seconds} s |
-| Warmup | {args.warmup_seconds} s |
-| Collection window | {args.collection_window_seconds} s |
-| Total scenarios | {len(summary_df)} |
-| Run folder | {run_dir.name} |
 """
     (run_dir / "report.md").write_text(report, encoding="utf-8")
     # Also write a canonical latest copy so there is always one stable path to open.
     canonical = run_dir.parent / "report.md"
     canonical.write_text(report, encoding="utf-8")
+    # Copy plots to canonical location so chart paths in report.md resolve correctly.
+    canonical_plots = canonical.parent / "plots"
+    ensure_dir(canonical_plots)
+    for png in (run_dir / "plots").glob("*.png"):
+        shutil.copy2(png, canonical_plots / png.name)
 
 
 def finalize_existing_run(run_dir: Path, args: argparse.Namespace) -> None:

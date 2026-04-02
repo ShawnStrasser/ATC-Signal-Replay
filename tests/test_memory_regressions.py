@@ -116,6 +116,10 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     assert all(isinstance(signal.events, str) for signal in captured["signals"])
     assert captured["signals"][0].events == str(events_1)
     assert captured["signals"][1].events == str(events_2)
+    assert captured["snmp_send_retries"] == suite.snmp_send_retries
+    assert captured["snmp_retry_backoff_seconds"] == suite.snmp_retry_backoff_seconds
+    assert captured["heartbeat_enabled"] == suite.heartbeat_enabled
+    assert captured["heartbeat_interval_seconds"] == suite.heartbeat_interval_seconds
 
     for handler in runner.logger.handlers:
         handler.close()

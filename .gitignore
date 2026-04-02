@@ -27,6 +27,9 @@ experiments/*
 !experiments/latency_scaling_runs/
 experiments/latency_scaling_runs/*
 !experiments/latency_scaling_runs/report.md
+!experiments/latency_scaling_runs/plots/
+experiments/latency_scaling_runs/plots/*
+!experiments/latency_scaling_runs/plots/*.png
 
 # firmware_validation - agency-specific data (not for git)
 firmware_validation/databases/

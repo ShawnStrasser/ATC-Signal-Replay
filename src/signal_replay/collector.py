@@ -248,8 +248,6 @@ class DatabaseManager:
         """Initialize database tables if they don't exist."""
         con = self._connect_with_retry()
         try:
-            # Events table must include run_number in the primary key so
-            # repeated runs with identical timestamps do not overwrite data.
             con.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     device_id VARCHAR,
@@ -261,30 +259,25 @@ class DatabaseManager:
                 )
             """)
 
-            # Migrate legacy schema where run_number was not in the PK.
             info = con.execute("PRAGMA table_info('events')").fetchall()
-            run_number_in_pk = any(
-                row[1] == 'run_number' and int(row[5]) > 0
+            expected_columns = ["device_id", "run_number", "timestamp", "event_id", "parameter"]
+            expected_pk_positions = {
+                "device_id": 1,
+                "run_number": 2,
+                "timestamp": 3,
+                "event_id": 4,
+                "parameter": 5,
+            }
+            actual_columns = [row[1] for row in info]
+            valid_schema = actual_columns == expected_columns and all(
+                int(row[5]) == expected_pk_positions[row[1]]
                 for row in info
             )
-            if info and not run_number_in_pk:
-                con.execute("""
-                    CREATE TABLE events_new (
-                        device_id VARCHAR,
-                        run_number INTEGER,
-                        timestamp TIMESTAMP,
-                        event_id INTEGER,
-                        parameter INTEGER,
-                        PRIMARY KEY (device_id, run_number, timestamp, event_id, parameter)
-                    )
-                """)
-                con.execute("""
-                    INSERT INTO events_new
-                    SELECT device_id, run_number, timestamp, event_id, parameter
-                    FROM events
-                """)
-                con.execute("DROP TABLE events")
-                con.execute("ALTER TABLE events_new RENAME TO events")
+            if not valid_schema:
+                raise RuntimeError(
+                    f"Unsupported events schema in {self.db_path}. "
+                    "Delete the existing DuckDB and rerun with the current pre-release schema."
+                )
 
             # Conflicts table
             con.execute("""
@@ -317,22 +310,39 @@ class DatabaseManager:
         finally:
             con.close()
     
-    def get_max_run_number(self) -> int:
+    def get_max_run_number(self, device_ids: Optional[List[str]] = None) -> int:
         """Get the maximum run number currently in the database."""
-        completed_runs = self.get_completed_run_numbers()
+        completed_runs = self.get_completed_run_numbers(device_ids=device_ids)
         if completed_runs:
             return completed_runs[-1]
 
         con = self._connect_with_retry()
         try:
-            # Check both events and conflicts tables efficiently
-            res = con.execute("""
-                SELECT MAX(max_run) FROM (
-                    SELECT MAX(run_number) as max_run FROM events
-                    UNION ALL
-                    SELECT MAX(run_number) as max_run FROM conflicts
-                )
-            """).fetchone()
+            if device_ids:
+                placeholders = ",".join(["?"] * len(device_ids))
+                res = con.execute(
+                    f"""
+                    SELECT MAX(max_run) FROM (
+                        SELECT MAX(run_number) AS max_run
+                        FROM events
+                        WHERE device_id IN ({placeholders})
+                        UNION ALL
+                        SELECT MAX(run_number) AS max_run
+                        FROM conflicts
+                        WHERE device_id IN ({placeholders})
+                    )
+                    """,
+                    device_ids + device_ids,
+                ).fetchone()
+            else:
+                # Check both events and conflicts tables efficiently
+                res = con.execute("""
+                    SELECT MAX(max_run) FROM (
+                        SELECT MAX(run_number) as max_run FROM events
+                        UNION ALL
+                        SELECT MAX(run_number) as max_run FROM conflicts
+                    )
+                """).fetchone()
             max_run = res[0] if res and res[0] is not None else 0
             return int(max_run)
         except Exception:
@@ -340,36 +350,34 @@ class DatabaseManager:
         finally:
             con.close()
 
-    def get_completed_run_numbers(self) -> List[int]:
+    def get_completed_run_numbers(self, device_ids: Optional[List[str]] = None) -> List[int]:
         """Return completed run numbers in ascending order."""
         con = self._connect_with_retry()
         try:
-            simulation_runs_exists = con.execute("""
-                SELECT COUNT(*) FROM information_schema.tables
-                WHERE lower(table_name) = 'simulation_runs'
-            """).fetchone()[0] > 0
-
-            if simulation_runs_exists:
-                completed = con.execute("""
-                    SELECT run_number
-                    FROM simulation_runs
-                    WHERE status = 'completed'
+            if device_ids:
+                placeholders = ",".join(["?"] * len(device_ids))
+                completed = con.execute(
+                    f"""
+                    SELECT DISTINCT run_number
+                    FROM (
+                        SELECT run_number FROM events WHERE device_id IN ({placeholders})
+                        UNION
+                        SELECT run_number FROM conflicts WHERE device_id IN ({placeholders})
+                    )
+                    WHERE run_number IS NOT NULL
                     ORDER BY run_number
-                """).fetchall()
-                if completed:
-                    return [int(row[0]) for row in completed]
+                    """,
+                    device_ids + device_ids,
+                ).fetchall()
+                return [int(row[0]) for row in completed]
 
-            fallback = con.execute("""
-                SELECT DISTINCT run_number
-                FROM (
-                    SELECT run_number FROM events
-                    UNION
-                    SELECT run_number FROM conflicts
-                )
-                WHERE run_number IS NOT NULL
+            completed = con.execute("""
+                SELECT run_number
+                FROM simulation_runs
+                WHERE status = 'completed'
                 ORDER BY run_number
             """).fetchall()
-            return [int(row[0]) for row in fallback]
+            return [int(row[0]) for row in completed]
         finally:
             con.close()
 
@@ -610,6 +618,20 @@ class DatabaseManager:
 
     def clear_device_data(self, device_ids: List[str]) -> None:
         """Clear all stored data for one or more device IDs."""
+        self.clear_collected_device_data(device_ids)
+
+        if not device_ids:
+            return
+
+        placeholders = ",".join(["?"] * len(device_ids))
+        con = self._connect_with_retry()
+        try:
+            con.execute(f"DELETE FROM input_events WHERE device_id IN ({placeholders})", device_ids)
+        finally:
+            con.close()
+
+    def clear_collected_device_data(self, device_ids: List[str]) -> None:
+        """Clear collected output data for one or more device IDs."""
         if not device_ids:
             return
 
@@ -618,7 +640,6 @@ class DatabaseManager:
         try:
             con.execute(f"DELETE FROM events WHERE device_id IN ({placeholders})", device_ids)
             con.execute(f"DELETE FROM conflicts WHERE device_id IN ({placeholders})", device_ids)
-            con.execute(f"DELETE FROM input_events WHERE device_id IN ({placeholders})", device_ids)
 
             has_comparison = con.execute("""
                 SELECT COUNT(*) FROM information_schema.tables

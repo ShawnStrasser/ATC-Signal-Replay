@@ -2,8 +2,8 @@
 """
 firmware_validate.py — Standalone firmware validation script.
 
-Replays event logs to controllers with new firmware, compares output to
-original logs, and generates an HTML report with divergence charts.
+Replays source logs to controllers with new firmware, compares collected output
+to the configured baseline, and generates an HTML report with divergence charts.
 
 Usage:
     python firmware_validate.py                  # interactive, uses settings.json
@@ -146,6 +146,32 @@ def load_settings(path: Path) -> dict:
         return json.load(f)
 
 
+def get_results_dir(firmware_dir: Path, settings: dict) -> Path:
+    return firmware_dir / settings["results_dir"]
+
+
+def get_version_logs_dir(firmware_dir: Path, settings: dict, version: str) -> Path:
+    return get_results_dir(firmware_dir, settings) / version / "logs"
+
+
+def resolve_baseline_logs_dir(firmware_dir: Path, settings: dict) -> Tuple[Optional[Path], str]:
+    baseline_dir = get_version_logs_dir(firmware_dir, settings, settings["baseline_version"])
+    if baseline_dir.exists():
+        return baseline_dir, settings["baseline_version"]
+    return None, f"{settings['baseline_version']} (source logs)"
+
+
+def resolve_baseline_log(
+    tssu: str,
+    firmware_dir: Path,
+    settings: dict,
+) -> Tuple[Optional[Path], str]:
+    baseline_dir, baseline_label = resolve_baseline_logs_dir(firmware_dir, settings)
+    if baseline_dir is not None:
+        return find_log(tssu, baseline_dir), baseline_label
+    return find_log(tssu, firmware_dir / settings["logs_dir"]), baseline_label
+
+
 # ---------------------------------------------------------------------------
 # Catalog helpers
 # ---------------------------------------------------------------------------
@@ -217,7 +243,7 @@ def build_suite(
     databases_dir = firmware_dir / settings["databases_dir"]
     controller_targets = settings["controller_targets"]
     firmware_version = settings["firmware_version"]
-    baseline_version = settings["baseline_version"]
+    _baseline_logs_dir, baseline_version = resolve_baseline_logs_dir(firmware_dir, settings)
     batch_size = len(controller_targets)
 
     file_map: Dict[str, dict] = {}
@@ -355,10 +381,12 @@ def wait_for_controllers(targets: List[str], labels: List[str]) -> None:
 def detect_current_batch(suite: sr.FirmwareTestSuite, batches: List[sr.TestBatch]) -> Tuple[Optional[sr.TestBatch], set]:
     checkpoint_path = Path(suite.output_dir) / suite.firmware_version / "checkpoint.json"
     completed: set = set()
+    batch_members: Dict[str, List[str]] = {}
     if checkpoint_path.exists():
         with open(checkpoint_path) as f:
             ck = json.load(f)
         completed = set(ck.get("completed_batches", []))
+        batch_members = ck.get("batch_members", {})
         log(
             f"Checkpoint found: {checkpoint_path} "
             f"({len(completed)} completed batch(es): {sorted(completed) if completed else 'none'})"
@@ -368,6 +396,8 @@ def detect_current_batch(suite: sr.FirmwareTestSuite, batches: List[sr.TestBatch
 
     for b in batches:
         if b.batch_id not in completed:
+            return b, completed
+        if batch_members.get(b.batch_id) != sorted(b.assignments.keys()):
             return b, completed
     return None, completed
 
@@ -396,14 +426,13 @@ def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> dict:
 def _extract_collected_events(
     suite: sr.FirmwareTestSuite,
     cp: dict,
-    tmp_dir: Path,
+    output_dir: Path,
 ) -> Dict[str, Path]:
     """
-    Pre-extract collected events from DuckDB into temporary parquet files.
-    This avoids DuckDB file-locking issues when using multiprocessing on Windows.
+    Extract collected events from DuckDB into versioned parquet files.
     Returns a mapping of scenario_id -> parquet path.
     """
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     # Group scenarios by their duckdb file to minimize open/close cycles
     db_to_scenarios: Dict[str, List[str]] = {}
     for scenario in suite.scenarios:
@@ -421,7 +450,7 @@ def _extract_collected_events(
                     "SELECT * FROM events WHERE device_id = ? ORDER BY timestamp",
                     [sid],
                 ).df()
-                out_path = tmp_dir / f"{sid}_collected.parquet"
+                out_path = output_dir / f"{sid}.parquet"
                 df.to_parquet(out_path, index=False)
                 extracted[sid] = out_path
         finally:
@@ -578,7 +607,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     All arguments are plain strings/numbers to avoid pickle issues.
     Reads from parquet files (no DuckDB needed in workers).
     """
-    (scenario_id, events_source, test_type_str, collected_parquet,
+    (scenario_id, baseline_events_source, baseline_label, test_type_str, collected_parquet,
      firmware_version, plots_dir_str, settle_minutes, group_tolerance,
       max_plots, window_minutes, verbose, notes_column, tod_align,
           analysis_start_time, phase_call_threshold) = args
@@ -589,10 +618,10 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
     test_type = sr.TestType.CONFLICT if test_type_str == "CONFLICT" else sr.TestType.SIMILARITY
 
-    original = sr.load_events(events_source)
+    baseline = sr.load_events(baseline_events_source)
     collected = pd.read_parquet(collected_parquet)
-    original_for_analysis, collected_for_analysis, start_time_a, start_time_b = _prepare_analysis_inputs(
-        original,
+    baseline_for_analysis, collected_for_analysis, start_time_a, start_time_b = _prepare_analysis_inputs(
+        baseline,
         collected,
         tod_align=tod_align,
     )
@@ -607,7 +636,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
         )
         if manual_analysis_start is not None:
             analysis_start = manual_analysis_start
-            original_for_analysis = _trim_to_analysis_start(original_for_analysis, analysis_start)
+            baseline_for_analysis = _trim_to_analysis_start(baseline_for_analysis, analysis_start)
             collected_for_analysis = _trim_to_analysis_start(collected_for_analysis, analysis_start)
             start_time_a = analysis_start.to_pydatetime()
             start_time_b = analysis_start.to_pydatetime()
@@ -617,9 +646,9 @@ def _compare_one_scenario(args: Tuple) -> dict:
             sparkline_base_timestamp = start_time_a
 
     result = sr.compare_runs(
-        events_a=original_for_analysis, events_b=collected_for_analysis,
+        events_a=baseline_for_analysis, events_b=collected_for_analysis,
         device_id=scenario_id,
-        run_a_label="original_logs", run_b_label=firmware_version,
+        run_a_label=baseline_label, run_b_label=firmware_version,
         start_time_a=start_time_a,
         start_time_b=start_time_b,
         auto_align=not tod_align, settle_minutes=compare_settle_minutes,
@@ -629,13 +658,13 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
     plot_paths: list = []
     timeline_a = timeline_b = None
-    if not original_for_analysis.empty and not collected_for_analysis.empty:
+    if not baseline_for_analysis.empty and not collected_for_analysis.empty:
         try:
             # Suppress atspm's verbose stdout unless --verbose
             _devnull = open(os.devnull, "w") if not verbose else None
             _ctx = contextlib.redirect_stdout(_devnull) if _devnull else contextlib.nullcontext()
             with _ctx:
-                timeline_a = sr.generate_timeline(original_for_analysis, device_id=scenario_id)
+                timeline_a = sr.generate_timeline(baseline_for_analysis, device_id=scenario_id)
                 timeline_b = sr.generate_timeline(collected_for_analysis, device_id=scenario_id)
             if _devnull:
                 _devnull.close()
@@ -657,7 +686,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 plot_paths = sr.create_multi_divergence_plots(
                     timeline_a=timeline_a, timeline_b=timeline_b,
                     comparison_result=result, output_dir=plots_dir_str,
-                    label_a="Original", label_b=firmware_version,
+                    label_a=baseline_label, label_b=firmware_version,
                     max_plots=max_plots, window_minutes=window_minutes,
                     time_offset_b=time_offset_b,
                     align_by_time_delta=not tod_align,
@@ -778,13 +807,14 @@ def _compare_one_scenario(args: Tuple) -> dict:
 def _export_device_csvs(
     suite: sr.FirmwareTestSuite,
     extracted_map: Dict[str, Path],
+    baseline_sources: Dict[str, Path],
     group_tolerance: float = 0.0,
 ) -> Path:
-    """Export a combined CSV per device with original + collected events.
+    """Export a combined CSV per device with baseline + collected events.
 
     Each CSV lives in results/<fw_version>/device_events/<scenario_id>.csv
-    and contains a ``DeviceId`` column (``original`` vs ``new``)
-    to distinguish the two runs. Original timestamps are shifted onto the
+    and contains a ``DeviceId`` column (``baseline`` vs ``new``)
+    to distinguish the two runs. Baseline timestamps are shifted onto the
     new run's absolute timeline using the same temporal offset logic used
     by the comparison / Gantt chart alignment.
     """
@@ -796,6 +826,13 @@ def _export_device_csvs(
         collected_parquet = extracted_map.get(scenario.scenario_id)
         if not collected_parquet:
             continue
+        baseline_source = baseline_sources.get(scenario.scenario_id)
+        if baseline_source is None:
+            log(
+                f"WARNING: Missing baseline log for {scenario.scenario_id}; "
+                "skipping device CSV export for this scenario."
+            )
+            continue
         if not Path(collected_parquet).exists():
             log(
                 f"WARNING: Missing collected parquet for {scenario.scenario_id}; "
@@ -803,16 +840,16 @@ def _export_device_csvs(
             )
             continue
 
-        original = sr.load_events(scenario.events_source)
+        baseline = sr.load_events(str(baseline_source))
         collected = pd.read_parquet(collected_parquet)
 
-        original_ts_col = _get_timestamp_col(original)
+        original_ts_col = _get_timestamp_col(baseline)
         collected_ts_col = _get_timestamp_col(collected)
-        original[original_ts_col] = pd.to_datetime(original[original_ts_col])
+        baseline[original_ts_col] = pd.to_datetime(baseline[original_ts_col])
         collected[collected_ts_col] = pd.to_datetime(collected[collected_ts_col])
 
         original_shift = _compute_export_shift(
-            original,
+            baseline,
             collected,
             original_ts_col=original_ts_col,
             collected_ts_col=collected_ts_col,
@@ -820,7 +857,7 @@ def _export_device_csvs(
             group_tolerance=group_tolerance,
         )
         if original_shift != pd.Timedelta(0):
-            original[original_ts_col] = original[original_ts_col] + original_shift
+            baseline[original_ts_col] = baseline[original_ts_col] + original_shift
         if scenario.tod_align:
             vlog(
                 f"  {scenario.scenario_id}: TOD export date shift "
@@ -833,19 +870,19 @@ def _export_device_csvs(
             )
 
         if original_ts_col != "timestamp":
-            original = original.rename(columns={original_ts_col: "timestamp"})
+            baseline = baseline.rename(columns={original_ts_col: "timestamp"})
         if collected_ts_col != "timestamp":
             collected = collected.rename(columns={collected_ts_col: "timestamp"})
 
         # Drop unwanted columns, add a single DeviceId
         drop_cols = {"device_id", "run_number"}
-        original = original.drop(columns=[c for c in original.columns if c in drop_cols], errors="ignore")
+        baseline = baseline.drop(columns=[c for c in baseline.columns if c in drop_cols], errors="ignore")
         collected = collected.drop(columns=[c for c in collected.columns if c in drop_cols], errors="ignore")
 
-        original["DeviceId"] = "original"
+        baseline["DeviceId"] = "baseline"
         collected["DeviceId"] = "new"
 
-        combined = pd.concat([original, collected], ignore_index=True)
+        combined = pd.concat([baseline, collected], ignore_index=True)
         combined = combined.sort_values(["timestamp", "event_id", "parameter", "DeviceId"]).reset_index(drop=True)
         csv_path = out_dir / f"{scenario.scenario_id}.csv"
         combined.to_csv(csv_path, index=False)
@@ -862,9 +899,6 @@ def run_analysis(
     firmware_dir: Path,
 ) -> List[sr.ScenarioResult]:
     """Run comparisons with multiprocessing. Returns list of ScenarioResult."""
-    import tempfile
-    import shutil
-
     firmware_version = suite.firmware_version
     comp = settings.get("comparison", {})
     settle_minutes = comp.get("settle_minutes", 10.0)
@@ -889,15 +923,31 @@ def run_analysis(
     plots_dir = Path(suite.output_dir) / firmware_version / "divergence_plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-extract collected events from DuckDB to avoid file-locking in workers
-    tmp_dir = Path(suite.output_dir) / firmware_version / "_tmp_analysis"
-    log("Extracting collected events from DuckDB...")
-    extracted_map = _extract_collected_events(suite, cp, tmp_dir)
-    log(f"Extracted {len(extracted_map)} scenarios to temp parquet files.")
+    baseline_logs_dir, baseline_label = resolve_baseline_logs_dir(firmware_dir, settings)
+    if baseline_logs_dir is not None:
+        log(f"Baseline logs: {baseline_logs_dir}")
+    else:
+        log(f"Baseline logs folder not found for {settings['baseline_version']}; using source logs/ as fallback.")
 
-    # Export per-device CSVs (original + collected combined)
+    version_logs_dir = get_version_logs_dir(firmware_dir, settings, firmware_version)
+    log(f"Exporting collected output logs to {version_logs_dir}...")
+    extracted_map = _extract_collected_events(suite, cp, version_logs_dir)
+    log(f"Exported {len(extracted_map)} scenario log(s).")
+
+    baseline_sources: Dict[str, Path] = {}
+    for scenario in suite.scenarios:
+        baseline_path, _ = resolve_baseline_log(scenario.scenario_id, firmware_dir, settings)
+        if baseline_path is None:
+            log(
+                f"WARNING: Missing baseline log for {scenario.scenario_id}; "
+                "this scenario will be skipped during analysis."
+            )
+            continue
+        baseline_sources[scenario.scenario_id] = baseline_path
+
+    # Export per-device CSVs (baseline + collected combined)
     log("Exporting per-device CSV files...")
-    _export_device_csvs(suite, extracted_map, group_tolerance=group_tolerance)
+    _export_device_csvs(suite, extracted_map, baseline_sources, group_tolerance=group_tolerance)
 
     analysis_start_time = comp.get("analysis_start_time")
     if analysis_start_time:
@@ -907,13 +957,17 @@ def run_analysis(
     jobs: list = []
     for scenario in suite.scenarios:
         collected_parquet = extracted_map.get(scenario.scenario_id)
+        baseline_source = baseline_sources.get(scenario.scenario_id)
         if not collected_parquet or not Path(collected_parquet).exists():
             log(f"  No output for {scenario.scenario_id}, skipping")
+            continue
+        if baseline_source is None:
             continue
         test_type_str = "CONFLICT" if scenario.test_type == sr.TestType.CONFLICT else "SIMILARITY"
         jobs.append((
             scenario.scenario_id,
-            scenario.events_source,
+            str(baseline_source),
+            baseline_label,
             test_type_str,
             str(collected_parquet),
             firmware_version,
@@ -931,7 +985,6 @@ def run_analysis(
 
     if not jobs:
         log("No scenarios to analyze.")
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         return []
 
     n_workers = min(max_workers, len(jobs))
@@ -941,65 +994,58 @@ def run_analysis(
     results: List[sr.ScenarioResult] = []
     done = 0
 
-    try:
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_compare_one_scenario, job): job[0]
-                for job in jobs
-            }
-            for future in as_completed(futures):
-                sid = futures[future]
-                done += 1
-                try:
-                    out = future.result()
-                    test_type = sr.TestType.CONFLICT if out["test_type_str"] == "CONFLICT" else sr.TestType.SIMILARITY
-                    results.append(sr.ScenarioResult(
-                        scenario_id=out["scenario_id"],
-                        test_type=test_type,
-                        firmware_version=firmware_version,
-                        passed=out["passed"],
-                        match_percentage=out["match_percentage"],
-                        num_divergences=out["num_divergences"],
-                        notes=out["summary"],
-                        notes_column=out.get("notes_column", ""),
-                        plot_paths=out["plot_paths"],
-                        phase_differences=out["phase_diffs"],
-                        operational_differences=out.get("operational_diffs", []),
-                        runs_completed=1,
-                        total_runs=1,
-                        chunk_scores=out.get("chunk_scores", []),
-                        phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
-                        included_chunk_count=out.get("included_chunk_count", 0),
-                        excluded_chunk_count=out.get("excluded_chunk_count", 0),
-                        thrown_out=out.get("thrown_out", False),
-                        timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
-                        sparkline_svg=out.get("sparkline_svg", ""),
-                        temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
-                    ))
-                    status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
-                    plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
-                    diffs_msg = ""
-                    if out["phase_diffs"]:
-                        diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
-                        diffs_msg += sr.format_phase_differences(
-                            out["phase_diffs"], label_a="Original", label_b=firmware_version
-                        )
-                    if out.get("operational_diffs"):
-                        diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
-                        diffs_msg += sr.format_phase_differences(
-                            out["operational_diffs"], label_a="Original", label_b=firmware_version
-                        )
-                    log(f"  [{done}/{len(jobs)}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
-                except Exception as e:
-                    log(f"  [{done}/{len(jobs)}] {sid}: ERROR — {e}")
-                    if _VERBOSE:
-                        traceback.print_exc()
-    finally:
-        # Clean up temp parquet files
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        vlog("Cleaned up temp analysis files.")
-
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_compare_one_scenario, job): job[0]
+            for job in jobs
+        }
+        for future in as_completed(futures):
+            sid = futures[future]
+            done += 1
+            try:
+                out = future.result()
+                test_type = sr.TestType.CONFLICT if out["test_type_str"] == "CONFLICT" else sr.TestType.SIMILARITY
+                results.append(sr.ScenarioResult(
+                    scenario_id=out["scenario_id"],
+                    test_type=test_type,
+                    firmware_version=firmware_version,
+                    passed=out["passed"],
+                    match_percentage=out["match_percentage"],
+                    num_divergences=out["num_divergences"],
+                    notes=out["summary"],
+                    notes_column=out.get("notes_column", ""),
+                    plot_paths=out["plot_paths"],
+                    phase_differences=out["phase_diffs"],
+                    operational_differences=out.get("operational_diffs", []),
+                    runs_completed=1,
+                    total_runs=1,
+                    chunk_scores=out.get("chunk_scores", []),
+                    phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
+                    included_chunk_count=out.get("included_chunk_count", 0),
+                    excluded_chunk_count=out.get("excluded_chunk_count", 0),
+                    thrown_out=out.get("thrown_out", False),
+                    timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
+                    sparkline_svg=out.get("sparkline_svg", ""),
+                    temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
+                ))
+                status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
+                plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
+                diffs_msg = ""
+                if out["phase_diffs"]:
+                    diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
+                    diffs_msg += sr.format_phase_differences(
+                        out["phase_diffs"], label_a=baseline_label, label_b=firmware_version
+                    )
+                if out.get("operational_diffs"):
+                    diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
+                    diffs_msg += sr.format_phase_differences(
+                        out["operational_diffs"], label_a=baseline_label, label_b=firmware_version
+                    )
+                log(f"  [{done}/{len(jobs)}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
+            except Exception as e:
+                log(f"  [{done}/{len(jobs)}] {sid}: ERROR — {e}")
+                if _VERBOSE:
+                    traceback.print_exc()
     # Sort results by scenario name for consistent ordering in report
     results.sort(key=lambda r: r.scenario_id)
     return results
@@ -1020,50 +1066,17 @@ def build_report(
 
 
 # ---------------------------------------------------------------------------
-# Archive + extract baseline
+# Refresh versioned collected logs
 # ---------------------------------------------------------------------------
-def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path) -> None:
+def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path, settings: dict) -> None:
     fw_ver = suite.firmware_version
-    logs_dir = firmware_dir / "logs"
-    archive_dir = firmware_dir / f"logs_{fw_ver}"
-
-    if archive_dir.exists():
-        log(f"Archive folder already exists: {archive_dir}")
-        log("Skipping archive step.")
-    elif logs_dir.exists():
-        logs_dir.rename(archive_dir)
-        log(f"Archived logs/ -> {archive_dir}")
-    else:
-        log("No logs/ folder found — nothing to archive.")
-
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    log("Fresh logs/ directory ready.")
-
     checkpoint_path = Path(suite.output_dir) / fw_ver / "checkpoint.json"
     with open(checkpoint_path) as f:
         cp = json.load(f)
 
-    extracted = 0
-    for scenario in suite.scenarios:
-        db_path = cp["scenario_db_map"].get(scenario.scenario_id)
-        if not db_path:
-            continue
-        con = duckdb.connect(db_path)
-        try:
-            df = con.execute(
-                "SELECT * FROM events WHERE device_id = ? ORDER BY timestamp",
-                [scenario.scenario_id],
-            ).df()
-        finally:
-            con.close()
-        if df.empty:
-            continue
-        out_path = logs_dir / f"{scenario.scenario_id}.parquet"
-        df.to_parquet(out_path, index=False)
-        extracted += 1
-        vlog(f"  {scenario.scenario_id} -> {out_path}  ({len(df)} events)")
-
-    log(f"Extracted {extracted} scenario(s) into logs/")
+    output_dir = get_version_logs_dir(firmware_dir, settings, fw_ver)
+    extracted_map = _extract_collected_events(suite, cp, output_dir)
+    log(f"Collected logs refreshed in {output_dir} ({len(extracted_map)} scenario(s)).")
 
 
 # ---------------------------------------------------------------------------
@@ -1076,7 +1089,7 @@ def main() -> None:
     parser.add_argument("--settings", default="settings.json", help="Path to settings JSON file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     parser.add_argument("--report-only", action="store_true", help="Skip replay, just run analysis + report")
-    parser.add_argument("--archive", action="store_true", help="Archive logs and extract new baseline after report")
+    parser.add_argument("--archive", action="store_true", help="Refresh the versioned collected logs after report generation")
     parser.add_argument(
         "--settle-minutes",
         type=float,
@@ -1281,7 +1294,7 @@ def main() -> None:
         # ANALYSIS PHASE
         # ======================================================================
         log(f"\n{'='*70}")
-        log("ANALYSIS: Comparing collected output to original logs")
+        log(f"ANALYSIS: Comparing {suite.firmware_version} output to {suite.baseline_version}")
         log(f"{'='*70}")
 
         results = run_analysis(suite, settings, firmware_dir)
@@ -1300,13 +1313,13 @@ def main() -> None:
         log(f"Total images embedded: {sum(len(r.plot_paths) for r in results)}")
 
         # ======================================================================
-        # ARCHIVE (optional)
+        # VERSIONED LOG EXPORT (optional refresh)
         # ======================================================================
         if args.archive:
             log(f"\n{'='*70}")
-            log("ARCHIVE: Extracting new baseline logs")
+            log("EXPORT: Refreshing versioned collected logs")
             log(f"{'='*70}")
-            archive_and_extract(suite, firmware_dir)
+            archive_and_extract(suite, firmware_dir, settings)
 
         log("\nDone.")
     finally:

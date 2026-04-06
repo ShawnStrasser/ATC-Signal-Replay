@@ -27,7 +27,7 @@ def test_failed_batch_is_not_marked_complete_and_data_is_cleared(tmp_path):
     suite = _build_suite(tmp_path)
     runner = sr.BatchRunner(suite, debug=False)
 
-    db_path = runner.run_dir / "batch_1.duckdb"
+    db_path = runner.run_dir / "new.duckdb"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -43,6 +43,9 @@ def test_failed_batch_is_not_marked_complete_and_data_is_cleared(tmp_path):
     con.execute(
         "INSERT INTO events VALUES ('S1', 1, '2026-01-01 12:00:00', 1, 1)"
     )
+    con.execute(
+        "INSERT INTO events VALUES ('S2', 1, '2026-01-01 12:00:01', 1, 1)"
+    )
     con.close()
 
     with patch.object(runner, "_run_similarity_batch", side_effect=RuntimeError("boom")):
@@ -54,8 +57,10 @@ def test_failed_batch_is_not_marked_complete_and_data_is_cleared(tmp_path):
 
     con = duckdb.connect(str(db_path))
     rows = con.execute("SELECT COUNT(*) FROM events WHERE device_id = 'S1'").fetchone()[0]
+    other_rows = con.execute("SELECT COUNT(*) FROM events WHERE device_id = 'S2'").fetchone()[0]
     con.close()
     assert rows == 0
+    assert other_rows == 1
 
     for handler in runner.logger.handlers:
         handler.close()

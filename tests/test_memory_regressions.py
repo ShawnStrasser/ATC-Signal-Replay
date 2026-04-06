@@ -1,7 +1,9 @@
 from unittest.mock import patch
 import sqlite3
 
+import duckdb
 import pandas as pd
+import pytest
 
 import signal_replay as sr
 
@@ -41,7 +43,7 @@ def test_simulation_uses_preloaded_signal_events_without_central_distribution(te
         def __init__(self, _db_path):
             pass
 
-        def get_max_run_number(self):
+        def get_max_run_number(self, device_ids=None):
             return 0
 
         def clear_run_data(self, _run_number=None):
@@ -110,7 +112,7 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
         db_path = runner._run_similarity_batch(batch, ["S1", "S2"], db_loader_callback=lambda *_args: True)
 
-    assert db_path == runner.run_dir / "batch_1.duckdb"
+    assert db_path == runner.run_dir / "new.duckdb"
     assert captured["events"] is None
     # Events should be file paths (not loaded DataFrames) to avoid holding large data in memory
     assert all(isinstance(signal.events, str) for signal in captured["signals"])
@@ -124,6 +126,67 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     for handler in runner.logger.handlers:
         handler.close()
     runner.logger.handlers.clear()
+
+
+def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
+    events_1 = tmp_path / "events_1.parquet"
+    _detector_events("S1").to_parquet(events_1, index=False)
+
+    scenario = sr.TestScenario(
+        scenario_id="S1",
+        database_name="S1.bin",
+        events_source=str(events_1),
+        test_type=sr.TestType.CONFLICT,
+        replays=25,
+    )
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="new",
+        baseline_version="old",
+        scenarios=[scenario],
+        batches=[sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701"})],
+        output_dir=str(tmp_path),
+    )
+    runner = sr.BatchRunner(suite, debug=False)
+    captured = {}
+
+    class FakeSimulation:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return {"completed_runs": [1]}
+
+    with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
+        db_path = runner._run_conflict_scenario(suite.batches[0], "S1", db_loader_callback=lambda *_args: True)
+
+    assert db_path == runner.run_dir / "new.duckdb"
+    assert captured["replays"] == 25
+    assert "replace_existing_device_data" not in captured
+
+    for handler in runner.logger.handlers:
+        handler.close()
+    runner.logger.handlers.clear()
+
+
+def test_database_manager_rejects_old_events_schema(temp_db_path):
+    con = duckdb.connect(temp_db_path)
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER,
+            PRIMARY KEY (device_id, timestamp, event_id, parameter)
+        )
+        """
+    )
+    con.close()
+
+    with pytest.raises(RuntimeError, match="Unsupported events schema"):
+        sr.DatabaseManager(temp_db_path)
 
 
 def test_load_events_reads_sqlite_event_table(tmp_path):

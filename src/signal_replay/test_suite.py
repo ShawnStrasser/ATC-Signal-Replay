@@ -44,6 +44,9 @@ class FirmwareTestSuite:
     batches: List[TestBatch]
     output_dir: str = "./firmware_test_results"
     comparison_thresholds: Optional[ComparisonThresholds] = None
+    detector_similarity_threshold: float = 90.0
+    analysis_settle_minutes: float = 0.0
+    analysis_start_time: str = ""
     collection_interval_minutes: float = 5.0
     post_replay_settle_seconds: float = 10.0
     snmp_timeout_seconds: float = 2.0
@@ -53,6 +56,14 @@ class FirmwareTestSuite:
     heartbeat_interval_seconds: float = 5.0
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
+
+    @property
+    def phase_call_similarity_threshold(self) -> float:
+        return self.detector_similarity_threshold
+
+    @phase_call_similarity_threshold.setter
+    def phase_call_similarity_threshold(self, value: float) -> None:
+        self.detector_similarity_threshold = value
 
 
 @dataclass
@@ -72,9 +83,23 @@ class ScenarioResult:
     notes: str = ""
     notes_column: str = ""
     phase_differences: List[dict] = field(default_factory=list)
+    operational_differences: List[dict] = field(default_factory=list)
     chunk_scores: List[dict] = field(default_factory=list)
+    detector_chunk_scores: List[dict] = field(default_factory=list)
+    included_chunk_count: int = 0
+    excluded_chunk_count: int = 0
+    thrown_out: bool = False
+    timeline_difference_analysis_available: bool = False
     sparkline_svg: str = ""
     temporal_shift_seconds: float = 0.0
+
+    @property
+    def phase_call_chunk_scores(self) -> List[dict]:
+        return self.detector_chunk_scores
+
+    @phase_call_chunk_scores.setter
+    def phase_call_chunk_scores(self, value: List[dict]) -> None:
+        self.detector_chunk_scores = value
 
 
 def _serialize_suite(suite: FirmwareTestSuite) -> dict:
@@ -151,6 +176,9 @@ def load_from_yaml(path: str) -> FirmwareTestSuite:
         batches=batches,
         output_dir=data.get("output_dir", "./firmware_test_results"),
         comparison_thresholds=thresholds,
+        detector_similarity_threshold=data.get("detector_similarity_threshold", data.get("phase_call_similarity_threshold", 90.0)),
+        analysis_settle_minutes=data.get("analysis_settle_minutes", 0.0),
+        analysis_start_time=data.get("analysis_start_time", ""),
         collection_interval_minutes=data.get("collection_interval_minutes", 5.0),
         post_replay_settle_seconds=data.get("post_replay_settle_seconds", 10.0),
         snmp_timeout_seconds=data.get("snmp_timeout_seconds", 2.0),

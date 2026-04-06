@@ -246,7 +246,7 @@ class ATCSimulation:
         
         # Determine starting run number using completed runs so interrupted runs
         # resume to the requested total instead of adding a fresh batch.
-        self._run_offset = self.db.get_max_run_number()
+        self._run_offset = self.db.get_max_run_number(device_ids=[sig.device_id for sig in self.config.signals])
         if self._run_offset > 0:
             print(f"Existing completed runs found in database: {self._run_offset}")
         

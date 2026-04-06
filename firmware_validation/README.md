@@ -10,11 +10,15 @@ firmware_validation/
 	databases/               # Controller databases you manually load onto controllers
 	logs/                    # Replay input event logs used by signal_replay
 	conflict_monitor/        # Conflict pair definitions (conflict_pairs.json)
-	results/                 # Output from replay runs
+	results/                 # Per-version replay output, extracted logs, and reports
 	test_suite.yaml          # Auto-generated test suite config (do not edit by hand)
 	walkthrough.ipynb        # Main notebook for running validations
 	get_data.ipynb           # Notebook for pulling raw event logs from the database
 ```
+
+Each replay run keeps `logs/` as the immutable source input folder. Collected
+controller output is written under `results/<firmware_version>/logs/` and is
+used as the comparison baseline for later firmware versions.
 
 ## `databases.xlsx` (Required Columns)
 
@@ -71,12 +75,13 @@ Examples:
 1. Maintain `databases.xlsx` rows and `Type` labels.
 2. Ensure matching replay log files exist under `logs/`.
 3. Ensure matching database files exist under `databases/`.
-4. Run `walkthrough.ipynb`:
+4. Run firmware validation:
 	 - Step 1 builds scenarios and batches from Excel.
-	 - Step 2 runs baseline firmware capture.
-	 - Step 3 runs new firmware capture.
-	 - Step 4 compares outputs.
-	 - Step 5 generates HTML report.
+	 - Step 2 replays source logs from `logs/` to the target firmware.
+	 - Step 3 writes collected output to `results/<firmware_version>/logs/`.
+	 - Step 4 compares `results/<firmware_version>/logs/` to `results/<baseline_version>/logs/` when available.
+	 - Step 5 falls back to `logs/` only when the baseline version folder does not exist.
+	 - Step 6 generates HTML report.
 
 ## Conflict Monitoring Behavior
 

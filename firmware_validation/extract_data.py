@@ -3,7 +3,7 @@
 extract_data.py — Extract collected event logs from a firmware validation run.
 
 This script reads the DuckDB files recorded for a firmware run and exports one
-parquet file per device into firmware_validation/logs_<firmware_version>/.
+parquet file per device into firmware_validation/results/<firmware_version>/logs/.
 
 Usage:
     python extract_data.py --firmware-version 2.3.1.0
@@ -11,7 +11,7 @@ Usage:
 
 Notes:
 - Firmware versions containing periods are supported as-is.
-- Output folder will be named exactly logs_<firmware_version>.
+- Output is written under results/<firmware_version>/logs/.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def extract_logs(firmware_dir: Path, firmware_version: str, settings_path: Path)
     if not scenario_db_map:
         raise ValueError(f"No scenario_db_map found in {checkpoint_path}")
 
-    output_dir = firmware_dir / f"logs_{firmware_version}"
+    output_dir = run_dir / "logs"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     extracted = 0

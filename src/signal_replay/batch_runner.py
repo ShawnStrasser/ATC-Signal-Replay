@@ -138,6 +138,7 @@ class BatchRunner:
             "suite_name": self.suite.suite_name,
             "firmware_version": self.suite.firmware_version,
             "completed_batches": [],
+            "batch_members": {},
             "scenario_db_map": {},
             "started_at": datetime.utcnow().isoformat(),
             "last_updated": datetime.utcnow().isoformat(),
@@ -161,6 +162,9 @@ class BatchRunner:
                 return scenario
         raise ValueError(f"Scenario '{scenario_id}' not found in suite")
 
+    def _shared_db_path(self) -> Path:
+        return self.run_dir / f"{self.suite.firmware_version}.duckdb"
+
     def _clear_scenario_data(self, db_path: Path, scenario_ids: List[str]) -> None:
         """Delete persisted rows for the provided scenarios from a DuckDB file."""
         if not scenario_ids or not db_path.exists():
@@ -175,7 +179,7 @@ class BatchRunner:
                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
                 ).fetchall()
             }
-            for table in ("events", "conflicts", "input_events", "comparison_results"):
+            for table in ("events", "conflicts", "comparison_results"):
                 if table in tables:
                     con.execute(
                         f"DELETE FROM {table} WHERE device_id IN ({placeholders})",
@@ -231,7 +235,7 @@ class BatchRunner:
             object.__setattr__(signal_cfg, "events", scenario.events_source)
             signals.append(signal_cfg)
 
-        db_path = self.run_dir / f"{batch.batch_id}.duckdb"
+        db_path = self._shared_db_path()
         self._clear_scenario_data(db_path, similarity_ids)
 
         sim = ATCSimulation(
@@ -297,7 +301,7 @@ class BatchRunner:
         )
         object.__setattr__(signal_cfg, "events", scenario.events_source)
 
-        db_path = self.run_dir / f"conflict_{scenario_id}.duckdb"
+        db_path = self._shared_db_path()
         self._clear_scenario_data(db_path, [scenario_id])
         sim = ATCSimulation(
             signals=[signal_cfg],
@@ -352,16 +356,18 @@ class BatchRunner:
         """
         checkpoint = self._load_checkpoint()
         completed = set(checkpoint.get("completed_batches", []))
+        batch_members = checkpoint.setdefault("batch_members", {})
         scenario_db_map = checkpoint.get("scenario_db_map", {})
 
         for batch in self.suite.batches:
             if batch_ids is not None and batch.batch_id not in batch_ids:
                 continue
-            if batch.batch_id in completed:
+            scenario_ids = list(batch.assignments.keys())
+            current_members = sorted(scenario_ids)
+            if batch.batch_id in completed and batch_members.get(batch.batch_id) == current_members:
                 self.logger.info(f"Skipping completed batch {batch.batch_id}")
                 continue
 
-            scenario_ids = list(batch.assignments.keys())
             similarity_ids = [
                 sid for sid in scenario_ids if self._get_scenario(sid).test_type == TestType.SIMILARITY
             ]
@@ -394,15 +400,17 @@ class BatchRunner:
                         break
 
             if batch_failed:
-                self._clear_scenario_data(self.run_dir / f"{batch.batch_id}.duckdb", similarity_ids)
+                self._clear_scenario_data(self._shared_db_path(), similarity_ids)
                 for sid in conflict_ids:
-                    self._clear_scenario_data(self.run_dir / f"conflict_{sid}.duckdb", [sid])
+                    self._clear_scenario_data(self._shared_db_path(), [sid])
                 for sid in scenario_ids:
                     scenario_db_map.pop(sid, None)
             else:
                 completed.add(batch.batch_id)
 
             checkpoint["completed_batches"] = sorted(completed)
+            batch_members[batch.batch_id] = current_members
+            checkpoint["batch_members"] = batch_members
             checkpoint["scenario_db_map"] = scenario_db_map
             if batch_errors:
                 errors_map = checkpoint.setdefault("batch_errors", {})

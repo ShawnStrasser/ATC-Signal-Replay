@@ -240,7 +240,7 @@ class TestOrchestratorTimingWithMocks:
             def __init__(self, _db_path):
                 pass
 
-            def get_max_run_number(self):
+            def get_max_run_number(self, device_ids=None):
                 return 0
 
             def clear_run_data(self, _run_number=None):
@@ -323,7 +323,7 @@ class TestOrchestratorTimingWithMocks:
             def __init__(self, _db_path):
                 pass
 
-            def get_max_run_number(self):
+            def get_max_run_number(self, device_ids=None):
                 return 2
 
             def clear_run_data(self, _run_number=None):

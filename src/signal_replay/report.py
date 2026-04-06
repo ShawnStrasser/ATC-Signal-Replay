@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import yaml
 from jinja2 import Template
 
+from .comparison import PhaseCallChunkScore, render_sparkline_svg
 from .test_suite import FirmwareTestSuite, ScenarioResult, TestType
 
 
@@ -22,6 +23,64 @@ def _image_to_base64(path: str) -> Optional[str]:
     with open(p, "rb") as f:
         content = f.read()
     return base64.b64encode(content).decode("utf-8")
+
+
+def _coerce_phase_call_chunk_scores(raw_scores: List[dict]) -> List[PhaseCallChunkScore]:
+    scores: List[PhaseCallChunkScore] = []
+    for item in raw_scores or []:
+        if isinstance(item, PhaseCallChunkScore):
+            scores.append(item)
+            continue
+        scores.append(
+            PhaseCallChunkScore(
+                center_seconds=float(item.get("center_seconds", 0.0)),
+                window_seconds=float(item.get("window_seconds", 0.0)),
+                similarity_percentage=item.get("similarity_percentage"),
+                has_activity=bool(item.get("has_activity", False)),
+                excluded_from_match=bool(item.get("excluded_from_match", False)),
+            )
+        )
+    return scores
+
+
+def _build_combined_phase_call_timeline(
+    results: List[ScenarioResult],
+    threshold: float,
+) -> str:
+    aggregate: Dict[tuple, List[float]] = {}
+
+    for row in results:
+        if row.test_type != TestType.SIMILARITY:
+            continue
+        raw_scores = getattr(row, "phase_call_chunk_scores", getattr(row, "detector_chunk_scores", []))
+        for score in _coerce_phase_call_chunk_scores(raw_scores):
+            if score.similarity_percentage is None:
+                continue
+            key = (round(score.center_seconds, 6), round(score.window_seconds, 6))
+            aggregate.setdefault(key, []).append(float(score.similarity_percentage))
+
+    combined_scores = [
+      PhaseCallChunkScore(
+            center_seconds=center_seconds,
+            window_seconds=window_seconds,
+            similarity_percentage=sum(values) / len(values),
+            has_activity=True,
+            excluded_from_match=(sum(values) / len(values)) < threshold,
+        )
+        for (center_seconds, window_seconds), values in sorted(aggregate.items())
+        if values
+    ]
+
+    if not combined_scores:
+        return ""
+
+    return render_sparkline_svg(
+        [],
+        phase_call_chunk_scores=combined_scores,
+        phase_call_threshold=threshold,
+        auto_scale_y=True,
+        show_exclusion_legend=False,
+    )
 
 
 _REPORT_TEMPLATE = Template("""\
@@ -149,6 +208,9 @@ a:hover { text-decoration: underline; }
   height: auto;
   min-height: 190px;
 }
+.chart-note { color: var(--muted); font-size: 14px; margin-top: 8px; }
+.chart-note strong { color: var(--text); }
+.section-copy { color: var(--muted); font-size: 15px; margin-bottom: 14px; max-width: 1050px; }
 </style>
 </head>
 <body>
@@ -199,18 +261,18 @@ a:hover { text-decoration: underline; }
         <tr>
           <td><a href="#{{ r.scenario_id }}">{{ r.scenario_id }}</a></td>
           <td>{{ r.notes.split('\\n')[0][:80] if r.notes else '' }}</td>
-          <td style="font-weight:600;{% if r.match_percentage is not none and r.match_percentage >= 95 %} color:var(--pass);{% elif r.match_percentage is not none and r.match_percentage >= 80 %} color:var(--warn);{% elif r.match_percentage is not none %} color:var(--fail);{% endif %}">
-            {{ '%.1f%%'|format(r.match_percentage) if r.match_percentage is not none else '&mdash;' }}
+          <td style="font-weight:600;{% if r.thrown_out %} color:var(--warn);{% elif r.match_percentage is not none and r.match_percentage >= 95 %} color:var(--pass);{% elif r.match_percentage is not none and r.match_percentage >= 80 %} color:var(--warn);{% elif r.match_percentage is not none %} color:var(--fail);{% endif %}">
+            {{ 'Thrown out' if r.thrown_out else ('%.1f%%'|format(r.match_percentage) if r.match_percentage is not none else '&mdash;') }}
           </td>
           <td>
-            {% if r.match_percentage is not none %}
+            {% if r.match_percentage is not none and not r.thrown_out %}
             <div class="match-bar-wrap">
               <div class="match-bar"><div class="match-bar-fill {{ 'high' if r.match_percentage >= 95 else ('med' if r.match_percentage >= 80 else 'low') }}" style="width:{{ [r.match_percentage, 100]|min }}%"></div></div>
             </div>
             {% endif %}
           </td>
           <td>{{ r.num_divergences }}</td>
-          <td><span class="badge {{ 'pass' if r.passed else 'fail' }}">{{ 'PASS' if r.passed else 'FAIL' }}</span></td>
+          <td><span class="badge {{ 'warn' if r.thrown_out else ('pass' if r.passed else 'fail') }}">{{ 'THROWN OUT' if r.thrown_out else ('PASS' if r.passed else 'FAIL') }}</span></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -242,6 +304,18 @@ a:hover { text-decoration: underline; }
 </div>
 {% endif %}
 
+{% if combined_phase_call_timeline_svg %}
+<div class="card">
+  <div class="card-header"><h2>Combined Timeline</h2></div>
+  <div class="card-body">
+    <div class="section-copy">
+      Black points and the connecting line show the average vehicular phase-call input similarity across all similarity devices. This is a system-wide sanity check for network or compute issues that may have affected every device at once, independent of firmware version.
+    </div>
+    <div class="sparkline-wrap">{{ combined_phase_call_timeline_svg }}</div>
+  </div>
+</div>
+{% endif %}
+
 <!-- ===== Detailed results ===== -->
 <div class="card">
   <div class="card-header"><h2>Detailed Results</h2></div>
@@ -250,7 +324,7 @@ a:hover { text-decoration: underline; }
     <div class="scenario" id="{{ row.scenario_id }}">
       <div class="scenario-header">
         <h3>{{ row.scenario_id }}</h3>
-        <span class="badge {{ 'pass' if row.passed else 'fail' }}">{{ 'PASS' if row.passed else 'FAIL' }}</span>
+        <span class="badge {{ 'warn' if row.thrown_out else ('pass' if row.passed else 'fail') }}">{{ 'THROWN OUT' if row.thrown_out else ('PASS' if row.passed else 'FAIL') }}</span>
         <span class="badge info">{{ row.test_type }}</span>
       </div>
       {% if row.notes_column %}
@@ -258,11 +332,18 @@ a:hover { text-decoration: underline; }
       {% endif %}
 
       <div class="meta-grid">
-        {% if row.match_percentage is not none %}
+        {% if row.thrown_out %}
+        <div><span class="label">Match:</span> <span class="val" style="color:var(--warn)">Thrown out</span></div>
+        <div><span class="label">Reason:</span> <span class="val">All scored chunks fell below the input similarity threshold</span></div>
+        {% elif row.match_percentage is not none %}
         <div><span class="label">Match:</span> <span class="val{% if row.match_percentage >= 95 %}" style="color:var(--pass){% elif row.match_percentage >= 80 %}" style="color:var(--warn){% else %}" style="color:var(--fail){% endif %}">{{ '%.1f%%'|format(row.match_percentage) }}</span></div>
         {% endif %}
         <div><span class="label">Divergences:</span> <span class="val">{{ row.num_divergences }}</span></div>
         <div><span class="label">Runs:</span> <span class="val">{{ row.runs_completed }} / {{ row.total_runs }}</span></div>
+        {% if row.test_type == 'similarity' and row.sparkline_svg %}
+        <div><span class="label">Included chunks:</span> <span class="val">{{ row.included_chunk_count }}</span></div>
+        <div><span class="label">Excluded chunks:</span> <span class="val">{{ row.excluded_chunk_count }}</span></div>
+        {% endif %}
 
         {% if row.annotation %}<div><span class="label">Note:</span> <span class="val">{{ row.annotation }}</span></div>{% endif %}
       </div>
@@ -271,6 +352,9 @@ a:hover { text-decoration: underline; }
         <div style="margin:12px 0;">
           <div style="font-weight:600;margin-bottom:6px;">Match Timeline</div>
           <div class="sparkline-wrap">{{ row.sparkline_svg }}</div>
+          {% if row.test_type == 'similarity' %}
+          <div class="chart-note"><strong>Match bars</strong> show the firmware comparison score by chunk. <strong>Black points/line</strong> show vehicular phase-call input similarity, which is treated as a simulation-reliability sanity check independent of firmware version. Semi-transparent bars were excluded from the device-level match average because input similarity fell below {{ phase_call_similarity_threshold }}%.</div>
+          {% endif %}
         </div>
       {% endif %}
 
@@ -291,9 +375,10 @@ a:hover { text-decoration: underline; }
         </details>
       {% endif %}
 
-      {% if row.phase_differences %}
+      {% if row.test_type == 'similarity' and row.timeline_difference_analysis_available %}
         <details{% if not row.passed %} open{% endif %}>
-          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Phase / Overlap Differences (top {{ [row.phase_differences|length, 5]|min }} of {{ row.phase_differences|length }})</summary>
+          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Phase / Overlap Differences{% if row.phase_differences %} (top {{ [row.phase_differences|length, 5]|min }} of {{ row.phase_differences|length }}){% endif %}</summary>
+          {% if row.phase_differences %}
           <table class="phase-table">
             <thead>
               <tr>
@@ -322,6 +407,47 @@ a:hover { text-decoration: underline; }
             {% endfor %}
             </tbody>
           </table>
+          {% else %}
+          <div class="chart-note">No meaningful phase or overlap differences were found.</div>
+          {% endif %}
+        </details>
+      {% endif %}
+
+      {% if row.test_type == 'similarity' and row.timeline_difference_analysis_available %}
+        <details{% if not row.passed %} open{% endif %}>
+          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Transition / Preempt / Ped Service Differences{% if row.operational_differences %} (top {{ [row.operational_differences|length, 5]|min }} of {{ row.operational_differences|length }}){% endif %}</summary>
+          {% if row.operational_differences %}
+          <table class="phase-table">
+            <thead>
+              <tr>
+                <th>Category</th>
+                <th>State</th>
+                <th class="num">Count (Orig)</th>
+                <th class="num">Count (New)</th>
+                <th class="num">&Delta; Count</th>
+                <th class="num">Avg Dur Orig (s)</th>
+                <th class="num">Avg Dur New (s)</th>
+                <th class="num">&Delta; Avg Dur (s)</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for d in row.operational_differences[:5] %}
+              <tr>
+                <td>{{ d.label }}</td>
+                <td>{{ d.state }}</td>
+                <td class="num{% if d.count_a == 0 %} warning-yellow{% endif %}">{{ d.count_a }}</td>
+                <td class="num{% if d.count_b == 0 %} warning-yellow{% endif %}">{{ d.count_b }}</td>
+                <td class="num {{ 'pos' if d.count_delta > 0 else ('neg' if d.count_delta < 0 else '') }}">{{ '%+d'|format(d.count_delta) if d.count_delta != 0 else '&mdash;' }}</td>
+                <td class="num">{{ '%.1f'|format(d.duration_a) }}</td>
+                <td class="num">{{ '%.1f'|format(d.duration_b) }}</td>
+                <td class="num {{ 'pos' if d.duration_delta > 0 else ('neg' if d.duration_delta < 0 else '') }}">{{ '%+.1f'|format(d.duration_delta) }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <div class="chart-note">No meaningful transition, preempt, or pedestrian-service differences were found.</div>
+          {% endif %}
         </details>
       {% endif %}
 
@@ -356,11 +482,16 @@ a:hover { text-decoration: underline; }
       <tr><td>Baseline version</td><td>{{ suite.baseline_version }}</td><td>Reference baseline used for comparison</td></tr>
       <tr><td>Collection interval</td><td>{{ suite.collection_interval_minutes }} minutes</td><td>Duration of event log collection per scenario</td></tr>
       <tr><td>Post-replay settle</td><td>{{ suite.post_replay_settle_seconds }} seconds</td><td>Wait time after log replay before collecting events</td></tr>
+      <tr><td>Analysis settle window</td><td>{{ suite.analysis_settle_minutes }} minutes</td><td>Initial replay period excluded from reported similarity analysis</td></tr>
+      {% if suite.analysis_start_time %}
+      <tr><td>Manual analysis start time</td><td>{{ suite.analysis_start_time }}</td><td>Clock time used to clip TOD scenarios before similarity analysis</td></tr>
+      {% endif %}
       {% if suite.comparison_thresholds %}
       <tr><td>Sequence DTW threshold</td><td>{{ suite.comparison_thresholds.sequence_threshold }}</td><td>Max normalised DTW distance for event-sequence similarity</td></tr>
       <tr><td>Timing DTW threshold</td><td>{{ suite.comparison_thresholds.timing_threshold }}</td><td>Max normalised DTW distance for timing similarity</td></tr>
       <tr><td>Match threshold</td><td>{{ suite.comparison_thresholds.match_threshold }}%</td><td>Minimum DTW match percentage to pass a scenario</td></tr>
       {% endif %}
+      <tr><td>Phase-call similarity threshold</td><td>{{ phase_call_similarity_threshold }}%</td><td>Vehicular phase-call input similarity below this value excludes a chunk from the device-level match average while leaving the chunk bar visible as a reliability sanity check</td></tr>
       </tbody>
     </table>
   </div>
@@ -400,8 +531,10 @@ def generate_report(
     total_pass = similarity_pass + conflict_pass
     total_count = len(results)
 
-    match_values = [r.match_percentage for r in similarity if r.match_percentage is not None]
+    match_values = [r.match_percentage for r in similarity if r.match_percentage is not None and not getattr(r, "thrown_out", False)]
     avg_match = sum(match_values) / len(match_values) if match_values else 0.0
+    phase_call_similarity_threshold = float(getattr(suite, "phase_call_similarity_threshold", getattr(suite, "detector_similarity_threshold", 90.0)))
+    combined_phase_call_timeline_svg = _build_combined_phase_call_timeline(results, phase_call_similarity_threshold)
 
     # Keep input order for both summary table and detail section
     # (caller is expected to pre-sort by scenario name or suite order)
@@ -423,6 +556,7 @@ def generate_report(
                 "test_type": row.test_type.value,
                 "passed": row.passed,
                 "match_percentage": row.match_percentage,
+                "thrown_out": getattr(row, 'thrown_out', False),
                 "num_divergences": row.num_divergences,
                 "runs_completed": row.runs_completed,
                 "total_runs": row.total_runs,
@@ -433,7 +567,12 @@ def generate_report(
                 "annotation": annotations.get(row.scenario_id, ""),
                 "images": encoded_images,
                 "phase_differences": getattr(row, 'phase_differences', []),
+                "operational_differences": getattr(row, 'operational_differences', []),
                 "sparkline_svg": getattr(row, 'sparkline_svg', ''),
+                "phase_call_chunk_scores": getattr(row, 'phase_call_chunk_scores', getattr(row, 'detector_chunk_scores', [])),
+                "included_chunk_count": getattr(row, 'included_chunk_count', 0),
+                "excluded_chunk_count": getattr(row, 'excluded_chunk_count', 0),
+                "timeline_difference_analysis_available": getattr(row, 'timeline_difference_analysis_available', False),
                 "temporal_shift_seconds": getattr(row, 'temporal_shift_seconds', 0.0),
             }
         )
@@ -454,6 +593,8 @@ def generate_report(
         total_pass=total_pass,
         total_count=total_count,
         avg_match=avg_match,
+        phase_call_similarity_threshold=phase_call_similarity_threshold,
+        combined_phase_call_timeline_svg=combined_phase_call_timeline_svg,
         sorted_similarity=sorted_similarity,
         detail_rows=detail_rows,
         version=version,

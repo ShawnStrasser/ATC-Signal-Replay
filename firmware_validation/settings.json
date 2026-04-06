@@ -21,7 +21,9 @@
     "sequence_threshold": 0.05,
     "timing_threshold": 0.02,
     "match_threshold": 95.0,
-    "settle_minutes": 3.0,
+    "phase_call_similarity_threshold": 85.0,
+    "settle_minutes": 10.0,
+    "analysis_start_time": "09:10",
     "group_tolerance": 0.25,
     "max_divergence_plots": 2,
     "divergence_window_minutes": 5.0

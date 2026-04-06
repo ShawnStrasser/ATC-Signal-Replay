@@ -21,7 +21,7 @@ import json
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -292,6 +292,9 @@ def build_suite(
             timing_threshold=comp.get("timing_threshold", 0.02),
             match_threshold=comp.get("match_threshold", 95.0),
         ),
+        phase_call_similarity_threshold=comp.get("phase_call_similarity_threshold", comp.get("detector_similarity_threshold", 90.0)),
+        analysis_settle_minutes=comp.get("settle_minutes", 10.0),
+        analysis_start_time=comp.get("analysis_start_time", ""),
     )
 
     return suite, scenarios, batches, file_map
@@ -451,6 +454,46 @@ def _date_only_shifted_copy(
     return shifted
 
 
+def _parse_analysis_start_time(value: Optional[str]) -> Optional[dt_time]:
+    """Parse a manual HH:MM[:SS] analysis start time from settings."""
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "comparison.analysis_start_time must use HH:MM or HH:MM:SS format"
+    )
+
+
+def _resolve_manual_analysis_start(
+    collected: pd.DataFrame,
+    *,
+    analysis_start_time: Optional[str],
+) -> Optional[pd.Timestamp]:
+    """Resolve the configured TOD analysis start onto the collected run date."""
+    parsed_time = _parse_analysis_start_time(analysis_start_time)
+    if parsed_time is None or collected.empty:
+        return None
+
+    collected_ts_col = _get_timestamp_col(collected)
+    collected_ts = pd.to_datetime(collected[collected_ts_col])
+    collected_date = collected_ts.min().normalize()
+    return collected_date + pd.Timedelta(
+        hours=parsed_time.hour,
+        minutes=parsed_time.minute,
+        seconds=parsed_time.second,
+    )
+
+
 def _prepare_analysis_inputs(
     original: pd.DataFrame,
     collected: pd.DataFrame,
@@ -478,11 +521,21 @@ def _prepare_analysis_inputs(
 
     collected_start = collected_prepared[collected_ts_col].min()
     original_prepared = _date_only_shifted_copy(original_prepared, original_ts_col, collected_start)
-    shared_start = min(
-        original_prepared[original_ts_col].min(),
-        collected_prepared[collected_ts_col].min(),
-    ).to_pydatetime()
+    shared_start = original_prepared[original_ts_col].min().to_pydatetime()
     return original_prepared, collected_prepared, shared_start, shared_start
+
+
+def _trim_to_analysis_start(
+    df: pd.DataFrame,
+    analysis_start: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    """Trim a raw events DataFrame to events at or after the analysis start."""
+    if analysis_start is None or df.empty:
+        return df
+    ts_col = _get_timestamp_col(df)
+    trimmed = df.copy()
+    trimmed[ts_col] = pd.to_datetime(trimmed[ts_col])
+    return trimmed[trimmed[ts_col] >= analysis_start].reset_index(drop=True)
 
 
 def _compute_export_shift(
@@ -527,7 +580,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
     """
     (scenario_id, events_source, test_type_str, collected_parquet,
      firmware_version, plots_dir_str, settle_minutes, group_tolerance,
-     max_plots, window_minutes, verbose, notes_column, tod_align) = args
+      max_plots, window_minutes, verbose, notes_column, tod_align,
+          analysis_start_time, phase_call_threshold) = args
 
     import signal_replay as sr
     import pandas as pd
@@ -543,14 +597,34 @@ def _compare_one_scenario(args: Tuple) -> dict:
         tod_align=tod_align,
     )
 
+    sparkline_base_timestamp: Optional[datetime] = None
+    compare_settle_minutes = settle_minutes
+    manual_analysis_start: Optional[pd.Timestamp] = None
+    if tod_align:
+        manual_analysis_start = _resolve_manual_analysis_start(
+            collected_for_analysis,
+            analysis_start_time=analysis_start_time,
+        )
+        if manual_analysis_start is not None:
+            analysis_start = manual_analysis_start
+            original_for_analysis = _trim_to_analysis_start(original_for_analysis, analysis_start)
+            collected_for_analysis = _trim_to_analysis_start(collected_for_analysis, analysis_start)
+            start_time_a = analysis_start.to_pydatetime()
+            start_time_b = analysis_start.to_pydatetime()
+            sparkline_base_timestamp = analysis_start.to_pydatetime()
+            compare_settle_minutes = 0.0
+        else:
+            sparkline_base_timestamp = start_time_a
+
     result = sr.compare_runs(
         events_a=original_for_analysis, events_b=collected_for_analysis,
         device_id=scenario_id,
         run_a_label="original_logs", run_b_label=firmware_version,
         start_time_a=start_time_a,
         start_time_b=start_time_b,
-        auto_align=not tod_align, settle_minutes=settle_minutes,
+        auto_align=not tod_align, settle_minutes=compare_settle_minutes,
         group_tolerance=group_tolerance,
+        phase_call_threshold=phase_call_threshold,
     )
 
     plot_paths: list = []
@@ -596,15 +670,16 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 import traceback as _tb
                 _tb.print_exc()
 
-    passed = result.match_percentage >= 95.0
+    passed = (not result.thrown_out) and result.match_percentage >= 95.0
     phase_diffs: list = []
-    if not passed and timeline_a is not None and not timeline_a.empty and not timeline_b.empty:
+    operational_diffs: list = []
+    timeline_difference_analysis_available = False
+    if test_type == sr.TestType.SIMILARITY and timeline_a is not None and not timeline_a.empty and not timeline_b.empty:
         try:
-            settle_td = pd.Timedelta(minutes=settle_minutes)
+            settle_td = pd.Timedelta(minutes=compare_settle_minutes)
             if tod_align:
-                common_start = min(timeline_a["StartTime"].min(), timeline_b["StartTime"].min())
-                tl_a_settled = timeline_a[timeline_a["StartTime"] >= common_start + settle_td].copy()
-                tl_b_settled = timeline_b[timeline_b["StartTime"] >= common_start + settle_td].copy()
+                tl_a_settled = timeline_a.copy()
+                tl_b_settled = timeline_b.copy()
             else:
                 # The two timelines come from different absolute dates (original vs.
                 # collected replay). We need to align them by relative time from
@@ -636,6 +711,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
                       f"tl_b={len(tl_b_settled)} ({len(sig_b)} signal), overlap_end={overlap_end}", flush=True)
 
             phase_diffs = sr.generate_phase_difference_summary(tl_a_settled, tl_b_settled, tolerance_seconds=0.2)
+            operational_diffs = sr.generate_operational_difference_summary(tl_a_settled, tl_b_settled, tolerance_seconds=0.2)
+            timeline_difference_analysis_available = True
         except Exception as e:
             if verbose:
                 print(f"    Phase breakdown failed for {scenario_id}: {e}", flush=True)
@@ -667,6 +744,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
         "summary": "\n".join(truncated_lines),
         "plot_paths": plot_paths,
         "phase_diffs": phase_diffs,
+        "operational_diffs": operational_diffs,
+        "timeline_difference_analysis_available": timeline_difference_analysis_available,
         "notes_column": notes_column,
         "chunk_scores": [
             {"center_seconds": c.center_seconds,
@@ -674,10 +753,24 @@ def _compare_one_scenario(args: Tuple) -> dict:
              "window_seconds": c.window_seconds}
             for c in result.chunk_scores
         ],
+        "phase_call_chunk_scores": [
+            {"center_seconds": c.center_seconds,
+             "window_seconds": c.window_seconds,
+             "similarity_percentage": c.similarity_percentage,
+             "has_activity": c.has_activity,
+             "excluded_from_match": c.excluded_from_match}
+            for c in result.phase_call_chunk_scores
+        ],
+        "included_chunk_count": result.included_chunk_count,
+        "excluded_chunk_count": result.excluded_chunk_count,
+        "thrown_out": result.thrown_out,
         "temporal_shift_seconds": result.temporal_shift_seconds,
         "sparkline_svg": sr.render_sparkline_svg(
             result.chunk_scores,
             pass_threshold=95.0,
+            base_timestamp=sparkline_base_timestamp,
+            phase_call_chunk_scores=result.phase_call_chunk_scores,
+            phase_call_threshold=phase_call_threshold,
         ) if result.chunk_scores else "",
     }
 
@@ -702,6 +795,12 @@ def _export_device_csvs(
     for scenario in suite.scenarios:
         collected_parquet = extracted_map.get(scenario.scenario_id)
         if not collected_parquet:
+            continue
+        if not Path(collected_parquet).exists():
+            log(
+                f"WARNING: Missing collected parquet for {scenario.scenario_id}; "
+                "skipping device CSV export for this scenario."
+            )
             continue
 
         original = sr.load_events(scenario.events_source)
@@ -768,10 +867,11 @@ def run_analysis(
 
     firmware_version = suite.firmware_version
     comp = settings.get("comparison", {})
-    settle_minutes = comp.get("settle_minutes", 3.0)
+    settle_minutes = comp.get("settle_minutes", 10.0)
     group_tolerance = comp.get("group_tolerance", 0.0)
     max_plots = comp.get("max_divergence_plots", 3)
     window_minutes = comp.get("divergence_window_minutes", 5.0)
+    phase_call_threshold = comp.get("phase_call_similarity_threshold", comp.get("detector_similarity_threshold", 90.0))
     max_workers = settings.get("analysis_workers", 4)
 
     # Load checkpoint
@@ -799,11 +899,15 @@ def run_analysis(
     log("Exporting per-device CSV files...")
     _export_device_csvs(suite, extracted_map, group_tolerance=group_tolerance)
 
+    analysis_start_time = comp.get("analysis_start_time")
+    if analysis_start_time:
+        log(f"TOD manual analysis start time: {analysis_start_time}")
+
     # Build job list — all plain types for pickling (no DuckDB paths)
     jobs: list = []
     for scenario in suite.scenarios:
         collected_parquet = extracted_map.get(scenario.scenario_id)
-        if not collected_parquet:
+        if not collected_parquet or not Path(collected_parquet).exists():
             log(f"  No output for {scenario.scenario_id}, skipping")
             continue
         test_type_str = "CONFLICT" if scenario.test_type == sr.TestType.CONFLICT else "SIMILARITY"
@@ -821,6 +925,8 @@ def run_analysis(
             _VERBOSE,
             scenario.notes_column,
             scenario.tod_align,
+            analysis_start_time,
+            phase_call_threshold,
         ))
 
     if not jobs:
@@ -858,19 +964,30 @@ def run_analysis(
                         notes_column=out.get("notes_column", ""),
                         plot_paths=out["plot_paths"],
                         phase_differences=out["phase_diffs"],
+                        operational_differences=out.get("operational_diffs", []),
                         runs_completed=1,
                         total_runs=1,
                         chunk_scores=out.get("chunk_scores", []),
+                        phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
+                        included_chunk_count=out.get("included_chunk_count", 0),
+                        excluded_chunk_count=out.get("excluded_chunk_count", 0),
+                        thrown_out=out.get("thrown_out", False),
+                        timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
                         sparkline_svg=out.get("sparkline_svg", ""),
                         temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
                     ))
-                    status = "PASS" if out["passed"] else "FAIL"
+                    status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
                     plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
                     diffs_msg = ""
                     if out["phase_diffs"]:
                         diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
                         diffs_msg += sr.format_phase_differences(
                             out["phase_diffs"], label_a="Original", label_b=firmware_version
+                        )
+                    if out.get("operational_diffs"):
+                        diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
+                        diffs_msg += sr.format_phase_differences(
+                            out["operational_diffs"], label_a="Original", label_b=firmware_version
                         )
                     log(f"  [{done}/{len(jobs)}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
                 except Exception as e:
@@ -960,6 +1077,12 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     parser.add_argument("--report-only", action="store_true", help="Skip replay, just run analysis + report")
     parser.add_argument("--archive", action="store_true", help="Archive logs and extract new baseline after report")
+    parser.add_argument(
+        "--settle-minutes",
+        type=float,
+        default=None,
+        help="Override the initial minutes excluded from similarity analysis/reporting",
+    )
     parser.add_argument("--dev", action="store_true", help="Dev mode: only run 3 test devices for fast iteration")
     parser.add_argument("--test", "-t", action="store_true",
                         help="Test mode: shift all event timestamps to start ~1 min from now")
@@ -969,17 +1092,27 @@ def main() -> None:
     _TEST_FIRST_SEND_TIMES = {}
     _TEST_ORIGINAL_SOURCES = {}
 
-    # Resolve paths relative to this script's directory
-    firmware_dir = Path(__file__).resolve().parent
+    # Preserve the invoked workspace path on Windows rather than resolving a
+    # mapped drive into its UNC share, which can break temp parquet access.
+    firmware_dir = Path(__file__).parent
     settings_path = firmware_dir / args.settings
     if not settings_path.exists():
         print(f"ERROR: Settings file not found: {settings_path}", file=sys.stderr)
         sys.exit(1)
 
     settings = load_settings(settings_path)
+    if args.settle_minutes is not None:
+        settings.setdefault("comparison", {})["settle_minutes"] = args.settle_minutes
     log(f"signal_replay version: {sr.__version__}")
     log(f"Firmware dir:  {firmware_dir}")
     log(f"Settings:      {settings_path}")
+    log(
+        f"Analysis settle window: {settings.get('comparison', {}).get('settle_minutes', 10.0)} minutes"
+    )
+    if settings.get("comparison", {}).get("analysis_start_time"):
+        log(
+            f"TOD manual analysis start time: {settings['comparison']['analysis_start_time']}"
+        )
 
     # --- Read catalog ---
     catalog_path = firmware_dir / settings["catalog_file"]

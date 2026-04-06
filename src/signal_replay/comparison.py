@@ -44,6 +44,7 @@ COMPARISON_EVENT_IDS = [
     61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
     105, 106, 107, 111, 112, 113, 114, 115, 118, 119
 ]
+PHASE_CALL_EVENT_IDS = [43, 44]
 # NOTE: Events 8 (Yellow Start) and 10 (Red Clear Start) removed — they always
 # co-occur at the same timestamp as 7 (Green End) and 9 (Yellow End) respectively,
 # so they dilute Jaccard distance without adding information.
@@ -130,6 +131,16 @@ class ChunkScore:
 
 
 @dataclass
+class PhaseCallChunkScore:
+    """Reliability score for vehicular phase-call input in a rolling chunk."""
+    center_seconds: float
+    window_seconds: float
+    similarity_percentage: Optional[float]
+    has_activity: bool = False
+    excluded_from_match: bool = False
+
+
+@dataclass
 class ComparisonResult:
     """Complete comparison result between two runs."""
     device_id: str
@@ -154,13 +165,30 @@ class ComparisonResult:
     alignment_trim_seconds_b: float = 0.0
     # Rolling chunk scores for time-localised diagnostics
     chunk_scores: List[ChunkScore] = field(default_factory=list)
+    # Reliability of the observed vehicular phase-call inputs by chunk
+    phase_call_chunk_scores: List[PhaseCallChunkScore] = field(default_factory=list)
+    included_chunk_count: int = 0
+    excluded_chunk_count: int = 0
+    thrown_out: bool = False
     # Temporal shift applied during alignment (seconds added to B's time_delta)
     temporal_shift_seconds: float = 0.0
+
+    @property
+    def detector_chunk_scores(self) -> List[PhaseCallChunkScore]:
+        return self.phase_call_chunk_scores
+
+    @detector_chunk_scores.setter
+    def detector_chunk_scores(self, value: List[PhaseCallChunkScore]) -> None:
+        self.phase_call_chunk_scores = value
     
     def format_summary(self) -> str:
         """Return a human-readable summary of the comparison."""
         lines = []
-        lines.append(f"Match: {self.match_percentage:.1f}%")
+        if self.thrown_out:
+            lines.append("Match: thrown out")
+            lines.append("Input similarity excluded every scored chunk for this device.")
+        else:
+            lines.append(f"Match: {self.match_percentage:.1f}%")
         
         if self.divergence_windows:
             lines.append(f"Divergences: {len(self.divergence_windows)}")
@@ -235,6 +263,7 @@ def prepare_events_for_comparison(
         df = df[df['event_id'].isin(event_ids)].copy()
     
     if df.empty:
+        df['time_delta'] = pd.Series(dtype=float)
         return df
     
     # Ensure timestamp is datetime
@@ -1384,12 +1413,174 @@ def _rolling_chunk_dtw(
     return scores
 
 
+def _score_phase_call_window(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    start_seconds: float,
+    end_seconds: float,
+    group_tolerance: float,
+    clip_sec: float,
+    minimum_groups: int = 2,
+) -> Tuple[Optional[float], bool]:
+    """Return an input-similarity score for vehicular phase calls in one chunk."""
+    ca = df_a[(df_a['time_delta'] >= start_seconds) & (df_a['time_delta'] < end_seconds)].copy()
+    cb = df_b[(df_b['time_delta'] >= start_seconds) & (df_b['time_delta'] < end_seconds)].copy()
+
+    if ca.empty and cb.empty:
+        return None, False
+
+    has_activity = not ca.empty or not cb.empty
+
+    if ca.empty or cb.empty:
+        active_side = cb if ca.empty else ca
+        active_groups = _group_events_by_timestamp(active_side, tolerance=group_tolerance)
+        if len(active_groups) >= minimum_groups:
+            return 0.0, True
+        return None, has_activity
+
+    ca['time_delta'] = ca['time_delta'] - start_seconds
+    cb['time_delta'] = cb['time_delta'] - start_seconds
+
+    ga = _group_events_by_timestamp(ca, tolerance=group_tolerance)
+    gb = _group_events_by_timestamp(cb, tolerance=group_tolerance)
+
+    if len(ga) < minimum_groups or len(gb) < minimum_groups:
+        return None, has_activity
+
+    dtw_r, match_pct, dist_m = _dtw_with_jaccard(ga, gb)
+    window_sec = end_seconds - start_seconds
+
+    if clip_sec > 0 and dtw_r.warping_path:
+        interior_matches = 0
+        interior_total = 0
+        for i, j in dtw_r.warping_path:
+            t_a = ga[i][0]
+            t_b = gb[j][0]
+            if (t_a >= clip_sec and t_a <= (window_sec - clip_sec)
+                    and t_b >= clip_sec and t_b <= (window_sec - clip_sec)):
+                interior_total += 1
+                if dist_m[i, j] == 0.0:
+                    interior_matches += 1
+        if interior_total > 0:
+            match_pct = interior_matches / interior_total * 100
+
+    return match_pct, has_activity
+
+
+def _compute_phase_call_chunk_scores(
+    chunk_scores: List[ChunkScore],
+    events_a: pd.DataFrame,
+    events_b: pd.DataFrame,
+    start_time_a: Optional[datetime],
+    start_time_b: Optional[datetime],
+    temporal_shift_seconds: float,
+    trim_seconds_a: float,
+    trim_seconds_b: float,
+    group_tolerance: float,
+    threshold: float,
+    clip_sec: float = 60.0,
+) -> List[PhaseCallChunkScore]:
+    """Score vehicular phase-call similarity on the same rolling chunk grid."""
+    if not chunk_scores:
+        return []
+
+    phase_df_a = prepare_events_for_comparison(events_a, start_time_a, event_ids=PHASE_CALL_EVENT_IDS)
+    phase_df_b = prepare_events_for_comparison(events_b, start_time_b, event_ids=PHASE_CALL_EVENT_IDS)
+
+    if phase_df_a.empty and phase_df_b.empty:
+        return [
+            PhaseCallChunkScore(
+                center_seconds=chunk.center_seconds,
+                window_seconds=chunk.window_seconds,
+                similarity_percentage=None,
+                has_activity=False,
+                excluded_from_match=False,
+            )
+            for chunk in chunk_scores
+        ]
+
+    if abs(temporal_shift_seconds) > 0.05 and not phase_df_b.empty:
+        phase_df_b = phase_df_b.copy()
+        phase_df_b['time_delta'] = phase_df_b['time_delta'] + temporal_shift_seconds
+        phase_df_b = phase_df_b[phase_df_b['time_delta'] >= 0].reset_index(drop=True)
+
+    if trim_seconds_a > 0 and not phase_df_a.empty:
+        phase_df_a = phase_df_a[phase_df_a['time_delta'] >= trim_seconds_a].copy()
+        phase_df_a['time_delta'] = phase_df_a['time_delta'] - trim_seconds_a
+
+    if trim_seconds_b > 0 and not phase_df_b.empty:
+        phase_df_b = phase_df_b[phase_df_b['time_delta'] >= trim_seconds_b].copy()
+        phase_df_b['time_delta'] = phase_df_b['time_delta'] - trim_seconds_b
+
+    scores: List[PhaseCallChunkScore] = []
+    for chunk in chunk_scores:
+        half_window = chunk.window_seconds / 2.0
+        start_seconds = max(0.0, chunk.center_seconds - half_window)
+        end_seconds = chunk.center_seconds + half_window
+        similarity_percentage, has_activity = _score_phase_call_window(
+            phase_df_a,
+            phase_df_b,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            group_tolerance=group_tolerance,
+            clip_sec=clip_sec,
+        )
+        scores.append(
+            PhaseCallChunkScore(
+                center_seconds=chunk.center_seconds,
+                window_seconds=chunk.window_seconds,
+                similarity_percentage=similarity_percentage,
+                has_activity=has_activity,
+                excluded_from_match=(
+                    similarity_percentage is not None
+                    and similarity_percentage < threshold
+                ),
+            )
+        )
+
+    return scores
+
+
+def _apply_phase_call_chunk_filter(
+    chunk_scores: List[ChunkScore],
+    phase_call_chunk_scores: List[PhaseCallChunkScore],
+) -> Tuple[float, int, int]:
+    """Average only chunks that are not flagged by the input-similarity sanity check."""
+    if not chunk_scores:
+        return 0.0, 0, 0
+
+    if not phase_call_chunk_scores or len(phase_call_chunk_scores) != len(chunk_scores):
+        return (
+            sum(chunk.match_percentage for chunk in chunk_scores) / len(chunk_scores),
+            len(chunk_scores),
+            0,
+        )
+
+    included_values: List[float] = []
+    excluded_count = 0
+    for chunk, phase_chunk in zip(chunk_scores, phase_call_chunk_scores):
+        if phase_chunk.excluded_from_match:
+            excluded_count += 1
+            continue
+        included_values.append(chunk.match_percentage)
+
+    if not included_values:
+        return 0.0, 0, excluded_count
+
+    return sum(included_values) / len(included_values), len(included_values), excluded_count
+
+
 def render_sparkline_svg(
     chunk_scores: List[ChunkScore],
     width: int = 1400,
     height: int = 220,
     pass_threshold: float = 95.0,
     warn_threshold: float = 85.0,
+    base_timestamp: Optional[datetime] = None,
+    phase_call_chunk_scores: Optional[List[PhaseCallChunkScore]] = None,
+    phase_call_threshold: float = 90.0,
+    auto_scale_y: bool = False,
+    show_exclusion_legend: bool = True,
 ) -> str:
     """
     Render an inline SVG sparkline showing match percentage over time.
@@ -1411,18 +1602,54 @@ def render_sparkline_svg(
     Returns:
         Self-contained SVG string suitable for embedding in HTML.
     """
-    if not chunk_scores:
+    if not chunk_scores and not phase_call_chunk_scores:
         return ""
 
     n = len(chunk_scores)
     margin_left = 64    # space for Y-axis labels
     margin_bottom = 34  # space for X-axis labels
-    margin_top = 14
+    margin_top = 34
     margin_right = 18
     plot_w = width - margin_left - margin_right
     plot_h = height - margin_bottom - margin_top
-    bar_w = max(1.0, plot_w / n)
-    y_min, y_max = 0.0, 100.0  # Full 0-100% range
+    bar_w = max(1.0, plot_w / max(n, 1))
+    domain_candidates = list(chunk_scores) + list(phase_call_chunk_scores or [])
+    domain_start = max(0.0, min(cs.center_seconds - (cs.window_seconds / 2.0) for cs in domain_candidates))
+    domain_end = max(domain_start + 1.0, max(cs.center_seconds + (cs.window_seconds / 2.0) for cs in domain_candidates))
+    domain_span = domain_end - domain_start
+
+    y_values: List[float] = [chunk.match_percentage for chunk in chunk_scores]
+    y_values.extend(
+        score.similarity_percentage
+        for score in (phase_call_chunk_scores or [])
+        if score.similarity_percentage is not None
+    )
+    if auto_scale_y and y_values:
+        raw_min = min(y_values)
+        raw_max = max(y_values)
+        pad = max(2.0, (raw_max - raw_min) * 0.12)
+        if raw_max - raw_min < 4.0:
+            center = (raw_min + raw_max) / 2.0
+            y_min = max(0.0, center - 3.0)
+            y_max = min(100.0, center + 3.0)
+        else:
+            y_min = max(0.0, raw_min - pad)
+            y_max = min(100.0, raw_max + pad)
+    else:
+        y_min, y_max = 0.0, 100.0
+    if y_max <= y_min:
+        y_max = min(100.0, y_min + 1.0)
+
+    def _choose_label_step_seconds(span_seconds: float, target_labels: int) -> int:
+        nice_steps = [
+            60, 120, 300, 600, 900, 1200, 1800,
+            3600, 7200, 10800, 14400,
+        ]
+        raw_step = max(60.0, span_seconds / max(target_labels, 1))
+        for step in nice_steps:
+            if step >= raw_step:
+                return step
+        return nice_steps[-1]
 
     def _y(pct: float) -> float:
         clamped = max(y_min, min(pct, y_max))
@@ -1435,25 +1662,129 @@ def render_sparkline_svg(
             return "#e8710a"
         return "#c5221f"
 
+    def _format_relative_hhmm(total_seconds: float) -> str:
+        total_minutes = max(0, int(round(total_seconds / 60.0)))
+        hours, minutes = divmod(total_minutes, 60)
+        return f'{hours:02d}:{minutes:02d}'
+
+    phase_lookup = {
+        (round(cs.center_seconds, 6), round(cs.window_seconds, 6)): cs
+        for cs in (phase_call_chunk_scores or [])
+    }
+
     bars = []
     for i, cs in enumerate(chunk_scores):
         x = margin_left + i * bar_w
         pct = cs.match_percentage
         y = _y(pct)
         h = _y(y_min) - y  # bar height from bottom of plot
+        window_start_seconds = max(domain_start, cs.center_seconds - (cs.window_seconds / 2.0))
+        window_end_seconds = min(domain_end, cs.center_seconds + (cs.window_seconds / 2.0))
+        phase_chunk = phase_lookup.get((round(cs.center_seconds, 6), round(cs.window_seconds, 6)))
+        phase_text = "Phase-call similarity: n/a"
+        opacity = "0.85"
+        if phase_chunk is not None:
+            if phase_chunk.similarity_percentage is not None:
+                phase_text = f'Phase-call similarity: {phase_chunk.similarity_percentage:.1f}%'
+            elif phase_chunk.has_activity:
+                phase_text = 'Phase-call similarity: insufficient activity'
+            if phase_chunk.excluded_from_match:
+                opacity = "0.42"
+        if base_timestamp is not None:
+            tooltip_start = base_timestamp + timedelta(seconds=window_start_seconds)
+            tooltip_end = base_timestamp + timedelta(seconds=window_end_seconds)
+            tooltip_label = (
+                f'{tooltip_start.strftime("%Y-%m-%d %H:%M:%S")} to '
+                f'{tooltip_end.strftime("%H:%M:%S")}'
+            )
+        else:
+            tooltip_label = (
+                f'{_format_relative_hhmm(window_start_seconds)} to '
+                f'{_format_relative_hhmm(window_end_seconds)}'
+            )
         bars.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" '
-            f'height="{h:.1f}" fill="{_color(pct)}" opacity="0.85">'
-            f'<title>{cs.center_seconds / 3600:.1f}h: {pct:.1f}%</title></rect>'
+            f'height="{h:.1f}" fill="{_color(pct)}" opacity="{opacity}">'
+            f'<title>{tooltip_label}: Match {pct:.1f}% | {phase_text}</title></rect>'
         )
 
-    # Reference dashed line at 100% (top)
-    ref_y_100 = _y(100.0)
-    ref_100 = (
-        f'<line x1="{margin_left}" y1="{ref_y_100:.1f}" '
-        f'x2="{width - margin_right}" y2="{ref_y_100:.1f}" '
-        f'stroke="#bbb" stroke-width="0.5" stroke-dasharray="3,2" />'
-    )
+    phase_segments = []
+    phase_points = []
+    current_segment = []
+    for phase_chunk in phase_call_chunk_scores or []:
+        similarity = phase_chunk.similarity_percentage
+        if similarity is None:
+            if current_segment:
+                phase_segments.append(current_segment)
+                current_segment = []
+            continue
+        frac = max(0.0, min(1.0, (phase_chunk.center_seconds - domain_start) / domain_span))
+        x = margin_left + frac * plot_w
+        y = _y(similarity)
+        current_segment.append((x, y, phase_chunk))
+
+    if current_segment:
+        phase_segments.append(current_segment)
+
+    phase_lines_svg = []
+    for segment in phase_segments:
+        if len(segment) >= 2:
+            points_attr = " ".join(f"{x:.1f},{y:.1f}" for x, y, _ in segment)
+            phase_lines_svg.append(
+                f'<polyline points="{points_attr}" fill="none" stroke="#000" stroke-width="1.2" />'
+            )
+        for x, y, phase_chunk in segment:
+            window_start_seconds = max(domain_start, phase_chunk.center_seconds - (phase_chunk.window_seconds / 2.0))
+            window_end_seconds = min(domain_end, phase_chunk.center_seconds + (phase_chunk.window_seconds / 2.0))
+            if base_timestamp is not None:
+                tooltip_start = base_timestamp + timedelta(seconds=window_start_seconds)
+                tooltip_end = base_timestamp + timedelta(seconds=window_end_seconds)
+                tooltip_label = (
+                    f'{tooltip_start.strftime("%Y-%m-%d %H:%M:%S")} to '
+                    f'{tooltip_end.strftime("%H:%M:%S")}'
+                )
+            else:
+                tooltip_label = (
+                    f'{_format_relative_hhmm(window_start_seconds)} to '
+                    f'{_format_relative_hhmm(window_end_seconds)}'
+                )
+            phase_points.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.4" fill="#000">'
+                f'<title>{tooltip_label}: Phase-call similarity {phase_chunk.similarity_percentage:.1f}%</title></circle>'
+            )
+
+    legend_items = []
+    if chunk_scores:
+        legend_items.append(
+            '<rect x="0" y="0" width="12" height="12" fill="#1b8a2e" opacity="0.85" />'
+            '<text x="18" y="10" font-size="12" fill="#1f1f1f" font-family="sans-serif">Match % by chunk</text>'
+        )
+    if phase_call_chunk_scores:
+        legend_items.append(
+            '<line x1="0" y1="6" x2="12" y2="6" stroke="#000" stroke-width="1.2" />'
+            '<circle cx="6" cy="6" r="2.6" fill="#000" />'
+            '<text x="18" y="10" font-size="12" fill="#1f1f1f" font-family="sans-serif">Phase-call similarity</text>'
+        )
+        if show_exclusion_legend:
+            legend_items.append(
+                f'<rect x="0" y="0" width="12" height="12" fill="#80868b" opacity="0.42" />'
+                f'<text x="18" y="10" font-size="12" fill="#1f1f1f" font-family="sans-serif">Excluded from match average (&lt; {phase_call_threshold:.0f}%)</text>'
+            )
+
+    legend_svg = []
+    for idx, item in enumerate(legend_items):
+        legend_svg.append(
+            f'<g transform="translate({margin_left + 10 + (idx * 240):.1f},{12})">{item}</g>'
+        )
+
+    ref_100 = ""
+    if not auto_scale_y:
+        ref_y_100 = _y(100.0)
+        ref_100 = (
+            f'<line x1="{margin_left}" y1="{ref_y_100:.1f}" '
+            f'x2="{width - margin_right}" y2="{ref_y_100:.1f}" '
+            f'stroke="#bbb" stroke-width="0.5" stroke-dasharray="3,2" />'
+        )
 
     # Plot area background
     bg = (
@@ -1463,12 +1794,14 @@ def render_sparkline_svg(
 
     # Y-axis labels and grid lines
     y_labels_svg = []
-    for pct_val in [0, 25, 50, 75, 100]:
+    y_ticks = np.linspace(y_min, y_max, 5) if auto_scale_y else [0, 25, 50, 75, 100]
+    for pct_val in y_ticks:
         yp = _y(float(pct_val))
+        label_text = f"{pct_val:.1f}%" if auto_scale_y else f"{int(pct_val)}%"
         y_labels_svg.append(
             f'<text x="{margin_left - 3}" y="{yp + 3:.1f}" '
             f'font-size="12" fill="#5f6368" font-family="sans-serif" '
-            f'text-anchor="end">{pct_val}%</text>'
+            f'text-anchor="end">{label_text}</text>'
         )
         y_labels_svg.append(
             f'<line x1="{margin_left}" y1="{yp:.1f}" '
@@ -1476,39 +1809,61 @@ def render_sparkline_svg(
             f'stroke="#e0e0e0" stroke-width="0.3" />'
         )
 
-    # X-axis labels in HH:MM format at clean minute intervals
+    # X-axis labels use clean clock boundaries and always show the analysis bounds.
     x_labels_svg = []
-    if chunk_scores:
-        first_sec = chunk_scores[0].center_seconds
-        last_sec = chunk_scores[-1].center_seconds
-        span_sec = last_sec - first_sec
-        if span_sec > 0:
-            # Pick a clean minute-based interval: 1, 5, 10, 30, 60, 120, 300, 600 min
-            target_labels = 6
-            raw_step_min = (span_sec / 60) / target_labels
-            minute_steps = [1, 5, 10, 30, 60, 120, 300, 600]
-            step_min = minute_steps[0]
-            for ms in minute_steps:
-                if ms >= raw_step_min:
-                    step_min = ms
-                    break
-            else:
-                step_min = minute_steps[-1]
-            step_s = step_min * 60
-            # Start at the first clean multiple of step_s at or after first_sec
-            first_label = (int(first_sec) // step_s + 1) * step_s
-            label_secs = list(range(first_label, int(last_sec) + 1, step_s))
-            for ls in label_secs:
-                frac = (ls - first_sec) / span_sec
-                xp = margin_left + frac * plot_w
-                y_label = margin_top + plot_h + 14
-                h_val, rem = divmod(int(ls), 3600)
+    if domain_candidates:
+        target_labels = max(4, min(10, int(plot_w // 125)))
+        step_s = _choose_label_step_seconds(domain_span, target_labels)
+        y_label = margin_top + plot_h + 14
+
+        if base_timestamp is not None:
+            domain_start_ts = base_timestamp + timedelta(seconds=domain_start)
+            domain_end_ts = base_timestamp + timedelta(seconds=domain_end)
+            label_points = [(domain_start, domain_start_ts.strftime('%H:%M'))]
+
+            first_aligned_ts = domain_start_ts.replace(second=0, microsecond=0)
+            rounded_seconds = int(first_aligned_ts.timestamp())
+            first_aligned_seconds = ((rounded_seconds + step_s - 1) // step_s) * step_s
+            label_ts = datetime.fromtimestamp(first_aligned_seconds)
+            while label_ts < domain_end_ts:
+                offset_seconds = (label_ts - domain_start_ts).total_seconds()
+                if offset_seconds > 0:
+                    label_points.append((domain_start + offset_seconds, label_ts.strftime('%H:%M')))
+                label_ts += timedelta(seconds=step_s)
+
+            if label_points[-1][0] < domain_span:
+                label_points.append((domain_span, domain_end_ts.strftime('%H:%M')))
+        else:
+            label_points = [(0.0, '00:00')]
+            first_aligned = ((int(domain_start) + step_s - 1) // step_s) * step_s
+            for label_sec in range(first_aligned, int(domain_end), step_s):
+                offset = label_sec - domain_start
+                if offset > 0:
+                    h_val, rem = divmod(int(label_sec), 3600)
+                    m_val = rem // 60
+                    label_points.append((offset, f'{h_val:02d}:{m_val:02d}'))
+            if label_points[-1][0] < domain_span:
+                h_val, rem = divmod(int(domain_end), 3600)
                 m_val = rem // 60
-                x_labels_svg.append(
-                    f'<text x="{xp:.1f}" y="{y_label}" '
-                    f'font-size="12" fill="#5f6368" font-family="sans-serif" '
-                    f'text-anchor="middle">{h_val:02d}:{m_val:02d}</text>'
-                )
+                label_points.append((domain_span, f'{h_val:02d}:{m_val:02d}'))
+
+        deduped_points = []
+        seen_labels = set()
+        for offset_seconds, label_text in label_points:
+            key = (round(offset_seconds, 1), label_text)
+            if key in seen_labels:
+                continue
+            seen_labels.add(key)
+            deduped_points.append((offset_seconds, label_text))
+
+        for offset_seconds, label_text in deduped_points:
+            frac = max(0.0, min(1.0, offset_seconds / domain_span))
+            xp = margin_left + frac * plot_w
+            x_labels_svg.append(
+                f'<text x="{xp:.1f}" y="{y_label}" '
+                f'font-size="12" fill="#5f6368" font-family="sans-serif" '
+                f'text-anchor="middle">{label_text}</text>'
+            )
 
     # Axes lines (L-shape: left + bottom)
     axes = (
@@ -1527,9 +1882,20 @@ def render_sparkline_svg(
         f'preserveAspectRatio="xMidYMid meet" '
         f'style="display:block;width:100%;height:auto;vertical-align:middle;">'
         f'{bg}{"".join(y_labels_svg)}{"".join(bars)}'
-        f'{ref_100}{axes}{"".join(x_labels_svg)}</svg>'
+        f'{"".join(phase_lines_svg)}{"".join(phase_points)}'
+        f'{ref_100}{axes}{"".join(x_labels_svg)}{"".join(legend_svg)}</svg>'
     )
     return svg
+
+
+def _filter_chunk_scores_after_settle(
+    chunk_scores: List[ChunkScore],
+    settle_seconds: float,
+) -> List[ChunkScore]:
+    """Return only chunk scores whose centers are at or after the settle window."""
+    if settle_seconds <= 0:
+        return list(chunk_scores)
+    return [chunk for chunk in chunk_scores if chunk.center_seconds >= settle_seconds]
 
 
 def compare_runs(
@@ -1545,6 +1911,7 @@ def compare_runs(
     trim_edges_minutes: float = 0.0,
     settle_minutes: float = 0.0,
     group_tolerance: float = 0.0,
+    phase_call_threshold: float = 90.0,
 ) -> ComparisonResult:
     """
     Compare two runs using group-level DTW on event sequences and timing.
@@ -1679,6 +2046,10 @@ def compare_runs(
             divergence_windows=[],
             match_percentage=0.0,
             chunk_scores=[],
+            phase_call_chunk_scores=[],
+            included_chunk_count=0,
+            excluded_chunk_count=0,
+            thrown_out=False,
             temporal_shift_seconds=0.0,
         )
     
@@ -1727,15 +2098,35 @@ def compare_runs(
         )
         dist_matrix = np.array([])
     
+    phase_call_chunk_scores = _compute_phase_call_chunk_scores(
+        chunk_scores,
+        events_a=events_a,
+        events_b=events_b,
+        start_time_a=start_time_a,
+        start_time_b=start_time_b,
+        temporal_shift_seconds=temporal_shift,
+        trim_seconds_a=trim_seconds_a,
+        trim_seconds_b=trim_seconds_b,
+        group_tolerance=group_tolerance,
+        threshold=phase_call_threshold,
+    )
+
     # ===== SETTLE PERIOD ADJUSTMENT =====
     # If settle_minutes is set, recompute match_percentage excluding the
     # settling period from the chunk scores.
     settle_seconds = settle_minutes * 60.0
+    settled_phase_call_chunk_scores = _filter_chunk_scores_after_settle(phase_call_chunk_scores, settle_seconds)
     if settle_seconds > 0 and chunk_scores:
         # Keep only chunks whose center is past the settle period
-        settled_chunks = [c for c in chunk_scores if c.center_seconds >= settle_seconds]
+        settled_chunks = _filter_chunk_scores_after_settle(chunk_scores, settle_seconds)
         if settled_chunks:
-            match_percentage = sum(c.match_percentage for c in settled_chunks) / len(settled_chunks)
+            match_percentage, included_chunk_count, excluded_chunk_count = _apply_phase_call_chunk_filter(
+                settled_chunks,
+                settled_phase_call_chunk_scores,
+            )
+        else:
+            included_chunk_count = 0
+            excluded_chunk_count = 0
     elif settle_seconds > 0 and sequence_dtw.warping_path:
         # Find the overlap window: both A and B must be past settle and
         # within the shorter sequence's duration
@@ -1755,6 +2146,18 @@ def compare_runs(
                     settled_matches += 1
         if settled_total > 0:
             match_percentage = settled_matches / settled_total * 100
+        included_chunk_count = 0
+        excluded_chunk_count = 0
+    elif chunk_scores:
+        match_percentage, included_chunk_count, excluded_chunk_count = _apply_phase_call_chunk_filter(
+            chunk_scores,
+            phase_call_chunk_scores,
+        )
+    else:
+        included_chunk_count = 0
+        excluded_chunk_count = 0
+
+    thrown_out = included_chunk_count == 0 and excluded_chunk_count > 0
     
     # ===== DIVERGENCE DETECTION =====
     _use_chunk_divergences = not sequence_dtw.warping_path
@@ -1867,7 +2270,11 @@ def compare_runs(
         timing_stats=timing_stats,
         alignment_trim_seconds_a=trim_seconds_a,
         alignment_trim_seconds_b=trim_seconds_b,
-        chunk_scores=chunk_scores,
+        chunk_scores=_filter_chunk_scores_after_settle(chunk_scores, settle_seconds),
+        phase_call_chunk_scores=settled_phase_call_chunk_scores,
+        included_chunk_count=included_chunk_count,
+        excluded_chunk_count=excluded_chunk_count,
+        thrown_out=thrown_out,
         temporal_shift_seconds=temporal_shift,
     )
 
@@ -2226,47 +2633,27 @@ def generate_timeline(
 
 
 # =============================================================================
-# Per-Phase Difference Breakdown
+# Timeline Difference Breakdown
 # =============================================================================
 
-def generate_phase_difference_summary(
+def _generate_timeline_difference_summary(
     timeline_a: pd.DataFrame,
     timeline_b: pd.DataFrame,
-    time_offset_b: float = 0.0,
-    tolerance_seconds: float = 3.0,
+    event_classes: set,
+    tolerance_seconds: float,
+    label_factory,
+    state_factory,
 ) -> List[Dict]:
-    """
-    Compare two timelines per-phase/overlap and identify which are different.
-
-    For each unique (EventClass, EventValue) in the signal states, computes:
-    - Count of state periods in A and B
-    - Total duration in A and B
-    - Delta in count and duration
-
-    Args:
-        timeline_a: Timeline DataFrame (StartTime, EndTime, EventClass, EventValue)
-        timeline_b: Timeline DataFrame
-        time_offset_b: Offset applied to B (not used for stats, just for reference)
-        tolerance_seconds: Ignore differences smaller than this in total duration
-
-    Returns:
-        List of dicts, one per (phase_label, state), sorted by largest |duration_delta|.
-        Only includes entries where there IS a meaningful difference.
-    """
-    signal_classes = {
-        'Green', 'Yellow', 'Red',
-        'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red',
-        'Ped Service',
-    }
+    """Compare two timelines for a selected set of event classes."""
 
     def _compute_stats(tl: pd.DataFrame) -> Dict:
-        filtered = tl[tl['EventClass'].isin(signal_classes)].copy()
+        filtered = tl[tl['EventClass'].isin(event_classes)].copy()
         if 'Duration' not in filtered.columns or filtered['Duration'].isna().all():
             filtered['Duration'] = (
                 filtered['EndTime'] - filtered['StartTime']
             ).dt.total_seconds()
         stats = {}
-        for (ec, ev), grp in filtered.groupby(['EventClass', 'EventValue']):
+        for (ec, ev), grp in filtered.groupby(['EventClass', 'EventValue'], dropna=False):
             ev_int = int(float(ev)) if pd.notna(ev) else 0
             key = (ec, ev_int)
             stats[key] = {
@@ -2278,7 +2665,6 @@ def generate_phase_difference_summary(
 
     stats_a = _compute_stats(timeline_a)
     stats_b = _compute_stats(timeline_b)
-
     all_keys = sorted(set(stats_a.keys()) | set(stats_b.keys()))
 
     results = []
@@ -2289,26 +2675,12 @@ def generate_phase_difference_summary(
         dur_delta = sb['total_seconds'] - sa['total_seconds']
 
         if abs(dur_delta) <= tolerance_seconds and count_delta == 0:
-            continue  # No meaningful difference
-
-        # Build a human-readable label
-        if ec in ('Green', 'Yellow', 'Red'):
-            label = f"Ph {ev}"
-        elif 'Overlap' in ec:
-            label = f"Ovlp {ev}"
-        elif ec == 'Ped Service':
-            label = f"Ped {ev}"
-        else:
-            label = f"{ec} {ev}"
-
-        # Simplify the state name
-        state = ec.replace('Overlap ', '')
+            continue
 
         avg_delta = sb['avg_seconds'] - sa['avg_seconds']
-
         results.append({
-            'label': label,
-            'state': state,
+            'label': label_factory(ec, ev),
+            'state': state_factory(ec, ev),
             'event_class': ec,
             'event_value': ev,
             'count_a': sa['count'],
@@ -2322,10 +2694,67 @@ def generate_phase_difference_summary(
             'total_duration_delta': dur_delta,
         })
 
-    # Sort: prioritze cases where a count is zero (completely missing phase/state),
-    # then sort by absolute total duration delta (largest first).
     results.sort(key=lambda r: (r['count_a'] == 0 or r['count_b'] == 0, abs(r['total_duration_delta'])), reverse=True)
     return results
+
+
+def generate_phase_difference_summary(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    time_offset_b: float = 0.0,
+    tolerance_seconds: float = 3.0,
+) -> List[Dict]:
+    """Compare phase and overlap signal-state timelines and identify meaningful differences."""
+    signal_classes = {
+        'Green', 'Yellow', 'Red',
+        'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red',
+    }
+
+    return _generate_timeline_difference_summary(
+        timeline_a,
+        timeline_b,
+        event_classes=signal_classes,
+        tolerance_seconds=tolerance_seconds,
+        label_factory=lambda ec, ev: f"Ph {ev}" if ec in ('Green', 'Yellow', 'Red') else f"Ovlp {ev}",
+        state_factory=lambda ec, ev: ec.replace('Overlap ', ''),
+    )
+
+
+def generate_operational_difference_summary(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    tolerance_seconds: float = 3.0,
+) -> List[Dict]:
+    """Compare transition, preempt, and pedestrian-service timelines."""
+    operational_classes = {
+        'Ped Service',
+        'Preempt',
+        'Transition Longway',
+        'Transition Shortway',
+    }
+
+    def _label_factory(event_class: str, event_value: int) -> str:
+        if event_class == 'Ped Service':
+            return f"Ped {event_value}"
+        if event_class == 'Preempt':
+            return f"Preempt {event_value}"
+        return 'Transition'
+
+    def _state_factory(event_class: str, event_value: int) -> str:
+        if event_class == 'Ped Service':
+            return 'Service'
+        if event_class == 'Preempt':
+            return 'Active'
+        return event_class.replace('Transition ', '')
+
+    return _generate_timeline_difference_summary(
+        timeline_a,
+        timeline_b,
+        event_classes=operational_classes,
+        tolerance_seconds=tolerance_seconds,
+        label_factory=_label_factory,
+        state_factory=_state_factory,
+    )
 
 
 def format_phase_differences(diffs: List[Dict], label_a: str = "Original", label_b: str = "Replay", max_rows: int = 10) -> str:

@@ -486,6 +486,9 @@ a:hover { text-decoration: underline; }
       {% if suite.analysis_start_time %}
       <tr><td>Manual analysis start time</td><td>{{ suite.analysis_start_time }}</td><td>Clock time used to clip TOD scenarios before similarity analysis</td></tr>
       {% endif %}
+      {% if suite.analysis_end_time %}
+      <tr><td>Manual analysis end time</td><td>{{ suite.analysis_end_time }}</td><td>Clock time used to stop TOD scenario analysis, using the run end date for overnight windows</td></tr>
+      {% endif %}
       {% if suite.comparison_thresholds %}
       <tr><td>Sequence DTW threshold</td><td>{{ suite.comparison_thresholds.sequence_threshold }}</td><td>Max normalised DTW distance for event-sequence similarity</td></tr>
       <tr><td>Timing DTW threshold</td><td>{{ suite.comparison_thresholds.timing_threshold }}</td><td>Max normalised DTW distance for timing similarity</td></tr>

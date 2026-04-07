@@ -5,7 +5,11 @@ import pandas as pd
 from signal_replay.comparison import (
     ChunkScore,
     PhaseCallChunkScore,
+    DivergenceWindow,
+    build_included_event_periods,
+    clip_timeline_to_relative_periods,
     compare_runs,
+    filter_divergence_windows_to_periods,
     generate_operational_difference_summary,
     generate_phase_difference_summary,
     render_sparkline_svg,
@@ -101,6 +105,112 @@ def test_compare_runs_does_not_exclude_low_activity_phase_call_chunk():
     assert result.included_chunk_count == 1
     assert result.excluded_chunk_count == 0
     assert result.match_percentage == 100.0
+
+
+def test_build_included_event_periods_merges_overlapping_good_chunks():
+    periods = build_included_event_periods(
+        [
+            ChunkScore(center_seconds=1350.0, match_percentage=98.0, window_seconds=2700.0),
+            ChunkScore(center_seconds=3750.0, match_percentage=97.0, window_seconds=2700.0),
+        ],
+        [
+            PhaseCallChunkScore(center_seconds=1350.0, window_seconds=2700.0, similarity_percentage=96.0),
+            PhaseCallChunkScore(center_seconds=3750.0, window_seconds=2700.0, similarity_percentage=94.0),
+        ],
+        min_start_seconds=600.0,
+    )
+
+    assert periods == [(600.0, 5100.0)]
+
+
+def test_clip_timeline_to_relative_periods_splits_rows_at_good_period_edges():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=20),
+            "Duration": 20.0,
+            "EventClass": "Green",
+            "EventValue": 2,
+        }
+    ])
+
+    clipped = clip_timeline_to_relative_periods(timeline, [(5.0, 10.0), (12.0, 18.0)])
+
+    assert len(clipped) == 2
+    assert clipped["Duration"].tolist() == [5.0, 6.0]
+    assert clipped["StartTime"].tolist() == [
+        base_time + timedelta(seconds=5),
+        base_time + timedelta(seconds=12),
+    ]
+    assert clipped["EndTime"].tolist() == [
+        base_time + timedelta(seconds=10),
+        base_time + timedelta(seconds=18),
+    ]
+
+
+def test_filter_divergence_windows_to_periods_keeps_only_good_period_divergences():
+    divergences = [
+        DivergenceWindow(
+            start_index_a=0,
+            end_index_a=1,
+            start_index_b=0,
+            end_index_b=1,
+            start_time_delta_a=0.0,
+            end_time_delta_a=10.0,
+            start_time_delta_b=0.0,
+            end_time_delta_b=10.0,
+            original_start_seconds_a=50.0,
+            original_end_seconds_a=60.0,
+            original_start_seconds_b=50.0,
+            original_end_seconds_b=60.0,
+        ),
+        DivergenceWindow(
+            start_index_a=2,
+            end_index_a=3,
+            start_index_b=2,
+            end_index_b=3,
+            start_time_delta_a=0.0,
+            end_time_delta_a=10.0,
+            start_time_delta_b=0.0,
+            end_time_delta_b=10.0,
+            original_start_seconds_a=250.0,
+            original_end_seconds_a=260.0,
+            original_start_seconds_b=250.0,
+            original_end_seconds_b=260.0,
+        ),
+    ]
+
+    filtered = filter_divergence_windows_to_periods(divergences, [(200.0, 300.0)])
+
+    assert len(filtered) == 1
+    assert filtered[0].original_start_seconds_a == 250.0
+
+
+def test_compare_runs_filters_divergences_when_all_chunks_are_bad():
+    main_offsets = [0, 600, 1200, 1800, 2400, 2800]
+    phase_offsets_a = [
+        (43, 300, 2),
+        (44, 900, 2),
+        (43, 1500, 2),
+        (44, 2100, 2),
+    ]
+
+    events_a = _make_events(main_offsets, phase_offsets=phase_offsets_a)
+    events_b = _make_events(main_offsets + [3000], phase_offsets=[])
+
+    result = compare_runs(
+        events_a,
+        events_b,
+        device_id="03013",
+        auto_align=False,
+        phase_call_threshold=90.0,
+    )
+
+    assert result.thrown_out is True
+    assert result.included_event_periods_a == []
+    assert result.included_event_periods_b == []
+    assert result.divergence_windows == []
 
 
 def test_render_sparkline_draws_phase_call_overlay_and_exclusion_legend():

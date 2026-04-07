@@ -261,18 +261,14 @@ class DatabaseManager:
 
             info = con.execute("PRAGMA table_info('events')").fetchall()
             expected_columns = ["device_id", "run_number", "timestamp", "event_id", "parameter"]
-            expected_pk_positions = {
-                "device_id": 1,
-                "run_number": 2,
-                "timestamp": 3,
-                "event_id": 4,
-                "parameter": 5,
-            }
             actual_columns = [row[1] for row in info]
-            valid_schema = actual_columns == expected_columns and all(
-                int(row[5]) == expected_pk_positions[row[1]]
-                for row in info
-            )
+            pk_markers = [row[5] for row in info]
+            if all(type(marker) is bool for marker in pk_markers):
+                valid_pk = all(pk_markers)
+            else:
+                valid_pk = [int(marker) for marker in pk_markers] == [1, 2, 3, 4, 5]
+
+            valid_schema = actual_columns == expected_columns and valid_pk
             if not valid_schema:
                 raise RuntimeError(
                     f"Unsupported events schema in {self.db_path}. "

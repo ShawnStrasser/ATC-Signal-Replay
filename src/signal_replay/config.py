@@ -8,6 +8,9 @@ from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 
+# Empirically derived from experiments/latency_scaling_runs/report.md.
+DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS = 0.1853
+
 # Sentinel value to indicate "use default"
 _USE_DEFAULT = object()
 
@@ -29,6 +32,9 @@ class SignalConfig:
         tod_align: If True, align replay events to wall-clock time-of-day from input timestamps
         limit_minutes: Limit input events to the last N minutes (0 = no limit)
         buffer_minutes: Include additional buffer minutes before the last N minutes (0 = no buffer)
+        replay_latency_offset_seconds: Positive detector replay compensation, in seconds.
+            This value is subtracted from detector event timestamps before scheduling
+            sends, so positive values send slightly earlier.
         http_port: Port for HTTP data collection. Defaults to udp_port for localhost, 80 for remote hosts. Use None to disable.
     """
     device_id: str
@@ -40,6 +46,7 @@ class SignalConfig:
     tod_align: bool = False
     limit_minutes: float = 0.0
     buffer_minutes: float = 0.0
+    replay_latency_offset_seconds: float = DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS
     http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
     
     # Internal: populated during simulation initialization
@@ -107,6 +114,14 @@ class SignalConfig:
             raise ValueError(f"limit_minutes must be a non-negative number, got {self.limit_minutes}")
         if not isinstance(self.buffer_minutes, (int, float)) or self.buffer_minutes < 0:
             raise ValueError(f"buffer_minutes must be a non-negative number, got {self.buffer_minutes}")
+        if (
+            not isinstance(self.replay_latency_offset_seconds, (int, float))
+            or self.replay_latency_offset_seconds < 0
+        ):
+            raise ValueError(
+                "replay_latency_offset_seconds must be a non-negative number, "
+                f"got {self.replay_latency_offset_seconds}"
+            )
     
     @property
     def ip_port(self) -> Tuple[str, int]:

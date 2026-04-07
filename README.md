@@ -438,6 +438,7 @@ Configuration for individual signals. Events are provided at the simulation leve
 | `http_port` | int/None | Auto | HTTP port for log collection. Auto = `udp_port` for localhost, `80` for remote. `None` disables collection |
 | `limit_minutes` | float | 0.0 | Only replay the last N minutes of events (0 = all) |
 | `buffer_minutes` | float | 0.0 | Include extra lead-in minutes before `limit_minutes` window |
+| `replay_latency_offset_seconds` | float | 0.1853 | Positive detector latency compensation. Replay subtracts this from detector timestamps so sends happen slightly earlier. |
 
 ### SimulationConfig (Legacy)
 
@@ -547,11 +548,13 @@ For comparison, phase and overlap state-change events are used (phase green/yell
 
 ## SNMP Detector Latency Calibration
 
-The SNMP SET commands that send detector actuations arrive at the controller with a measurable latency. To compensate, the replay pipeline shifts event timestamps forward by a **global offset** before sending — so the controller receives each command closer to the correct wall-clock moment.
+The SNMP SET commands that send detector actuations arrive at the controller with a measurable latency. To compensate, the replay pipeline applies a **global positive compensation offset** before sending by subtracting it from detector event timestamps, so commands are scheduled slightly earlier and arrive closer to the intended wall-clock moment.
 
 The default offset value was determined empirically using the latency scaling study in [`experiments/run_latency_scaling_study.py`](experiments/run_latency_scaling_study.py).
 
 **Latest result: 185.3 ms** (see full report at [`experiments/latency_scaling_runs/report.md`](experiments/latency_scaling_runs/report.md))
+
+Use `SignalConfig(replay_latency_offset_seconds=...)` to override it in code, or set `replay_latency_offset_seconds` in `firmware_validation/settings.json` for firmware validation runs. Set it to `0.0` to disable compensation.
 
 ### Re-running the study
 

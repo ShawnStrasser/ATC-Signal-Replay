@@ -170,6 +170,8 @@ class ComparisonResult:
     included_chunk_count: int = 0
     excluded_chunk_count: int = 0
     thrown_out: bool = False
+    included_event_periods_a: Optional[List[Tuple[float, float]]] = None
+    included_event_periods_b: Optional[List[Tuple[float, float]]] = None
     # Temporal shift applied during alignment (seconds added to B's time_delta)
     temporal_shift_seconds: float = 0.0
 
@@ -1570,6 +1572,121 @@ def _apply_phase_call_chunk_filter(
     return sum(included_values) / len(included_values), len(included_values), excluded_count
 
 
+def _merge_time_periods(periods: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Merge overlapping or touching time periods measured in seconds."""
+    if not periods:
+        return []
+
+    normalized = sorted((float(start), float(end)) for start, end in periods if end >= start)
+    if not normalized:
+        return []
+
+    merged: List[Tuple[float, float]] = [normalized[0]]
+    for start, end in normalized[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def build_included_event_periods(
+    chunk_scores: List[ChunkScore],
+    phase_call_chunk_scores: Optional[List[PhaseCallChunkScore]] = None,
+    *,
+    start_offset_seconds: float = 0.0,
+    min_start_seconds: float = 0.0,
+) -> Optional[List[Tuple[float, float]]]:
+    """Return merged inclusive periods for chunks that remain in the match average.
+
+    The returned seconds are relative to the original analysis start for the
+    selected run, not the post-alignment trimmed chunk origin.
+    """
+    if not chunk_scores:
+        return None
+
+    use_phase_filter = (
+        phase_call_chunk_scores is not None
+        and len(phase_call_chunk_scores) == len(chunk_scores)
+    )
+
+    periods: List[Tuple[float, float]] = []
+    for idx, chunk in enumerate(chunk_scores):
+        if use_phase_filter and phase_call_chunk_scores[idx].excluded_from_match:
+            continue
+        half_window = chunk.window_seconds / 2.0
+        start_seconds = max(min_start_seconds, start_offset_seconds + chunk.center_seconds - half_window)
+        end_seconds = start_offset_seconds + chunk.center_seconds + half_window
+        if end_seconds < start_seconds:
+            continue
+        periods.append((start_seconds, end_seconds))
+
+    return _merge_time_periods(periods)
+
+
+def filter_divergence_windows_to_periods(
+    divergences: List[DivergenceWindow],
+    periods: Optional[List[Tuple[float, float]]],
+) -> List[DivergenceWindow]:
+    """Keep only divergence windows that overlap an included period on run A."""
+    if periods is None:
+        return list(divergences)
+    if not periods:
+        return []
+
+    filtered: List[DivergenceWindow] = []
+    for divergence in divergences:
+        for period_start, period_end in periods:
+            if divergence.original_end_seconds_a < period_start:
+                continue
+            if divergence.original_start_seconds_a > period_end:
+                continue
+            filtered.append(divergence)
+            break
+    return filtered
+
+
+def clip_timeline_to_relative_periods(
+    timeline: pd.DataFrame,
+    periods: Optional[List[Tuple[float, float]]],
+) -> pd.DataFrame:
+    """Clip timeline intervals to the inclusive union of allowed relative periods."""
+    if timeline.empty or periods is None:
+        return timeline.copy()
+    if not periods:
+        return timeline.iloc[0:0].copy()
+
+    clipped_rows: List[Dict[str, Any]] = []
+    base_start = pd.to_datetime(timeline['StartTime']).min()
+    merged_periods = _merge_time_periods(periods)
+
+    for _, row in timeline.iterrows():
+        row_start = pd.to_datetime(row['StartTime'])
+        row_end = pd.to_datetime(row['EndTime'])
+        rel_start = (row_start - base_start).total_seconds()
+        rel_end = (row_end - base_start).total_seconds()
+
+        for period_start, period_end in merged_periods:
+            overlap_start = max(rel_start, period_start)
+            overlap_end = min(rel_end, period_end)
+            if overlap_end < overlap_start:
+                continue
+
+            clipped_row = row.to_dict()
+            clipped_row['StartTime'] = base_start + pd.Timedelta(seconds=overlap_start)
+            clipped_row['EndTime'] = base_start + pd.Timedelta(seconds=overlap_end)
+            duration_seconds = max(0.0, overlap_end - overlap_start)
+            if 'Duration' in timeline.columns:
+                clipped_row['Duration'] = duration_seconds
+            clipped_rows.append(clipped_row)
+
+    if not clipped_rows:
+        return timeline.iloc[0:0].copy()
+
+    return pd.DataFrame(clipped_rows, columns=timeline.columns)
+
+
 def render_sparkline_svg(
     chunk_scores: List[ChunkScore],
     width: int = 1400,
@@ -2116,9 +2233,22 @@ def compare_runs(
     # settling period from the chunk scores.
     settle_seconds = settle_minutes * 60.0
     settled_phase_call_chunk_scores = _filter_chunk_scores_after_settle(phase_call_chunk_scores, settle_seconds)
+    settled_chunk_scores = _filter_chunk_scores_after_settle(chunk_scores, settle_seconds)
+    included_event_periods_a = build_included_event_periods(
+        settled_chunk_scores,
+        settled_phase_call_chunk_scores,
+        start_offset_seconds=trim_seconds_a,
+        min_start_seconds=trim_seconds_a + settle_seconds,
+    )
+    included_event_periods_b = build_included_event_periods(
+        settled_chunk_scores,
+        settled_phase_call_chunk_scores,
+        start_offset_seconds=trim_seconds_b,
+        min_start_seconds=trim_seconds_b + settle_seconds,
+    )
     if settle_seconds > 0 and chunk_scores:
         # Keep only chunks whose center is past the settle period
-        settled_chunks = _filter_chunk_scores_after_settle(chunk_scores, settle_seconds)
+        settled_chunks = settled_chunk_scores
         if settled_chunks:
             match_percentage, included_chunk_count, excluded_chunk_count = _apply_phase_call_chunk_filter(
                 settled_chunks,
@@ -2185,6 +2315,7 @@ def compare_runs(
                 if (d.end_time_delta_a < (overlap_end - tail_margin)
                     and d.end_time_delta_b < (overlap_end - tail_margin))
             ]
+        divergences = filter_divergence_windows_to_periods(divergences, included_event_periods_a)
     else:
         # Full DTW was skipped — run local DTW on each failing chunk to
         # find precise divergence points (same quality as full-DTW method).
@@ -2224,6 +2355,7 @@ def compare_runs(
                     d.start_time_delta_b += c_start
                     d.end_time_delta_b += c_start
                 divergences.extend(local_divs)
+        divergences = filter_divergence_windows_to_periods(divergences, included_event_periods_a)
     
     # ===== TIMING ANALYSIS =====
     # For matched groups, compare how much the timing differs
@@ -2270,11 +2402,13 @@ def compare_runs(
         timing_stats=timing_stats,
         alignment_trim_seconds_a=trim_seconds_a,
         alignment_trim_seconds_b=trim_seconds_b,
-        chunk_scores=_filter_chunk_scores_after_settle(chunk_scores, settle_seconds),
+        chunk_scores=settled_chunk_scores,
         phase_call_chunk_scores=settled_phase_call_chunk_scores,
         included_chunk_count=included_chunk_count,
         excluded_chunk_count=excluded_chunk_count,
         thrown_out=thrown_out,
+        included_event_periods_a=included_event_periods_a,
+        included_event_periods_b=included_event_periods_b,
         temporal_shift_seconds=temporal_shift,
     )
 

@@ -125,12 +125,58 @@ def test_resolve_manual_analysis_start_uses_collected_run_date():
         }
     )
 
-    analysis_start = fv._resolve_manual_analysis_start(
+    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
         collected,
         analysis_start_time="09:10",
+        analysis_end_time=None,
     )
 
     assert analysis_start == pd.Timestamp("2026-03-25 09:10:00")
+    assert analysis_end is None
+
+
+def test_resolve_manual_analysis_window_keeps_same_day_end_when_after_start():
+    collected = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime([
+                "2026-03-25 09:07:10.000",
+                "2026-03-26 08:59:12.000",
+            ]),
+            "event_id": [44, 10],
+            "parameter": [2, 2],
+        }
+    )
+
+    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
+        collected,
+        analysis_start_time="09:00",
+        analysis_end_time="10:00",
+    )
+
+    assert analysis_start == pd.Timestamp("2026-03-25 09:00:00")
+    assert analysis_end == pd.Timestamp("2026-03-25 10:00:00")
+
+
+def test_resolve_manual_analysis_window_uses_run_end_date_for_overnight_end():
+    collected = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime([
+                "2026-03-25 09:07:10.000",
+                "2026-03-26 08:59:12.000",
+            ]),
+            "event_id": [44, 10],
+            "parameter": [2, 2],
+        }
+    )
+
+    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
+        collected,
+        analysis_start_time="09:00",
+        analysis_end_time="07:00",
+    )
+
+    assert analysis_start == pd.Timestamp("2026-03-25 09:00:00")
+    assert analysis_end == pd.Timestamp("2026-03-26 07:00:00")
 
 
 def test_filter_chunk_scores_after_settle_excludes_initial_window():
@@ -145,7 +191,7 @@ def test_filter_chunk_scores_after_settle_excludes_initial_window():
     assert [chunk.center_seconds for chunk in filtered] == [600.0, 1200.0]
 
 
-def test_trim_to_analysis_start_uses_sent_timestamp_cutoff():
+def test_trim_to_analysis_window_uses_sent_timestamp_cutoff():
     df = pd.DataFrame(
         {
             "timestamp": pd.to_datetime([
@@ -158,9 +204,35 @@ def test_trim_to_analysis_start_uses_sent_timestamp_cutoff():
         }
     )
 
-    trimmed = fv._trim_to_analysis_start(df, pd.Timestamp("2026-03-25 09:10:14.600"))
+    trimmed = fv._trim_to_analysis_window(
+        df,
+        pd.Timestamp("2026-03-25 09:10:14.600"),
+        None,
+    )
 
     assert list(trimmed["event_id"]) == [11]
+
+
+def test_trim_to_analysis_window_applies_end_cutoff():
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime([
+                "2026-03-25 09:00:00",
+                "2026-03-25 09:30:00",
+                "2026-03-25 10:30:00",
+            ]),
+            "event_id": [7, 9, 11],
+            "parameter": [2, 2, 2],
+        }
+    )
+
+    trimmed = fv._trim_to_analysis_window(
+        df,
+        pd.Timestamp("2026-03-25 09:00:00"),
+        pd.Timestamp("2026-03-25 10:00:00"),
+    )
+
+    assert list(trimmed["event_id"]) == [7, 9]
 
 
 def test_sparkline_uses_actual_wall_clock_labels():

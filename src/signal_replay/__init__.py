@@ -3,7 +3,11 @@ Signal Replay - Python package for replaying high-resolution event logs
 from ATC signal controllers back to test controllers using NTCIP.
 """
 
-from .config import SignalConfig, SimulationConfig
+from .config import (
+    DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS,
+    SignalConfig,
+    SimulationConfig,
+)
 from .orchestrator import ATCSimulation
 from .replay import SignalReplay, create_replays
 from .collector import (
@@ -43,6 +47,9 @@ from .comparison import (
     find_temporal_offset,
     calculate_timeline_offset,
     compute_timeline_offset,
+    build_included_event_periods,
+    filter_divergence_windows_to_periods,
+    clip_timeline_to_relative_periods,
     render_sparkline_svg,
 )
 from .test_suite import (
@@ -51,8 +58,6 @@ from .test_suite import (
     TestBatch,
     FirmwareTestSuite,
     ScenarioResult,
-    save_to_yaml,
-    load_from_yaml,
 )
 from .batch_runner import BatchRunner, compare_firmware
 from .report import generate_report, load_annotations
@@ -65,6 +70,7 @@ __all__ = [
     "ATCSimulation",
     "SimulationConfig",
     "SignalConfig",
+    "DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS",
     "SignalReplay",
     "create_replays",
     # Data collection
@@ -95,6 +101,9 @@ __all__ = [
     "generate_operational_difference_summary",
     "format_phase_differences",
     "find_temporal_offset",
+    "build_included_event_periods",
+    "filter_divergence_windows_to_periods",
+    "clip_timeline_to_relative_periods",
     "render_sparkline_svg",
     # Firmware validation
     "TestType",
@@ -102,8 +111,6 @@ __all__ = [
     "TestBatch",
     "FirmwareTestSuite",
     "ScenarioResult",
-    "save_to_yaml",
-    "load_from_yaml",
     "BatchRunner",
     "compare_firmware",
     "generate_report",

@@ -24,10 +24,7 @@ import traceback
 from datetime import datetime, time as dt_time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import shutil
-import tempfile
+from typing import Dict, List, Optional, Tuple
 
 import duckdb
 import pandas as pd
@@ -39,92 +36,9 @@ from signal_replay.ntcip import send_ntcip
 from signal_replay.report import generate_report
 
 # ---------------------------------------------------------------------------
-# Dev / test mode — limit to these devices for fast iteration
-# ---------------------------------------------------------------------------
-DEV_DEVICES = ["2B085", "08042", "2C042"]
-
-# Temp directory for --test mode shifted parquet files (cleaned up on exit)
-_TEST_TMPDIR: Optional[Path] = None
-_TEST_FIRST_SEND_TIMES: Dict[str, pd.Timestamp] = {}
-_TEST_ORIGINAL_SOURCES: Dict[str, str] = {}
-
-# ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 _VERBOSE = False
-
-
-def _shift_events_for_test_batch(batch: sr.TestBatch, scenarios: List[sr.TestScenario]) -> Path:
-    """Rewrite only the current batch's event sources so replay starts about
-    one minute from *now*, after controllers are ready."""
-    from datetime import datetime, timedelta
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="fw_test_"))
-    target_start = datetime.now() + timedelta(minutes=1)
-
-    log("TEST MODE: shifting current batch timestamps for fast TOD-aligned startup")
-
-    batch_scenarios = [s for s in scenarios if s.scenario_id in batch.assignments]
-
-    for scenario in batch_scenarios:
-        original_source = _TEST_ORIGINAL_SOURCES.get(scenario.scenario_id, scenario.events_source)
-        src = Path(original_source)
-        if not src.exists():
-            log(f"  {scenario.scenario_id}: source file missing, skipping shift: {src}")
-            continue
-
-        df = pd.read_parquet(src) if src.suffix == ".parquet" else pd.read_csv(src)
-
-        # Find the timestamp column
-        ts_col = None
-        for col in df.columns:
-            if col.lower() in ("timestamp", "time_stamp", "time"):
-                ts_col = col
-                break
-        if ts_col is None:
-            log(f"  {scenario.scenario_id}: no timestamp column found in {src.name}, leaving unchanged")
-            continue
-
-        df[ts_col] = pd.to_datetime(df[ts_col])
-        min_ts = df[ts_col].min()
-        max_ts = df[ts_col].max()
-
-        probe_signal = sr.SignalConfig(
-            device_id=scenario.scenario_id,
-            ip="127.0.0.1",
-            udp_port=1,
-            http_port=None,
-            cycle_length=scenario.cycle_length,
-            cycle_offset=scenario.cycle_offset,
-            tod_align=scenario.tod_align,
-        )
-        probe_signal.events = str(src)
-        probe_replay = sr.SignalReplay(probe_signal)
-        first_replay_ts = pd.to_datetime(probe_replay.activation_feed["TimeStamp"].min())
-        shift = target_start - first_replay_ts
-        df[ts_col] = df[ts_col] + shift
-
-        shifted_min = df[ts_col].min()
-        shifted_max = df[ts_col].max()
-        shifted_first_replay_ts = first_replay_ts + shift
-
-        out_path = tmp_dir / f"{scenario.scenario_id}.parquet"
-        df.to_parquet(out_path, index=False)
-
-        # Point the scenario at the shifted file
-        scenario.events_source = str(out_path)
-        _TEST_FIRST_SEND_TIMES[scenario.scenario_id] = shifted_first_replay_ts
-
-        log(
-            f"  {scenario.scenario_id}: original {min_ts:%Y-%m-%d %H:%M:%S} -> "
-            f"shifted {shifted_min:%Y-%m-%d %H:%M:%S} "
-            f"(first replay send {shifted_first_replay_ts:%Y-%m-%d %H:%M:%S}, "
-            f"last {shifted_max:%Y-%m-%d %H:%M:%S}, rows={len(df)})"
-        )
-
-    log(f"TEST MODE: current batch shifted so first replay send starts at ~{target_start:%H:%M:%S}")
-    log(f"           temp files in {tmp_dir}")
-    return tmp_dir
 
 
 def log(msg: str, *, always: bool = True) -> None:
@@ -236,8 +150,8 @@ def build_suite(
     firmware_dir: Path,
     catalog: List[dict],
     conflict_pairs: dict,
-) -> Tuple[sr.FirmwareTestSuite, List[sr.TestScenario], List[sr.TestBatch], dict]:
-    """Build scenarios, batches, and the full test suite. Returns (suite, scenarios, batches, file_map)."""
+) -> Tuple[sr.FirmwareTestSuite, dict]:
+    """Build the full test suite and return it with the discovered input file map."""
 
     logs_dir = firmware_dir / settings["logs_dir"]
     databases_dir = firmware_dir / settings["databases_dir"]
@@ -254,7 +168,8 @@ def build_suite(
             "db": find_database(tssu, databases_dir),
         }
 
-    scenarios: List[sr.TestScenario] = []
+    similarity_scenarios: List[sr.TestScenario] = []
+    conflict_scenarios: List[sr.TestScenario] = []
     skipped: List[str] = []
 
     for r in catalog:
@@ -277,7 +192,7 @@ def build_suite(
             if pairs_key in conflict_pairs:
                 kwargs["incompatible_pairs"] = conflict_pairs[pairs_key]
 
-        scenarios.append(sr.TestScenario(
+        scenario = sr.TestScenario(
             scenario_id=tssu,
             database_name=str(db_path) if db_path else f"{tssu}.bin",
             events_source=str(log_path),
@@ -288,7 +203,13 @@ def build_suite(
             cycle_offset=offset,
             tod_align=tod_align,
             **kwargs,
-        ))
+        )
+        if test_type == sr.TestType.CONFLICT:
+            conflict_scenarios.append(scenario)
+        else:
+            similarity_scenarios.append(scenario)
+
+    scenarios = similarity_scenarios + conflict_scenarios
 
     if skipped:
         log(f"Skipped (no log): {', '.join(skipped)}")
@@ -306,6 +227,13 @@ def build_suite(
         ))
 
     comp = settings.get("comparison", {})
+    configured_settle_minutes = comp.get("settle_minutes", 10.0)
+    analysis_start_time = str(comp.get("analysis_start_time", "")).strip()
+    analysis_end_time = str(comp.get("analysis_end_time", "")).strip()
+    effective_settle_minutes = configured_settle_minutes
+    if analysis_start_time and scenarios and all(s.tod_align for s in scenarios):
+        effective_settle_minutes = 0.0
+
     suite = sr.FirmwareTestSuite(
         suite_name="Firmware Validation",
         firmware_version=firmware_version,
@@ -319,11 +247,12 @@ def build_suite(
             match_threshold=comp.get("match_threshold", 95.0),
         ),
         phase_call_similarity_threshold=comp.get("phase_call_similarity_threshold", comp.get("detector_similarity_threshold", 90.0)),
-        analysis_settle_minutes=comp.get("settle_minutes", 10.0),
-        analysis_start_time=comp.get("analysis_start_time", ""),
+        analysis_settle_minutes=effective_settle_minutes,
+        analysis_start_time=analysis_start_time,
+        analysis_end_time=analysis_end_time,
     )
 
-    return suite, scenarios, batches, file_map
+    return suite, file_map
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +307,7 @@ def wait_for_controllers(targets: List[str], labels: List[str]) -> None:
 # ---------------------------------------------------------------------------
 # Batch operations
 # ---------------------------------------------------------------------------
-def detect_current_batch(suite: sr.FirmwareTestSuite, batches: List[sr.TestBatch]) -> Tuple[Optional[sr.TestBatch], set]:
+def detect_current_batch(suite: sr.FirmwareTestSuite) -> Tuple[Optional[sr.TestBatch], set]:
     checkpoint_path = Path(suite.output_dir) / suite.firmware_version / "checkpoint.json"
     completed: set = set()
     batch_members: Dict[str, List[str]] = {}
@@ -394,7 +323,7 @@ def detect_current_batch(suite: sr.FirmwareTestSuite, batches: List[sr.TestBatch
     else:
         log(f"No checkpoint found at {checkpoint_path}; starting from the first batch.")
 
-    for b in batches:
+    for b in suite.batches:
         if b.batch_id not in completed:
             return b, completed
         if batch_members.get(b.batch_id) != sorted(b.assignments.keys()):
@@ -458,6 +387,35 @@ def _extract_collected_events(
     return extracted
 
 
+def _load_collected_events_from_duckdb(db_path: Path | str, scenario_id: str) -> pd.DataFrame:
+    """Load collected events for a single scenario directly from DuckDB."""
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        columns = [row[1] for row in con.execute("PRAGMA table_info('events')").fetchall()]
+        required = {"device_id", "timestamp", "event_id", "parameter"}
+        missing = sorted(required - set(columns))
+        if missing:
+            raise ValueError(
+                f"DuckDB events table at {db_path} is missing required columns: {missing}"
+            )
+
+        select_columns = [
+            col for col in ("device_id", "run_number", "timestamp", "event_id", "parameter")
+            if col in columns
+        ]
+        order_columns = [
+            col for col in ("run_number", "timestamp", "event_id", "parameter")
+            if col in columns
+        ]
+        query = (
+            f"SELECT {', '.join(select_columns)} FROM events WHERE device_id = ? "
+            f"ORDER BY {', '.join(order_columns)}"
+        )
+        return con.execute(query, [scenario_id]).df()
+    finally:
+        con.close()
+
+
 def _get_timestamp_col(df: pd.DataFrame) -> str:
     """Return the timestamp column name used by a raw events DataFrame."""
     return next(
@@ -483,8 +441,8 @@ def _date_only_shifted_copy(
     return shifted
 
 
-def _parse_analysis_start_time(value: Optional[str]) -> Optional[dt_time]:
-    """Parse a manual HH:MM[:SS] analysis start time from settings."""
+def _parse_analysis_clock_time(value: Optional[str], setting_name: str) -> Optional[dt_time]:
+    """Parse a manual HH:MM[:SS] analysis clock time from settings."""
     if value is None:
         return None
 
@@ -499,28 +457,47 @@ def _parse_analysis_start_time(value: Optional[str]) -> Optional[dt_time]:
             continue
 
     raise ValueError(
-        "comparison.analysis_start_time must use HH:MM or HH:MM:SS format"
+        f"comparison.{setting_name} must use HH:MM or HH:MM:SS format"
     )
 
 
-def _resolve_manual_analysis_start(
+def _resolve_manual_analysis_window(
     collected: pd.DataFrame,
     *,
     analysis_start_time: Optional[str],
-) -> Optional[pd.Timestamp]:
-    """Resolve the configured TOD analysis start onto the collected run date."""
-    parsed_time = _parse_analysis_start_time(analysis_start_time)
-    if parsed_time is None or collected.empty:
-        return None
+    analysis_end_time: Optional[str],
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """Resolve manual TOD analysis bounds onto the collected run dates."""
+    parsed_start = _parse_analysis_clock_time(analysis_start_time, "analysis_start_time")
+    parsed_end = _parse_analysis_clock_time(analysis_end_time, "analysis_end_time")
+    if collected.empty or (parsed_start is None and parsed_end is None):
+        return None, None
 
     collected_ts_col = _get_timestamp_col(collected)
     collected_ts = pd.to_datetime(collected[collected_ts_col])
-    collected_date = collected_ts.min().normalize()
-    return collected_date + pd.Timedelta(
-        hours=parsed_time.hour,
-        minutes=parsed_time.minute,
-        seconds=parsed_time.second,
-    )
+    min_date = collected_ts.min().normalize()
+    max_date = collected_ts.max().normalize()
+
+    analysis_start = None
+    if parsed_start is not None:
+        analysis_start = min_date + pd.Timedelta(
+            hours=parsed_start.hour,
+            minutes=parsed_start.minute,
+            seconds=parsed_start.second,
+        )
+
+    analysis_end = None
+    if parsed_end is not None:
+        end_date = min_date
+        if parsed_start is not None and parsed_end < parsed_start:
+            end_date = max_date
+        analysis_end = end_date + pd.Timedelta(
+            hours=parsed_end.hour,
+            minutes=parsed_end.minute,
+            seconds=parsed_end.second,
+        )
+
+    return analysis_start, analysis_end
 
 
 def _prepare_analysis_inputs(
@@ -554,17 +531,208 @@ def _prepare_analysis_inputs(
     return original_prepared, collected_prepared, shared_start, shared_start
 
 
-def _trim_to_analysis_start(
+def _trim_to_analysis_window(
     df: pd.DataFrame,
     analysis_start: Optional[pd.Timestamp],
+    analysis_end: Optional[pd.Timestamp],
 ) -> pd.DataFrame:
-    """Trim a raw events DataFrame to events at or after the analysis start."""
-    if analysis_start is None or df.empty:
+    """Trim a raw events DataFrame to the configured analysis window."""
+    if df.empty or (analysis_start is None and analysis_end is None):
         return df
     ts_col = _get_timestamp_col(df)
     trimmed = df.copy()
     trimmed[ts_col] = pd.to_datetime(trimmed[ts_col])
-    return trimmed[trimmed[ts_col] >= analysis_start].reset_index(drop=True)
+    mask = pd.Series(True, index=trimmed.index)
+    if analysis_start is not None:
+        mask &= trimmed[ts_col] >= analysis_start
+    if analysis_end is not None:
+        mask &= trimmed[ts_col] <= analysis_end
+    return trimmed[mask].reset_index(drop=True)
+
+
+def _normalize_conflict_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw event logs into the shape expected by conflict analysis."""
+    if events_df.empty:
+        return pd.DataFrame(columns=["run_number", "TimeStamp", "EventTypeID", "Parameter"])
+
+    df = events_df.copy()
+    rename_map: Dict[str, str] = {}
+
+    timestamp_col = _get_timestamp_col(df)
+    if timestamp_col not in df.columns:
+        raise ValueError("Conflict analysis requires a timestamp column")
+    if timestamp_col != "TimeStamp":
+        rename_map[timestamp_col] = "TimeStamp"
+
+    event_col = next(
+        (col for col in df.columns if col.lower() in ("event_id", "eventid", "eventtypeid")),
+        None,
+    )
+    if event_col is None:
+        raise ValueError("Conflict analysis requires an event_id/EventTypeID column")
+    if event_col != "EventTypeID":
+        rename_map[event_col] = "EventTypeID"
+
+    parameter_col = next(
+        (col for col in df.columns if col.lower() == "parameter"),
+        None,
+    )
+    if parameter_col is None:
+        raise ValueError("Conflict analysis requires a parameter column")
+    if parameter_col != "Parameter":
+        rename_map[parameter_col] = "Parameter"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    if "run_number" not in df.columns:
+        df["run_number"] = 1
+
+    df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce").fillna(1).astype(int)
+    df["TimeStamp"] = pd.to_datetime(df["TimeStamp"])
+    df["EventTypeID"] = pd.to_numeric(df["EventTypeID"], errors="raise").astype(int)
+    df["Parameter"] = pd.to_numeric(df["Parameter"], errors="raise").astype(int)
+
+    return (
+        df[["run_number", "TimeStamp", "EventTypeID", "Parameter"]]
+        .sort_values(["run_number", "TimeStamp", "EventTypeID", "Parameter"])
+        .reset_index(drop=True)
+    )
+
+
+def _normalize_device_csv_events(events_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw events into a single human-readable CSV schema."""
+    if events_df.empty:
+        return pd.DataFrame(columns=["timestamp", "EventId", "Parameter"])
+
+    df = events_df.copy()
+    rename_map: Dict[str, str] = {}
+
+    timestamp_col = _get_timestamp_col(df)
+    if timestamp_col != "timestamp":
+        rename_map[timestamp_col] = "timestamp"
+
+    event_col = next(
+        (col for col in df.columns if col.lower() in ("event_id", "eventid", "eventtypeid")),
+        None,
+    )
+    if event_col is None:
+        raise ValueError("Device CSV export requires an event_id/EventId/EventTypeID column")
+    if event_col != "EventId":
+        rename_map[event_col] = "EventId"
+
+    parameter_col = next(
+        (col for col in df.columns if col.lower() in ("parameter", "param")),
+        None,
+    )
+    if parameter_col is None:
+        raise ValueError("Device CSV export requires a parameter column")
+    if parameter_col != "Parameter":
+        rename_map[parameter_col] = "Parameter"
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["EventId"] = pd.to_numeric(df["EventId"], errors="raise").astype(int)
+    df["Parameter"] = pd.to_numeric(df["Parameter"], errors="raise").astype(int)
+
+    return df[["timestamp", "EventId", "Parameter"]].copy()
+
+
+def _summarize_conflicts_from_saved_events(
+    events_df: pd.DataFrame,
+    incompatible_pairs: Optional[List[Tuple[str, str]]],
+) -> Tuple[List[dict], int]:
+    """Compute per-run conflict records directly from saved event logs."""
+    if events_df.empty:
+        return [], 0
+    if not incompatible_pairs:
+        normalized = _normalize_conflict_events(events_df)
+        run_count = int(normalized["run_number"].nunique()) if not normalized.empty else 0
+        return [], run_count
+
+    normalized = _normalize_conflict_events(events_df)
+    if normalized.empty:
+        return [], 0
+
+    conflicts_found: List[dict] = []
+    run_numbers = normalized["run_number"].drop_duplicates().tolist()
+    for run_number in run_numbers:
+        run_events = normalized.loc[
+            normalized["run_number"] == run_number,
+            ["TimeStamp", "EventTypeID", "Parameter"],
+        ]
+        run_conflicts = sr.check_conflicts(run_events, incompatible_pairs)
+        if run_conflicts.empty:
+            continue
+
+        run_conflicts = run_conflicts.sort_values("TimeStamp")
+        for row in run_conflicts.itertuples(index=False):
+            conflicts_found.append({
+                "run_number": int(run_number),
+                "timestamp": pd.Timestamp(row.TimeStamp).isoformat(sep=" "),
+                "conflict_details": row.Conflict_Details,
+            })
+
+    return conflicts_found, len(run_numbers)
+
+
+def _analyze_conflict_scenario(
+    scenario: sr.TestScenario,
+    baseline_source: Path,
+    baseline_label: str,
+    collected_db_path: Path,
+    firmware_version: str,
+) -> sr.ScenarioResult:
+    """Build a conflict result from persisted baseline/new logs."""
+    baseline_events = sr.load_events(str(baseline_source))
+    collected_events = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
+
+    baseline_conflicts, baseline_runs = _summarize_conflicts_from_saved_events(
+        baseline_events,
+        scenario.incompatible_pairs,
+    )
+    new_conflicts, runs_completed = _summarize_conflicts_from_saved_events(
+        collected_events,
+        scenario.incompatible_pairs,
+    )
+
+    baseline_has_conflict = bool(baseline_conflicts)
+    new_has_conflict = bool(new_conflicts)
+    configured_pairs = bool(scenario.incompatible_pairs)
+
+    notes: List[str] = []
+    if not configured_pairs:
+        notes.append("No incompatible_pairs configured for this conflict scenario.")
+    elif baseline_has_conflict:
+        notes.append(
+            f"{baseline_label} reproduced {len(baseline_conflicts)} conflict signature(s) across {baseline_runs} run(s)."
+        )
+    else:
+        notes.append(f"{baseline_label} did not reproduce the configured conflict; test validity warning.")
+
+    if new_has_conflict:
+        conflict_runs = sorted({record["run_number"] for record in new_conflicts})
+        notes.append(
+            f"Conflict observed on {firmware_version} in run(s): {', '.join(str(run) for run in conflict_runs)}."
+        )
+    else:
+        notes.append(f"No conflicts detected on {firmware_version} across {runs_completed} completed run(s).")
+
+    passed = configured_pairs and baseline_has_conflict and not new_has_conflict
+
+    return sr.ScenarioResult(
+        scenario_id=scenario.scenario_id,
+        test_type=sr.TestType.CONFLICT,
+        firmware_version=firmware_version,
+        passed=passed,
+        conflicts_found=new_conflicts,
+        runs_completed=runs_completed,
+        total_runs=scenario.replays,
+        notes=" ".join(notes),
+        notes_column=scenario.notes_column,
+    )
 
 
 def _compute_export_shift(
@@ -605,12 +773,12 @@ def _compare_one_scenario(args: Tuple) -> dict:
     """
     Worker function for ProcessPoolExecutor.
     All arguments are plain strings/numbers to avoid pickle issues.
-    Reads from parquet files (no DuckDB needed in workers).
+    Reads collected output directly from DuckDB.
     """
-    (scenario_id, baseline_events_source, baseline_label, test_type_str, collected_parquet,
+    (scenario_id, baseline_events_source, baseline_label, test_type_str, collected_db_path,
      firmware_version, plots_dir_str, settle_minutes, group_tolerance,
       max_plots, window_minutes, verbose, notes_column, tod_align,
-          analysis_start_time, phase_call_threshold) = args
+          analysis_start_time, analysis_end_time, phase_call_threshold) = args
 
     import signal_replay as sr
     import pandas as pd
@@ -619,7 +787,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     test_type = sr.TestType.CONFLICT if test_type_str == "CONFLICT" else sr.TestType.SIMILARITY
 
     baseline = sr.load_events(baseline_events_source)
-    collected = pd.read_parquet(collected_parquet)
+    collected = _load_collected_events_from_duckdb(collected_db_path, scenario_id)
     baseline_for_analysis, collected_for_analysis, start_time_a, start_time_b = _prepare_analysis_inputs(
         baseline,
         collected,
@@ -629,18 +797,34 @@ def _compare_one_scenario(args: Tuple) -> dict:
     sparkline_base_timestamp: Optional[datetime] = None
     compare_settle_minutes = settle_minutes
     manual_analysis_start: Optional[pd.Timestamp] = None
+    manual_analysis_end: Optional[pd.Timestamp] = None
     if tod_align:
-        manual_analysis_start = _resolve_manual_analysis_start(
+        manual_analysis_start, manual_analysis_end = _resolve_manual_analysis_window(
             collected_for_analysis,
             analysis_start_time=analysis_start_time,
+            analysis_end_time=analysis_end_time,
         )
-        if manual_analysis_start is not None:
-            analysis_start = manual_analysis_start
-            baseline_for_analysis = _trim_to_analysis_start(baseline_for_analysis, analysis_start)
-            collected_for_analysis = _trim_to_analysis_start(collected_for_analysis, analysis_start)
-            start_time_a = analysis_start.to_pydatetime()
-            start_time_b = analysis_start.to_pydatetime()
-            sparkline_base_timestamp = analysis_start.to_pydatetime()
+        if manual_analysis_start is not None or manual_analysis_end is not None:
+            baseline_for_analysis = _trim_to_analysis_window(
+                baseline_for_analysis,
+                manual_analysis_start,
+                manual_analysis_end,
+            )
+            collected_for_analysis = _trim_to_analysis_window(
+                collected_for_analysis,
+                manual_analysis_start,
+                manual_analysis_end,
+            )
+            if manual_analysis_start is not None:
+                start_time_a = manual_analysis_start.to_pydatetime()
+                start_time_b = manual_analysis_start.to_pydatetime()
+                sparkline_base_timestamp = manual_analysis_start.to_pydatetime()
+            elif not baseline_for_analysis.empty:
+                start_time_a = pd.to_datetime(
+                    baseline_for_analysis[_get_timestamp_col(baseline_for_analysis)]
+                ).min().to_pydatetime()
+                start_time_b = start_time_a
+                sparkline_base_timestamp = start_time_a
             compare_settle_minutes = 0.0
         else:
             sparkline_base_timestamp = start_time_a
@@ -806,7 +990,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
 def _export_device_csvs(
     suite: sr.FirmwareTestSuite,
-    extracted_map: Dict[str, Path],
+    collected_db_map: Dict[str, str],
     baseline_sources: Dict[str, Path],
     group_tolerance: float = 0.0,
 ) -> Path:
@@ -823,8 +1007,8 @@ def _export_device_csvs(
 
     exported = 0
     for scenario in suite.scenarios:
-        collected_parquet = extracted_map.get(scenario.scenario_id)
-        if not collected_parquet:
+        collected_db_path = collected_db_map.get(scenario.scenario_id)
+        if not collected_db_path:
             continue
         baseline_source = baseline_sources.get(scenario.scenario_id)
         if baseline_source is None:
@@ -833,15 +1017,15 @@ def _export_device_csvs(
                 "skipping device CSV export for this scenario."
             )
             continue
-        if not Path(collected_parquet).exists():
+        if not Path(collected_db_path).exists():
             log(
-                f"WARNING: Missing collected parquet for {scenario.scenario_id}; "
+                f"WARNING: Missing collected DuckDB for {scenario.scenario_id}; "
                 "skipping device CSV export for this scenario."
             )
             continue
 
         baseline = sr.load_events(str(baseline_source))
-        collected = pd.read_parquet(collected_parquet)
+        collected = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
 
         original_ts_col = _get_timestamp_col(baseline)
         collected_ts_col = _get_timestamp_col(collected)
@@ -869,21 +1053,15 @@ def _export_device_csvs(
                 f"{original_shift.total_seconds():+.2f}s"
             )
 
-        if original_ts_col != "timestamp":
-            baseline = baseline.rename(columns={original_ts_col: "timestamp"})
-        if collected_ts_col != "timestamp":
-            collected = collected.rename(columns={collected_ts_col: "timestamp"})
-
-        # Drop unwanted columns, add a single DeviceId
-        drop_cols = {"device_id", "run_number"}
-        baseline = baseline.drop(columns=[c for c in baseline.columns if c in drop_cols], errors="ignore")
-        collected = collected.drop(columns=[c for c in collected.columns if c in drop_cols], errors="ignore")
+        baseline = _normalize_device_csv_events(baseline)
+        collected = _normalize_device_csv_events(collected)
 
         baseline["DeviceId"] = "baseline"
         collected["DeviceId"] = "new"
 
         combined = pd.concat([baseline, collected], ignore_index=True)
-        combined = combined.sort_values(["timestamp", "event_id", "parameter", "DeviceId"]).reset_index(drop=True)
+        combined = combined[["DeviceId", "timestamp", "EventId", "Parameter"]]
+        combined = combined.sort_values(["timestamp", "EventId", "Parameter", "DeviceId"]).reset_index(drop=True)
         csv_path = out_dir / f"{scenario.scenario_id}.csv"
         combined.to_csv(csv_path, index=False)
         exported += 1
@@ -929,10 +1107,8 @@ def run_analysis(
     else:
         log(f"Baseline logs folder not found for {settings['baseline_version']}; using source logs/ as fallback.")
 
-    version_logs_dir = get_version_logs_dir(firmware_dir, settings, firmware_version)
-    log(f"Exporting collected output logs to {version_logs_dir}...")
-    extracted_map = _extract_collected_events(suite, cp, version_logs_dir)
-    log(f"Exported {len(extracted_map)} scenario log(s).")
+    collected_db_map = cp.get("scenario_db_map", {})
+    log("Reading collected output directly from DuckDB.")
 
     baseline_sources: Dict[str, Path] = {}
     for scenario in suite.scenarios:
@@ -947,21 +1123,28 @@ def run_analysis(
 
     # Export per-device CSVs (baseline + collected combined)
     log("Exporting per-device CSV files...")
-    _export_device_csvs(suite, extracted_map, baseline_sources, group_tolerance=group_tolerance)
+    _export_device_csvs(suite, collected_db_map, baseline_sources, group_tolerance=group_tolerance)
 
     analysis_start_time = comp.get("analysis_start_time")
+    analysis_end_time = comp.get("analysis_end_time")
     if analysis_start_time:
         log(f"TOD manual analysis start time: {analysis_start_time}")
+    if analysis_end_time:
+        log(f"TOD manual analysis end time: {analysis_end_time}")
 
     # Build job list — all plain types for pickling (no DuckDB paths)
     jobs: list = []
+    conflict_jobs: List[Tuple[sr.TestScenario, Path, Path]] = []
     for scenario in suite.scenarios:
-        collected_parquet = extracted_map.get(scenario.scenario_id)
+        collected_db_path = collected_db_map.get(scenario.scenario_id)
         baseline_source = baseline_sources.get(scenario.scenario_id)
-        if not collected_parquet or not Path(collected_parquet).exists():
+        if not collected_db_path or not Path(collected_db_path).exists():
             log(f"  No output for {scenario.scenario_id}, skipping")
             continue
         if baseline_source is None:
+            continue
+        if scenario.test_type == sr.TestType.CONFLICT:
+            conflict_jobs.append((scenario, baseline_source, Path(collected_db_path)))
             continue
         test_type_str = "CONFLICT" if scenario.test_type == sr.TestType.CONFLICT else "SIMILARITY"
         jobs.append((
@@ -969,7 +1152,7 @@ def run_analysis(
             str(baseline_source),
             baseline_label,
             test_type_str,
-            str(collected_parquet),
+            str(collected_db_path),
             firmware_version,
             str(plots_dir),
             settle_minutes,
@@ -980,74 +1163,100 @@ def run_analysis(
             scenario.notes_column,
             scenario.tod_align,
             analysis_start_time,
+            analysis_end_time,
             phase_call_threshold,
         ))
 
-    if not jobs:
+    if not jobs and not conflict_jobs:
         log("No scenarios to analyze.")
         return []
 
-    n_workers = min(max_workers, len(jobs))
-    log(f"\nAnalyzing {len(jobs)} scenarios with {n_workers} workers...")
-    sys.stdout.flush()
-
     results: List[sr.ScenarioResult] = []
     done = 0
+    total_jobs = len(jobs) + len(conflict_jobs)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(_compare_one_scenario, job): job[0]
-            for job in jobs
-        }
-        for future in as_completed(futures):
-            sid = futures[future]
+    if jobs:
+        n_workers = min(max_workers, len(jobs))
+        log(f"\nAnalyzing {len(jobs)} similarity scenario(s) with {n_workers} workers...")
+        sys.stdout.flush()
+
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_compare_one_scenario, job): job[0]
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                sid = futures[future]
+                done += 1
+                try:
+                    out = future.result()
+                    results.append(sr.ScenarioResult(
+                        scenario_id=out["scenario_id"],
+                        test_type=sr.TestType.SIMILARITY,
+                        firmware_version=firmware_version,
+                        passed=out["passed"],
+                        match_percentage=out["match_percentage"],
+                        num_divergences=out["num_divergences"],
+                        notes=out["summary"],
+                        notes_column=out.get("notes_column", ""),
+                        plot_paths=out["plot_paths"],
+                        phase_differences=out["phase_diffs"],
+                        operational_differences=out.get("operational_diffs", []),
+                        runs_completed=1,
+                        total_runs=1,
+                        chunk_scores=out.get("chunk_scores", []),
+                        phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
+                        included_chunk_count=out.get("included_chunk_count", 0),
+                        excluded_chunk_count=out.get("excluded_chunk_count", 0),
+                        thrown_out=out.get("thrown_out", False),
+                        timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
+                        sparkline_svg=out.get("sparkline_svg", ""),
+                        temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
+                    ))
+                    status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
+                    plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
+                    diffs_msg = ""
+                    if out["phase_diffs"]:
+                        diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
+                        diffs_msg += sr.format_phase_differences(
+                            out["phase_diffs"], label_a=baseline_label, label_b=firmware_version
+                        )
+                    if out.get("operational_diffs"):
+                        diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
+                        diffs_msg += sr.format_phase_differences(
+                            out["operational_diffs"], label_a=baseline_label, label_b=firmware_version
+                        )
+                    log(f"  [{done}/{total_jobs}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
+                except Exception as e:
+                    log(f"  [{done}/{total_jobs}] {sid}: ERROR — {e}")
+                    if _VERBOSE:
+                        traceback.print_exc()
+
+    if conflict_jobs:
+        log(f"\nAnalyzing {len(conflict_jobs)} conflict scenario(s) from saved output logs...")
+        for scenario, baseline_source, collected_db_path in conflict_jobs:
             done += 1
             try:
-                out = future.result()
-                test_type = sr.TestType.CONFLICT if out["test_type_str"] == "CONFLICT" else sr.TestType.SIMILARITY
-                results.append(sr.ScenarioResult(
-                    scenario_id=out["scenario_id"],
-                    test_type=test_type,
-                    firmware_version=firmware_version,
-                    passed=out["passed"],
-                    match_percentage=out["match_percentage"],
-                    num_divergences=out["num_divergences"],
-                    notes=out["summary"],
-                    notes_column=out.get("notes_column", ""),
-                    plot_paths=out["plot_paths"],
-                    phase_differences=out["phase_diffs"],
-                    operational_differences=out.get("operational_diffs", []),
-                    runs_completed=1,
-                    total_runs=1,
-                    chunk_scores=out.get("chunk_scores", []),
-                    phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
-                    included_chunk_count=out.get("included_chunk_count", 0),
-                    excluded_chunk_count=out.get("excluded_chunk_count", 0),
-                    thrown_out=out.get("thrown_out", False),
-                    timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
-                    sparkline_svg=out.get("sparkline_svg", ""),
-                    temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
-                ))
-                status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
-                plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
-                diffs_msg = ""
-                if out["phase_diffs"]:
-                    diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
-                    diffs_msg += sr.format_phase_differences(
-                        out["phase_diffs"], label_a=baseline_label, label_b=firmware_version
-                    )
-                if out.get("operational_diffs"):
-                    diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
-                    diffs_msg += sr.format_phase_differences(
-                        out["operational_diffs"], label_a=baseline_label, label_b=firmware_version
-                    )
-                log(f"  [{done}/{len(jobs)}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
+                result = _analyze_conflict_scenario(
+                    scenario,
+                    baseline_source,
+                    baseline_label,
+                    collected_db_path,
+                    firmware_version,
+                )
+                results.append(result)
+                status = "PASS" if result.passed else "FAIL"
+                log(
+                    f"  [{done}/{total_jobs}] {result.scenario_id}: {status}  "
+                    f"({len(result.conflicts_found)} conflict signature(s), "
+                    f"{result.runs_completed}/{result.total_runs} runs completed)"
+                )
             except Exception as e:
-                log(f"  [{done}/{len(jobs)}] {sid}: ERROR — {e}")
+                log(f"  [{done}/{total_jobs}] {scenario.scenario_id}: ERROR — {e}")
                 if _VERBOSE:
                     traceback.print_exc()
-    # Sort results by scenario name for consistent ordering in report
-    results.sort(key=lambda r: r.scenario_id)
+
+    results.sort(key=lambda r: (0 if r.test_type == sr.TestType.SIMILARITY else 1, r.scenario_id))
     return results
 
 
@@ -1083,7 +1292,7 @@ def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path, setting
 # Main flow
 # ---------------------------------------------------------------------------
 def main() -> None:
-    global _TEST_FIRST_SEND_TIMES, _TEST_ORIGINAL_SOURCES, _TEST_TMPDIR, _VERBOSE
+    global _VERBOSE
 
     parser = argparse.ArgumentParser(description="Firmware validation: replay, compare, report.")
     parser.add_argument("--settings", default="settings.json", help="Path to settings JSON file")
@@ -1096,14 +1305,9 @@ def main() -> None:
         default=None,
         help="Override the initial minutes excluded from similarity analysis/reporting",
     )
-    parser.add_argument("--dev", action="store_true", help="Dev mode: only run 3 test devices for fast iteration")
-    parser.add_argument("--test", "-t", action="store_true",
-                        help="Test mode: shift all event timestamps to start ~1 min from now")
     args = parser.parse_args()
 
     _VERBOSE = args.verbose
-    _TEST_FIRST_SEND_TIMES = {}
-    _TEST_ORIGINAL_SOURCES = {}
 
     # Preserve the invoked workspace path on Windows rather than resolving a
     # mapped drive into its UNC share, which can break temp parquet access.
@@ -1119,13 +1323,6 @@ def main() -> None:
     log(f"signal_replay version: {sr.__version__}")
     log(f"Firmware dir:  {firmware_dir}")
     log(f"Settings:      {settings_path}")
-    log(
-        f"Analysis settle window: {settings.get('comparison', {}).get('settle_minutes', 10.0)} minutes"
-    )
-    if settings.get("comparison", {}).get("analysis_start_time"):
-        log(
-            f"TOD manual analysis start time: {settings['comparison']['analysis_start_time']}"
-        )
 
     # --- Read catalog ---
     catalog_path = firmware_dir / settings["catalog_file"]
@@ -1142,47 +1339,35 @@ def main() -> None:
         vlog(f"Loaded conflict pairs for {len(conflict_pairs)} devices")
 
     # --- Build suite ---
-    suite, scenarios, batches, file_map = build_suite(settings, firmware_dir, catalog, conflict_pairs)
+    suite, file_map = build_suite(settings, firmware_dir, catalog, conflict_pairs)
+    scenario_lookup = {scenario.scenario_id: scenario for scenario in suite.scenarios}
 
-    # Save yaml
-    yaml_path = firmware_dir / "test_suite.yaml"
-    sr.save_to_yaml(suite, str(yaml_path))
-    vlog(f"Saved: {yaml_path}")
+    if suite.analysis_start_time:
+        if suite.scenarios and all(s.tod_align for s in suite.scenarios):
+            log(
+                f"TOD manual analysis start time: {suite.analysis_start_time} "
+                "(replaces settle window for all scenarios)"
+            )
+        elif any(s.tod_align for s in suite.scenarios):
+            log(f"Analysis settle window: {suite.analysis_settle_minutes} minutes")
+            log(
+                f"TOD manual analysis start time: {suite.analysis_start_time} "
+                "(replaces settle window only for TOD-aligned scenarios)"
+            )
+        else:
+            log(f"Analysis settle window: {suite.analysis_settle_minutes} minutes")
+            log(
+                f"TOD manual analysis start time: {suite.analysis_start_time} "
+                "(no TOD-aligned scenarios currently use it)"
+            )
+    else:
+        log(f"Analysis settle window: {suite.analysis_settle_minutes} minutes")
+    if suite.analysis_end_time:
+        log(f"TOD manual analysis end time: {suite.analysis_end_time}")
 
-    _TEST_ORIGINAL_SOURCES = {scenario.scenario_id: scenario.events_source for scenario in scenarios}
-
-    # --- Dev mode filter ---
-    if args.dev:
-        before = len(scenarios)
-        scenarios = [s for s in scenarios if s.scenario_id in DEV_DEVICES]
-        suite.scenarios = scenarios
-        # Rebuild batches with only the dev devices
-        normalized_targets = [normalize_target(t) for t in settings["controller_targets"]]
-        dev_batches = []
-        for i in range(0, len(scenarios), len(normalized_targets)):
-            chunk = scenarios[i:i + len(normalized_targets)]
-            batch_num = i // len(normalized_targets) + 1
-            targets = normalized_targets[:len(chunk)]
-            dev_batches.append(sr.TestBatch(
-                batch_id=f"batch_{batch_num}",
-                assignments={s.scenario_id: t for s, t in zip(chunk, targets)},
-                description=f"Batch {batch_num}: {len(chunk)} scenarios",
-            ))
-        batches = dev_batches
-        suite.batches = batches
-        log(f"DEV MODE: filtered {before} -> {len(scenarios)} scenarios ({', '.join(s.scenario_id for s in scenarios)})")
-
-    if args.test:
-        log("TEST MODE: timestamps will be shifted for the active batch right before replay starts")
-        suite.show_progress_logs = True
-        suite.progress_log_interval_seconds = 5.0
-        log("TEST MODE: progress logs enabled every 5 seconds")
-
-    log(f"Scenarios: {len(scenarios)}  |  Batches: {len(batches)}")
+    log(f"Scenarios: {len(suite.scenarios)}  |  Batches: {len(suite.batches)}")
 
     # --- File readiness ---
-    logs_dir = firmware_dir / settings["logs_dir"]
-    databases_dir = firmware_dir / settings["databases_dir"]
     ready = sum(1 for r in catalog if file_map[r["TSSU"]]["log"])
     log(f"Logs ready: {ready}/{len(catalog)}")
 
@@ -1200,7 +1385,7 @@ def main() -> None:
         # ======================================================================
         if not args.report_only:
             while True:
-                current_batch, completed = detect_current_batch(suite, batches)
+                current_batch, completed = detect_current_batch(suite)
                 if current_batch is None:
                     log("\nAll batches complete! Proceeding to analysis.")
                     break
@@ -1211,7 +1396,7 @@ def main() -> None:
                 log(f"{'='*70}")
                 log("\nLoad these databases onto the controllers:")
                 for sid, tgt in current_batch.assignments.items():
-                    s = next(s for s in scenarios if s.scenario_id == sid)
+                    s = scenario_lookup[sid]
                     db_name = Path(s.database_name).name
                     extras = []
                     if s.test_type == sr.TestType.CONFLICT:
@@ -1224,22 +1409,13 @@ def main() -> None:
                         extras.append("tod_align=OFF")
                     extra_str = "  " + ", ".join(extras) if extras else ""
                     log(f"  {tgt:<22s}  <-  {db_name:<20s}{extra_str}")
-                    if args.test:
-                        original_path = Path(_TEST_ORIGINAL_SOURCES.get(s.scenario_id, s.events_source))
-                        if original_path.exists():
-                            preview = pd.read_parquet(original_path, columns=["timestamp"])
-                            preview["timestamp"] = pd.to_datetime(preview["timestamp"])
-                            log(
-                                f"      original first raw timestamp: {preview['timestamp'].min():%Y-%m-%d %H:%M:%S}  "
-                                f"timestamps will be shifted after controller check"
-                            )
 
                 log("")
                 input("Press ENTER when databases are loaded and controllers are ready...")
 
                 # Controller check
                 log("\nChecking controllers...")
-                db_lookup = {s.scenario_id: Path(s.database_name).name for s in scenarios}
+                db_lookup = {sid: Path(s.database_name).name for sid, s in scenario_lookup.items()}
                 b_targets = list(current_batch.assignments.values())
                 b_labels = [f"{tgt} / {db_lookup[sid]}" for sid, tgt in current_batch.assignments.items()]
 
@@ -1247,29 +1423,6 @@ def main() -> None:
                     wait_for_controllers(b_targets, b_labels)
                 except KeyboardInterrupt:
                     log("\nController check interrupted. Continuing anyway...")
-
-                if args.test:
-                    if _TEST_TMPDIR is not None and _TEST_TMPDIR.exists():
-                        shutil.rmtree(_TEST_TMPDIR, ignore_errors=True)
-                    _TEST_FIRST_SEND_TIMES = {}
-                    _TEST_TMPDIR = _shift_events_for_test_batch(current_batch, scenarios)
-
-                    log("TEST MODE: current batch timing after shift:")
-                    for sid, tgt in current_batch.assignments.items():
-                        scenario = next(s for s in scenarios if s.scenario_id == sid)
-                        shifted_path = Path(scenario.events_source)
-                        preview = pd.read_parquet(shifted_path, columns=["timestamp"])
-                        preview["timestamp"] = pd.to_datetime(preview["timestamp"])
-                        first_send = _TEST_FIRST_SEND_TIMES.get(sid)
-                        first_send_text = (
-                            f"{first_send:%Y-%m-%d %H:%M:%S}"
-                            if first_send is not None
-                            else "(unknown)"
-                        )
-                        log(
-                            f"  {tgt:<22s} first raw timestamp: {preview['timestamp'].min():%Y-%m-%d %H:%M:%S}  "
-                            f"first replay send: {first_send_text}"
-                        )
 
                 # Run replay
                 log(f"\nRunning replay for {current_batch.batch_id}...")
@@ -1279,16 +1432,16 @@ def main() -> None:
                     log("Replay interrupted by user. Exiting.")
                     sys.exit(130)
                 completed_batches = checkpoint.get("completed_batches", [])
-                remaining = [b.batch_id for b in batches if b.batch_id not in completed_batches]
+                remaining = [b.batch_id for b in suite.batches if b.batch_id not in completed_batches]
 
                 if remaining:
                     log(f"\nDone with {current_batch.batch_id}. "
-                        f"Completed: {len(completed_batches)}/{len(batches)} batches.")
+                        f"Completed: {len(completed_batches)}/{len(suite.batches)} batches.")
                     log(f"Remaining batches: {remaining}")
                     log("Run this script again for the next batch.")
                     sys.exit(0)
                 else:
-                    log(f"\nAll {len(batches)} batches complete!")
+                    log(f"\nAll {len(suite.batches)} batches complete!")
 
         # ======================================================================
         # ANALYSIS PHASE
@@ -1323,9 +1476,7 @@ def main() -> None:
 
         log("\nDone.")
     finally:
-        if _TEST_TMPDIR is not None and _TEST_TMPDIR.exists():
-            shutil.rmtree(_TEST_TMPDIR, ignore_errors=True)
-            vlog(f"Cleaned up test-mode temp dir: {_TEST_TMPDIR}")
+        pass
 
 
 if __name__ == "__main__":

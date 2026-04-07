@@ -75,6 +75,7 @@ class SignalReplay:
         self.cycle_length = config.cycle_length
         self.cycle_offset = config.cycle_offset
         self.tod_align = config.tod_align
+        self.replay_latency_offset_seconds = config.replay_latency_offset_seconds
         self.incompatible_pairs = config.incompatible_pairs
         self.simulation_speed = simulation_speed
         self.limit_minutes = config.limit_minutes if limit_minutes is None else limit_minutes
@@ -153,11 +154,37 @@ class SignalReplay:
         if 'DeviceId' not in self.input_data.columns:
             self.input_data['DeviceId'] = self.device_id
 
+        # Advance replay scheduling to compensate for measured detector delivery latency.
+        self._apply_replay_latency_offset()
+
         # Apply time-window slicing if specified
         self._apply_time_window()
         
         if self.debug:
             print(f"[{self.device_id}] Loaded {len(self.input_data)} events")
+
+    def _apply_replay_latency_offset(self) -> None:
+        """Advance detector event timestamps by the configured latency compensation."""
+        if (
+            self.input_data is None
+            or self.input_data.empty
+            or self.replay_latency_offset_seconds <= 0
+        ):
+            return
+
+        if not pd.api.types.is_datetime64_any_dtype(self.input_data['TimeStamp']):
+            self.input_data['TimeStamp'] = pd.to_datetime(self.input_data['TimeStamp'])
+
+        self.input_data['TimeStamp'] = (
+            self.input_data['TimeStamp']
+            - pd.to_timedelta(self.replay_latency_offset_seconds, unit='s')
+        )
+
+        if self.debug:
+            print(
+                f"[{self.device_id}] Advanced replay timestamps by "
+                f"{self.replay_latency_offset_seconds * 1000:.1f} ms"
+            )
     
     def _load_from_dataframe(self, df: pd.DataFrame) -> None:
         """Load events from a pandas DataFrame."""
@@ -217,6 +244,10 @@ class SignalReplay:
         suffix = Path(path).suffix.lower()
         if suffix in ('.db', '.sqlite', '.sqlite3'):
             self._load_from_sqlite(path)
+        elif suffix == '.parquet':
+            self._load_from_dataframe(pd.read_parquet(path))
+        elif suffix == '.csv':
+            self._load_from_dataframe(pd.read_csv(path))
         else:
             # Use SQL template for other file types
             template_vars = {
@@ -411,21 +442,12 @@ class SignalReplay:
             df = con.execute(sql).df()
             con.close()
             return df
-        else:
-            # Load from CSV/Parquet with DuckDB
-            sql = f"""
-                SELECT
-                    timestamp::TIMESTAMP AS timestamp,
-                    event_id::int AS event_id,
-                    parameter::int AS parameter
-                FROM '{path}'
-                ORDER BY timestamp
-            """
-            con = duckdb.connect()
-            try:
-                return con.execute(sql).df()
-            finally:
-                con.close()
+        if suffix == '.parquet':
+            return self._load_comparison_from_dataframe(pd.read_parquet(path))
+        if suffix == '.csv':
+            return self._load_comparison_from_dataframe(pd.read_csv(path))
+
+        raise ValueError(f"Unsupported file type: {suffix}. Use .csv, .parquet, or .db")
     
     async def _send_state_with_retries(
         self,

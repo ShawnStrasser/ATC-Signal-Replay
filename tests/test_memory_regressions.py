@@ -34,6 +34,56 @@ def test_signal_replay_releases_input_dataframe_after_feed_generation():
     assert replay.get_run_duration() > 0
 
 
+def test_signal_replay_loads_parquet_with_deviceid_column(tmp_path):
+    parquet_path = tmp_path / "events.parquet"
+    _detector_events().rename(columns={"device_id": "DeviceId"}).to_parquet(parquet_path, index=False)
+
+    signal = sr.SignalConfig(device_id="S1", ip="127.0.0.1", udp_port=9701, http_port=None)
+    signal.events = str(parquet_path)
+
+    replay = sr.SignalReplay(signal)
+
+    assert replay.input_data is None
+    assert replay.activation_feed is not None
+    assert replay.get_run_duration() > 0
+
+
+def test_signal_replay_loads_comparison_events_from_parquet_eventtypeid_schema(tmp_path):
+    parquet_path = tmp_path / "comparison_events.parquet"
+    detector_df = _detector_events()
+    comparison_df_source = pd.DataFrame(
+        {
+            "timestamp": [
+                pd.Timestamp("2026-01-01 09:00:01"),
+                pd.Timestamp("2026-01-01 09:00:06"),
+                pd.Timestamp("2026-01-01 09:00:11"),
+            ],
+            "event_id": [1, 7, 9],
+            "parameter": [2, 2, 2],
+            "device_id": ["S1", "S1", "S1"],
+        }
+    )
+    df = pd.concat([detector_df, comparison_df_source], ignore_index=True).rename(
+        columns={
+            "timestamp": "TimeStamp",
+            "event_id": "EventTypeID",
+            "parameter": "Parameter",
+            "device_id": "DeviceId",
+        }
+    )
+    df.to_parquet(parquet_path, index=False)
+
+    signal = sr.SignalConfig(device_id="S1", ip="127.0.0.1", udp_port=9701, http_port=None)
+    signal.events = str(parquet_path)
+
+    replay = sr.SignalReplay(signal)
+    comparison_df = replay.get_source_comparison_events()
+
+    assert list(comparison_df.columns) == ["timestamp", "event_id", "parameter"]
+    assert len(comparison_df) == len(comparison_df_source)
+    assert comparison_df["event_id"].tolist() == comparison_df_source["event_id"].tolist()
+
+
 def test_simulation_uses_preloaded_signal_events_without_central_distribution(temp_db_path):
     signal = sr.SignalConfig(device_id="S1", ip="127.0.0.1", udp_port=9701, http_port=None)
     preloaded_events = _detector_events()
@@ -112,7 +162,7 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
         db_path = runner._run_similarity_batch(batch, ["S1", "S2"], db_loader_callback=lambda *_args: True)
 
-    assert db_path == runner.run_dir / "new.duckdb"
+    assert db_path == runner.run_dir / "collected.duckdb"
     assert captured["events"] is None
     # Events should be file paths (not loaded DataFrames) to avoid holding large data in memory
     assert all(isinstance(signal.events, str) for signal in captured["signals"])
@@ -160,7 +210,7 @@ def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
     with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
         db_path = runner._run_conflict_scenario(suite.batches[0], "S1", db_loader_callback=lambda *_args: True)
 
-    assert db_path == runner.run_dir / "new.duckdb"
+    assert db_path == runner.run_dir / "collected.duckdb"
     assert captured["replays"] == 25
     assert "replace_existing_device_data" not in captured
 
@@ -187,6 +237,27 @@ def test_database_manager_rejects_old_events_schema(temp_db_path):
 
     with pytest.raises(RuntimeError, match="Unsupported events schema"):
         sr.DatabaseManager(temp_db_path)
+
+
+def test_database_manager_accepts_current_events_schema(temp_db_path):
+    con = duckdb.connect(temp_db_path)
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER,
+            PRIMARY KEY (device_id, run_number, timestamp, event_id, parameter)
+        )
+        """
+    )
+    con.close()
+
+    manager = sr.DatabaseManager(temp_db_path)
+
+    assert manager.db_path == temp_db_path
 
 
 def test_load_events_reads_sqlite_event_table(tmp_path):

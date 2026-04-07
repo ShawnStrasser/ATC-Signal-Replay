@@ -8,10 +8,15 @@
     "127.0.0.1:9706",
     "127.0.0.1:9707",
     "127.0.0.1:9708",
-    "127.0.0.1:9709"
+    "127.0.0.1:9709",
+    "127.0.0.1:9710",
+    "127.0.0.1:9711",
+    "127.0.0.1:9712",
+    "127.0.0.1:9713"
   ],
   "firmware_version": "2.17.3",
-  "baseline_version": "2.15.1",
+  "baseline_version": "baseline",
+  "replay_latency_offset_seconds": 0.185,
   "catalog_file": "databases.xlsx",
   "logs_dir": "logs",
   "databases_dir": "databases",
@@ -22,8 +27,8 @@
     "timing_threshold": 0.02,
     "match_threshold": 95.0,
     "phase_call_similarity_threshold": 85.0,
-    "settle_minutes": 10.0,
     "analysis_start_time": "09:10",
+    "analysis_end_time": "",
     "group_tolerance": 0.25,
     "max_divergence_plots": 2,
     "divergence_window_minutes": 5.0

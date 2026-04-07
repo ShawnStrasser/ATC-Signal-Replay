@@ -1,11 +1,9 @@
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import yaml
-
 from .comparison import ComparisonThresholds
+from .config import DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS
 
 
 class TestType(str, Enum):
@@ -47,6 +45,8 @@ class FirmwareTestSuite:
     phase_call_similarity_threshold: float = 90.0
     analysis_settle_minutes: float = 0.0
     analysis_start_time: str = ""
+    analysis_end_time: str = ""
+    replay_latency_offset_seconds: float = DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS
     collection_interval_minutes: float = 5.0
     post_replay_settle_seconds: float = 10.0
     snmp_timeout_seconds: float = 2.0
@@ -100,92 +100,3 @@ class ScenarioResult:
     @detector_chunk_scores.setter
     def detector_chunk_scores(self, value: List[dict]) -> None:
         self.phase_call_chunk_scores = value
-
-
-def _serialize_suite(suite: FirmwareTestSuite) -> dict:
-    data = asdict(suite)
-
-    def _to_plain(value):
-        if isinstance(value, Enum):
-            return value.value
-        if isinstance(value, dict):
-            return {k: _to_plain(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_to_plain(v) for v in value]
-        if isinstance(value, tuple):
-            return [_to_plain(v) for v in value]
-        return value
-
-    if suite.comparison_thresholds is not None:
-        data["comparison_thresholds"] = asdict(suite.comparison_thresholds)
-
-    return _to_plain(data)
-
-
-def save_to_yaml(suite: FirmwareTestSuite, path: str) -> None:
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(_serialize_suite(suite), f, sort_keys=False)
-
-
-def load_from_yaml(path: str) -> FirmwareTestSuite:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-
-    thresholds_data = data.get("comparison_thresholds")
-    thresholds = ComparisonThresholds(**thresholds_data) if thresholds_data else None
-
-    scenarios = []
-    for item in data.get("scenarios", []):
-        raw_pairs = item.get("incompatible_pairs")
-        normalized_pairs = None
-        if raw_pairs is not None:
-            normalized_pairs = [tuple(pair) for pair in raw_pairs]
-
-        scenarios.append(
-            TestScenario(
-                scenario_id=item["scenario_id"],
-                database_name=item["database_name"],
-                events_source=item["events_source"],
-                test_type=TestType(item["test_type"]),
-                replays=item.get("replays", 1),
-                incompatible_pairs=normalized_pairs,
-                description=item.get("description", ""),
-                notes_column=item.get("notes_column", ""),
-                tod_align=item.get("tod_align", True),
-                cycle_length=item.get("cycle_length", 0),
-                cycle_offset=item.get("cycle_offset", 0.0),
-            )
-        )
-
-    batches = [
-        TestBatch(
-            batch_id=item["batch_id"],
-            assignments=item.get("assignments", {}),
-            description=item.get("description", ""),
-        )
-        for item in data.get("batches", [])
-    ]
-
-    return FirmwareTestSuite(
-        suite_name=data["suite_name"],
-        firmware_version=data["firmware_version"],
-        baseline_version=data["baseline_version"],
-        scenarios=scenarios,
-        batches=batches,
-        output_dir=data.get("output_dir", "./firmware_test_results"),
-        comparison_thresholds=thresholds,
-        phase_call_similarity_threshold=data.get("phase_call_similarity_threshold", data.get("detector_similarity_threshold", 90.0)),
-        analysis_settle_minutes=data.get("analysis_settle_minutes", 0.0),
-        analysis_start_time=data.get("analysis_start_time", ""),
-        collection_interval_minutes=data.get("collection_interval_minutes", 5.0),
-        post_replay_settle_seconds=data.get("post_replay_settle_seconds", 10.0),
-        snmp_timeout_seconds=data.get("snmp_timeout_seconds", 2.0),
-        snmp_send_retries=data.get("snmp_send_retries", 1),
-        snmp_retry_backoff_seconds=data.get("snmp_retry_backoff_seconds", 0.25),
-        heartbeat_enabled=data.get("heartbeat_enabled", True),
-        heartbeat_interval_seconds=data.get("heartbeat_interval_seconds", 5.0),
-        show_progress_logs=data.get("show_progress_logs", False),
-        progress_log_interval_seconds=data.get("progress_log_interval_seconds", 60.0),
-    )

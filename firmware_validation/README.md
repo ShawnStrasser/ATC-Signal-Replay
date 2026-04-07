@@ -10,15 +10,16 @@ firmware_validation/
 	databases/               # Controller databases you manually load onto controllers
 	logs/                    # Replay input event logs used by signal_replay
 	conflict_monitor/        # Conflict pair definitions (conflict_pairs.json)
-	results/                 # Per-version replay output, extracted logs, and reports
-	test_suite.yaml          # Auto-generated test suite config (do not edit by hand)
+	results/                 # Per-version replay output, DuckDB, CSVs, and reports
 	walkthrough.ipynb        # Main notebook for running validations
 	get_data.ipynb           # Notebook for pulling raw event logs from the database
 ```
 
 Each replay run keeps `logs/` as the immutable source input folder. Collected
-controller output is written under `results/<firmware_version>/logs/` and is
-used as the comparison baseline for later firmware versions.
+controller output is persisted in `results/<firmware_version>/collected.duckdb`.
+Analysis reads directly from that DuckDB file. If you explicitly want one
+Parquet file per device under `results/<firmware_version>/logs/`, use the
+archive/export path after the run.
 
 ## `databases.xlsx` (Required Columns)
 
@@ -78,10 +79,10 @@ Examples:
 4. Run firmware validation:
 	 - Step 1 builds scenarios and batches from Excel.
 	 - Step 2 replays source logs from `logs/` to the target firmware.
-	 - Step 3 writes collected output to `results/<firmware_version>/logs/`.
-	 - Step 4 compares `results/<firmware_version>/logs/` to `results/<baseline_version>/logs/` when available.
+	 - Step 3 stores collected output in `results/<firmware_version>/collected.duckdb`.
+	 - Step 4 compares that collected output to `results/<baseline_version>/logs/` when available.
 	 - Step 5 falls back to `logs/` only when the baseline version folder does not exist.
-	 - Step 6 generates HTML report.
+	 - Step 6 exports human-readable `device_events/*.csv` files and generates the HTML report.
 
 ## Conflict Monitoring Behavior
 
@@ -90,4 +91,6 @@ Examples:
 	- run continues even if conflicts are found.
 - Conflict batches run with `stop_on_conflict=True`:
 	- run stops when conflict is detected.
-- Conflict checks occur during periodic collection (`collection_interval_minutes`) and once more during final end-of-run collection.
+- Conflict scenarios are grouped after all similarity batches, so they execute at the end of the run.
+- Runtime conflict stopping happens on the final collection pass after each replayed run.
+- Report generation recomputes conflict results from the saved output logs rather than reusing replay-time conflict table state.

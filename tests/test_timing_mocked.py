@@ -243,7 +243,7 @@ class TestOrchestratorTimingWithMocks:
             def get_max_run_number(self, device_ids=None):
                 return 0
 
-            def clear_run_data(self, _run_number=None):
+            def clear_run_data(self, _run_number=None, device_ids=None):
                 return None
 
             def mark_run_started(self, _run_number):
@@ -326,7 +326,7 @@ class TestOrchestratorTimingWithMocks:
             def get_max_run_number(self, device_ids=None):
                 return 2
 
-            def clear_run_data(self, _run_number=None):
+            def clear_run_data(self, _run_number=None, device_ids=None):
                 return None
 
             def mark_run_started(self, run_number):

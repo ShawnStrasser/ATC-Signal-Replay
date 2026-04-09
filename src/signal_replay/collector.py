@@ -599,11 +599,30 @@ class DatabaseManager:
             con.close()
         return df
     
-    def clear_run_data(self, run_number: Optional[int] = None) -> None:
-        """Clear data for a specific run or all runs."""
+    def clear_run_data(
+        self,
+        run_number: Optional[int] = None,
+        device_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Clear data for a specific run or all runs, optionally scoped to devices."""
+        if device_ids is not None and not device_ids:
+            return
+
         con = self._connect_with_retry()
         try:
-            if run_number is not None:
+            if device_ids:
+                placeholders = ",".join(["?"] * len(device_ids))
+                params: List[object] = []
+                where_clauses: List[str] = []
+                if run_number is not None:
+                    where_clauses.append("run_number = ?")
+                    params.append(run_number)
+                where_clauses.append(f"device_id IN ({placeholders})")
+                params.extend(device_ids)
+                where_sql = " WHERE " + " AND ".join(where_clauses)
+                con.execute(f"DELETE FROM events{where_sql}", params)
+                con.execute(f"DELETE FROM conflicts{where_sql}", params)
+            elif run_number is not None:
                 con.execute("DELETE FROM events WHERE run_number = ?", [run_number])
                 con.execute("DELETE FROM conflicts WHERE run_number = ?", [run_number])
             else:

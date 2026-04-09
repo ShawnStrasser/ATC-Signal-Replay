@@ -339,6 +339,30 @@ class BatchRunner:
             self.logger.warning("Stop requested for active simulation")
             self._active_simulation.request_stop()
 
+    def run_batch_once(
+        self,
+        batch,
+        db_loader_callback: Optional[Callable[[str, str], bool]] = None,
+    ) -> Path:
+        """Run a single batch without checkpoint-based batch tracking."""
+        scenario_ids = list(batch.assignments.keys())
+        similarity_ids = [
+            sid for sid in scenario_ids if self._get_scenario(sid).test_type == TestType.SIMILARITY
+        ]
+        conflict_ids = [
+            sid for sid in scenario_ids if self._get_scenario(sid).test_type == TestType.CONFLICT
+        ]
+
+        try:
+            self._run_similarity_batch(batch, similarity_ids, db_loader_callback)
+            for sid in conflict_ids:
+                self._run_conflict_scenario(batch, sid, db_loader_callback)
+        except Exception:
+            self._clear_scenario_data(self._shared_db_path(), scenario_ids)
+            raise
+
+        return self._shared_db_path()
+
     def run(
         self,
         db_loader_callback: Optional[Callable[[str, str], bool]] = None,

@@ -112,6 +112,7 @@ def read_catalog(catalog_path: Path) -> List[dict]:
             "CycleLength": cycle_length,
             "Offset": offset,
             "Notes": r.get("notes", ""),
+            "ReplaceOnRerun": r.get("replace on rerun", ""),
         })
     return catalog
 
@@ -155,10 +156,8 @@ def build_suite(
 
     logs_dir = firmware_dir / settings["logs_dir"]
     databases_dir = firmware_dir / settings["databases_dir"]
-    controller_targets = settings["controller_targets"]
     firmware_version = settings["firmware_version"]
     _baseline_logs_dir, baseline_version = resolve_baseline_logs_dir(firmware_dir, settings)
-    batch_size = len(controller_targets)
 
     file_map: Dict[str, dict] = {}
     for r in catalog:
@@ -214,18 +213,6 @@ def build_suite(
     if skipped:
         log(f"Skipped (no log): {', '.join(skipped)}")
 
-    normalized_targets = [normalize_target(t) for t in controller_targets]
-    batches: List[sr.TestBatch] = []
-    for i in range(0, len(scenarios), batch_size):
-        chunk = scenarios[i:i + batch_size]
-        batch_num = i // batch_size + 1
-        targets = normalized_targets[:len(chunk)]
-        batches.append(sr.TestBatch(
-            batch_id=f"batch_{batch_num}",
-            assignments={s.scenario_id: t for s, t in zip(chunk, targets)},
-            description=f"Batch {batch_num}: {len(chunk)} scenarios",
-        ))
-
     comp = settings.get("comparison", {})
     configured_settle_minutes = comp.get("settle_minutes", 10.0)
     analysis_start_time = str(comp.get("analysis_start_time", "")).strip()
@@ -239,7 +226,7 @@ def build_suite(
         firmware_version=firmware_version,
         baseline_version=baseline_version,
         scenarios=scenarios,
-        batches=batches,
+        batches=[],
         output_dir=str(firmware_dir / settings["results_dir"]),
         comparison_thresholds=sr.ComparisonThresholds(
             sequence_threshold=comp.get("sequence_threshold", 0.05),
@@ -253,6 +240,92 @@ def build_suite(
     )
 
     return suite, file_map
+
+
+def _replace_on_rerun_enabled(value: object) -> bool:
+    return str(value).strip().lower() == "yes"
+
+
+def _shared_collected_db_path(suite: sr.FirmwareTestSuite) -> Path:
+    return Path(suite.output_dir) / suite.firmware_version / "collected.duckdb"
+
+
+def _get_collected_device_ids(db_path: Path) -> set[str]:
+    if not db_path.exists():
+        return set()
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        tables = {
+            row[0].lower()
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+
+        device_ids: set[str] = set()
+        if "events" in tables:
+            device_ids.update(
+                row[0]
+                for row in con.execute(
+                    "SELECT DISTINCT device_id FROM events WHERE device_id IS NOT NULL"
+                ).fetchall()
+            )
+        if "conflicts" in tables:
+            device_ids.update(
+                row[0]
+                for row in con.execute(
+                    "SELECT DISTINCT device_id FROM conflicts WHERE device_id IS NOT NULL"
+                ).fetchall()
+            )
+        return device_ids
+    finally:
+        con.close()
+
+
+def _select_pending_replay_batch(
+    suite: sr.FirmwareTestSuite,
+    settings: dict,
+    catalog: List[dict],
+    existing_ids: set[str],
+) -> Tuple[Optional[sr.TestBatch], List[sr.TestScenario], List[str], List[str]]:
+    replace_flags = {
+        row["TSSU"]: _replace_on_rerun_enabled(row.get("ReplaceOnRerun", ""))
+        for row in catalog
+    }
+    pending_scenarios = [
+        scenario
+        for scenario in suite.scenarios
+        if replace_flags.get(scenario.scenario_id, False) or scenario.scenario_id not in existing_ids
+    ]
+    if not pending_scenarios:
+        return None, [], [], []
+
+    normalized_targets = [normalize_target(target) for target in settings["controller_targets"]]
+    selected = pending_scenarios[:len(normalized_targets)]
+    batch = sr.TestBatch(
+        batch_id="pending_replay",
+        assignments={scenario.scenario_id: target for scenario, target in zip(selected, normalized_targets)},
+        description=f"Pending replay batch: {len(selected)} scenario(s)",
+    )
+    replace_selected = [
+        scenario.scenario_id
+        for scenario in selected
+        if replace_flags.get(scenario.scenario_id, False)
+    ]
+    skipped_existing = [
+        scenario.scenario_id
+        for scenario in suite.scenarios
+        if scenario.scenario_id in existing_ids and not replace_flags.get(scenario.scenario_id, False)
+    ]
+    return batch, pending_scenarios[len(selected):], replace_selected, skipped_existing
+
+
+def _clear_selected_devices_for_rerun(db_path: Path, scenario_ids: List[str]) -> None:
+    if not scenario_ids or not db_path.exists():
+        return
+
+    sr.DatabaseManager(str(db_path)).clear_device_data(scenario_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -305,33 +378,9 @@ def wait_for_controllers(targets: List[str], labels: List[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Batch operations
+# Replay operations
 # ---------------------------------------------------------------------------
-def detect_current_batch(suite: sr.FirmwareTestSuite) -> Tuple[Optional[sr.TestBatch], set]:
-    checkpoint_path = Path(suite.output_dir) / suite.firmware_version / "checkpoint.json"
-    completed: set = set()
-    batch_members: Dict[str, List[str]] = {}
-    if checkpoint_path.exists():
-        with open(checkpoint_path) as f:
-            ck = json.load(f)
-        completed = set(ck.get("completed_batches", []))
-        batch_members = ck.get("batch_members", {})
-        log(
-            f"Checkpoint found: {checkpoint_path} "
-            f"({len(completed)} completed batch(es): {sorted(completed) if completed else 'none'})"
-        )
-    else:
-        log(f"No checkpoint found at {checkpoint_path}; starting from the first batch.")
-
-    for b in suite.batches:
-        if b.batch_id not in completed:
-            return b, completed
-        if batch_members.get(b.batch_id) != sorted(b.assignments.keys()):
-            return b, completed
-    return None, completed
-
-
-def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> dict:
+def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> Path:
     runner = sr.BatchRunner(suite, debug=_VERBOSE)
 
     def auto_db_loader(db_name: str, target: str) -> bool:
@@ -339,10 +388,7 @@ def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> dict:
         return True
 
     try:
-        return runner.run(
-            db_loader_callback=auto_db_loader,
-            batch_ids=[batch.batch_id],
-        )
+        return runner.run_batch_once(batch, db_loader_callback=auto_db_loader)
     except KeyboardInterrupt:
         log("\nKeyboard interrupt received. Requesting replay shutdown...")
         runner.stop()
@@ -354,7 +400,7 @@ def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> dict:
 # ---------------------------------------------------------------------------
 def _extract_collected_events(
     suite: sr.FirmwareTestSuite,
-    cp: dict,
+    collected_db_path: Path,
     output_dir: Path,
 ) -> Dict[str, Path]:
     """
@@ -362,28 +408,23 @@ def _extract_collected_events(
     Returns a mapping of scenario_id -> parquet path.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Group scenarios by their duckdb file to minimize open/close cycles
-    db_to_scenarios: Dict[str, List[str]] = {}
-    for scenario in suite.scenarios:
-        db_path = cp["scenario_db_map"].get(scenario.scenario_id)
-        if db_path:
-            db_to_scenarios.setdefault(db_path, []).append(scenario.scenario_id)
+    if not collected_db_path.exists():
+        return {}
 
     extracted: Dict[str, Path] = {}
-    for db_path, scenario_ids in db_to_scenarios.items():
-        vlog(f"  Extracting from {Path(db_path).name}: {len(scenario_ids)} scenarios")
-        con = duckdb.connect(db_path, read_only=True)
-        try:
-            for sid in scenario_ids:
-                df = con.execute(
-                    "SELECT * FROM events WHERE device_id = ? ORDER BY timestamp",
-                    [sid],
-                ).df()
-                out_path = output_dir / f"{sid}.parquet"
-                df.to_parquet(out_path, index=False)
-                extracted[sid] = out_path
-        finally:
-            con.close()
+    vlog(f"  Extracting from {collected_db_path.name}: {len(suite.scenarios)} scenarios")
+    con = duckdb.connect(str(collected_db_path), read_only=True)
+    try:
+        for scenario in suite.scenarios:
+            df = con.execute(
+                "SELECT * FROM events WHERE device_id = ? ORDER BY timestamp",
+                [scenario.scenario_id],
+            ).df()
+            out_path = output_dir / f"{scenario.scenario_id}.parquet"
+            df.to_parquet(out_path, index=False)
+            extracted[scenario.scenario_id] = out_path
+    finally:
+        con.close()
     return extracted
 
 
@@ -414,6 +455,14 @@ def _load_collected_events_from_duckdb(db_path: Path | str, scenario_id: str) ->
         return con.execute(query, [scenario_id]).df()
     finally:
         con.close()
+
+
+def _missing_collected_error(scenario_id: str, collected_db_path: Path | str) -> str:
+    return (
+        f"No collected events found for {scenario_id} in {Path(collected_db_path).name}. "
+        "Replay data for this scenario is missing, so the comparison and device CSV export are invalid "
+        "until that device is collected again."
+    )
 
 
 def _get_timestamp_col(df: pd.DataFrame) -> str:
@@ -689,6 +738,18 @@ def _analyze_conflict_scenario(
     baseline_events = sr.load_events(str(baseline_source))
     collected_events = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
 
+    if collected_events.empty:
+        return sr.ScenarioResult(
+            scenario_id=scenario.scenario_id,
+            test_type=sr.TestType.CONFLICT,
+            firmware_version=firmware_version,
+            passed=False,
+            runs_completed=0,
+            total_runs=scenario.replays,
+            error=_missing_collected_error(scenario.scenario_id, collected_db_path),
+            notes_column=scenario.notes_column,
+        )
+
     baseline_conflicts, baseline_runs = _summarize_conflicts_from_saved_events(
         baseline_events,
         scenario.incompatible_pairs,
@@ -788,6 +849,29 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
     baseline = sr.load_events(baseline_events_source)
     collected = _load_collected_events_from_duckdb(collected_db_path, scenario_id)
+    if collected.empty:
+        return {
+            "scenario_id": scenario_id,
+            "passed": False,
+            "match_percentage": None,
+            "num_divergences": 0,
+            "summary": "",
+            "error": _missing_collected_error(scenario_id, collected_db_path),
+            "plot_paths": [],
+            "phase_diffs": [],
+            "operational_diffs": [],
+            "timeline_difference_analysis_available": False,
+            "notes_column": notes_column,
+            "chunk_scores": [],
+            "phase_call_chunk_scores": [],
+            "included_chunk_count": 0,
+            "excluded_chunk_count": 0,
+            "thrown_out": False,
+            "temporal_shift_seconds": 0.0,
+            "sparkline_svg": "",
+            "runs_completed": 0,
+            "total_runs": 1,
+        }
     baseline_for_analysis, collected_for_analysis, start_time_a, start_time_b = _prepare_analysis_inputs(
         baseline,
         collected,
@@ -978,6 +1062,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
         "excluded_chunk_count": result.excluded_chunk_count,
         "thrown_out": result.thrown_out,
         "temporal_shift_seconds": result.temporal_shift_seconds,
+        "runs_completed": 1,
+        "total_runs": 1,
         "sparkline_svg": sr.render_sparkline_svg(
             result.chunk_scores,
             pass_threshold=95.0,
@@ -990,7 +1076,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
 def _export_device_csvs(
     suite: sr.FirmwareTestSuite,
-    collected_db_map: Dict[str, str],
+    collected_db_path: Path,
     baseline_sources: Dict[str, Path],
     group_tolerance: float = 0.0,
 ) -> Path:
@@ -1005,11 +1091,12 @@ def _export_device_csvs(
     out_dir = Path(suite.output_dir) / suite.firmware_version / "device_events"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if not collected_db_path.exists():
+        log(f"Collected DuckDB not found for device CSV export: {collected_db_path}")
+        return out_dir
+
     exported = 0
     for scenario in suite.scenarios:
-        collected_db_path = collected_db_map.get(scenario.scenario_id)
-        if not collected_db_path:
-            continue
         baseline_source = baseline_sources.get(scenario.scenario_id)
         if baseline_source is None:
             log(
@@ -1017,15 +1104,22 @@ def _export_device_csvs(
                 "skipping device CSV export for this scenario."
             )
             continue
-        if not Path(collected_db_path).exists():
-            log(
-                f"WARNING: Missing collected DuckDB for {scenario.scenario_id}; "
-                "skipping device CSV export for this scenario."
-            )
-            continue
 
         baseline = sr.load_events(str(baseline_source))
         collected = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
+
+        if baseline.empty:
+            log(
+                f"WARNING: Baseline log for {scenario.scenario_id} has no rows; "
+                "skipping device CSV export for this scenario."
+            )
+            continue
+        if collected.empty:
+            log(
+                f"WARNING: No collected events found in DuckDB for {scenario.scenario_id}; "
+                "skipping device CSV export for this scenario."
+            )
+            continue
 
         original_ts_col = _get_timestamp_col(baseline)
         collected_ts_col = _get_timestamp_col(collected)
@@ -1055,6 +1149,14 @@ def _export_device_csvs(
 
         baseline = _normalize_device_csv_events(baseline)
         collected = _normalize_device_csv_events(collected)
+
+        if baseline.empty or collected.empty:
+            missing_side = "baseline" if baseline.empty else "collected"
+            log(
+                f"WARNING: Normalized device CSV export for {scenario.scenario_id} is missing "
+                f"{missing_side} rows; skipping export."
+            )
+            continue
 
         baseline["DeviceId"] = "baseline"
         collected["DeviceId"] = "new"
@@ -1086,20 +1188,9 @@ def run_analysis(
     phase_call_threshold = comp.get("phase_call_similarity_threshold", comp.get("detector_similarity_threshold", 90.0))
     max_workers = settings.get("analysis_workers", 4)
 
-    # Load checkpoint
-    checkpoint_path = Path(suite.output_dir) / firmware_version / "checkpoint.json"
-    with open(checkpoint_path) as f:
-        cp = json.load(f)
-
-    completed = cp.get("completed_batches", [])
-    total_batches = [b.batch_id for b in suite.batches]
-    if set(total_batches) - set(completed):
-        missing = sorted(set(total_batches) - set(completed))
-        log(f"WARNING: Not all batches complete. Missing: {missing}")
-        log("         Report will only cover completed batches.")
-
     plots_dir = Path(suite.output_dir) / firmware_version / "divergence_plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
+    collected_db_path = _shared_collected_db_path(suite)
 
     baseline_logs_dir, baseline_label = resolve_baseline_logs_dir(firmware_dir, settings)
     if baseline_logs_dir is not None:
@@ -1107,8 +1198,10 @@ def run_analysis(
     else:
         log(f"Baseline logs folder not found for {settings['baseline_version']}; using source logs/ as fallback.")
 
-    collected_db_map = cp.get("scenario_db_map", {})
-    log("Reading collected output directly from DuckDB.")
+    if collected_db_path.exists():
+        log(f"Reading collected output directly from DuckDB: {collected_db_path}")
+    else:
+        log(f"Collected DuckDB not found: {collected_db_path}")
 
     baseline_sources: Dict[str, Path] = {}
     for scenario in suite.scenarios:
@@ -1123,7 +1216,7 @@ def run_analysis(
 
     # Export per-device CSVs (baseline + collected combined)
     log("Exporting per-device CSV files...")
-    _export_device_csvs(suite, collected_db_map, baseline_sources, group_tolerance=group_tolerance)
+    _export_device_csvs(suite, collected_db_path, baseline_sources, group_tolerance=group_tolerance)
 
     analysis_start_time = comp.get("analysis_start_time")
     analysis_end_time = comp.get("analysis_end_time")
@@ -1136,15 +1229,14 @@ def run_analysis(
     jobs: list = []
     conflict_jobs: List[Tuple[sr.TestScenario, Path, Path]] = []
     for scenario in suite.scenarios:
-        collected_db_path = collected_db_map.get(scenario.scenario_id)
         baseline_source = baseline_sources.get(scenario.scenario_id)
-        if not collected_db_path or not Path(collected_db_path).exists():
+        if not collected_db_path.exists():
             log(f"  No output for {scenario.scenario_id}, skipping")
             continue
         if baseline_source is None:
             continue
         if scenario.test_type == sr.TestType.CONFLICT:
-            conflict_jobs.append((scenario, baseline_source, Path(collected_db_path)))
+            conflict_jobs.append((scenario, baseline_source, collected_db_path))
             continue
         test_type_str = "CONFLICT" if scenario.test_type == sr.TestType.CONFLICT else "SIMILARITY"
         jobs.append((
@@ -1197,13 +1289,14 @@ def run_analysis(
                         passed=out["passed"],
                         match_percentage=out["match_percentage"],
                         num_divergences=out["num_divergences"],
+                        error=out.get("error"),
                         notes=out["summary"],
                         notes_column=out.get("notes_column", ""),
                         plot_paths=out["plot_paths"],
                         phase_differences=out["phase_diffs"],
                         operational_differences=out.get("operational_diffs", []),
-                        runs_completed=1,
-                        total_runs=1,
+                        runs_completed=out.get("runs_completed", 1),
+                        total_runs=out.get("total_runs", 1),
                         chunk_scores=out.get("chunk_scores", []),
                         phase_call_chunk_scores=out.get("phase_call_chunk_scores", out.get("detector_chunk_scores", [])),
                         included_chunk_count=out.get("included_chunk_count", 0),
@@ -1213,7 +1306,10 @@ def run_analysis(
                         sparkline_svg=out.get("sparkline_svg", ""),
                         temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
                     ))
-                    status = "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
+                    status = "ERROR" if out.get("error") else (
+                        "THROWN OUT" if out.get("thrown_out") else ("PASS" if out["passed"] else "FAIL")
+                    )
+                    match_text = "n/a" if out.get("match_percentage") is None else f"{out['match_percentage']:.1f}%"
                     plots_msg = f", {len(out['plot_paths'])} charts" if out["plot_paths"] else ""
                     diffs_msg = ""
                     if out["phase_diffs"]:
@@ -1226,7 +1322,8 @@ def run_analysis(
                         diffs_msg += sr.format_phase_differences(
                             out["operational_diffs"], label_a=baseline_label, label_b=firmware_version
                         )
-                    log(f"  [{done}/{total_jobs}] {out['scenario_id']}: {out['match_percentage']:.1f}%  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}")
+                    error_msg = f"\n    {out['error']}" if out.get("error") else ""
+                    log(f"  [{done}/{total_jobs}] {out['scenario_id']}: {match_text}  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}{error_msg}")
                 except Exception as e:
                     log(f"  [{done}/{total_jobs}] {sid}: ERROR — {e}")
                     if _VERBOSE:
@@ -1245,7 +1342,7 @@ def run_analysis(
                     firmware_version,
                 )
                 results.append(result)
-                status = "PASS" if result.passed else "FAIL"
+                status = "ERROR" if result.error else ("PASS" if result.passed else "FAIL")
                 log(
                     f"  [{done}/{total_jobs}] {result.scenario_id}: {status}  "
                     f"({len(result.conflicts_found)} conflict signature(s), "
@@ -1279,12 +1376,12 @@ def build_report(
 # ---------------------------------------------------------------------------
 def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path, settings: dict) -> None:
     fw_ver = suite.firmware_version
-    checkpoint_path = Path(suite.output_dir) / fw_ver / "checkpoint.json"
-    with open(checkpoint_path) as f:
-        cp = json.load(f)
-
+    collected_db_path = _shared_collected_db_path(suite)
+    if not collected_db_path.exists():
+        log(f"No collected DuckDB found to export: {collected_db_path}")
+        return
     output_dir = get_version_logs_dir(firmware_dir, settings, fw_ver)
-    extracted_map = _extract_collected_events(suite, cp, output_dir)
+    extracted_map = _extract_collected_events(suite, collected_db_path, output_dir)
     log(f"Collected logs refreshed in {output_dir} ({len(extracted_map)} scenario(s)).")
 
 
@@ -1365,7 +1462,7 @@ def main() -> None:
     if suite.analysis_end_time:
         log(f"TOD manual analysis end time: {suite.analysis_end_time}")
 
-    log(f"Scenarios: {len(suite.scenarios)}  |  Batches: {len(suite.batches)}")
+    log(f"Scenarios: {len(suite.scenarios)}  |  Controllers: {len(settings['controller_targets'])}")
 
     # --- File readiness ---
     ready = sum(1 for r in catalog if file_map[r["TSSU"]]["log"])
@@ -1384,15 +1481,33 @@ def main() -> None:
         # REPLAY PHASE
         # ======================================================================
         if not args.report_only:
-            while True:
-                current_batch, completed = detect_current_batch(suite)
-                if current_batch is None:
-                    log("\nAll batches complete! Proceeding to analysis.")
-                    break
+            existing_ids = _get_collected_device_ids(_shared_collected_db_path(suite))
+            current_batch, remaining_pending, replace_selected, skipped_existing = _select_pending_replay_batch(
+                suite,
+                settings,
+                catalog,
+                existing_ids,
+            )
+
+            if skipped_existing:
+                vlog(
+                    "Already collected; skipping unless Replace on Rerun = yes: "
+                    + ", ".join(skipped_existing)
+                )
+
+            if current_batch is None:
+                log("\nNo pending replay devices in the current catalog. Proceeding to analysis.")
+            else:
+                shared_db_path = _shared_collected_db_path(suite)
+                if replace_selected:
+                    log(
+                        "Replace on Rerun = yes; clearing existing data for: "
+                        + ", ".join(replace_selected)
+                    )
+                    _clear_selected_devices_for_rerun(shared_db_path, replace_selected)
 
                 log(f"\n{'='*70}")
-                log(f"BATCH: {current_batch.batch_id}  ({len(current_batch.assignments)} scenarios)")
-                log(f"Completed so far: {sorted(completed) if completed else '(none)'}")
+                log(f"REPLAY: Next Pending Batch  ({len(current_batch.assignments)} scenarios)")
                 log(f"{'='*70}")
                 log("\nLoad these databases onto the controllers:")
                 for sid, tgt in current_batch.assignments.items():
@@ -1413,7 +1528,6 @@ def main() -> None:
                 log("")
                 input("Press ENTER when databases are loaded and controllers are ready...")
 
-                # Controller check
                 log("\nChecking controllers...")
                 db_lookup = {sid: Path(s.database_name).name for sid, s in scenario_lookup.items()}
                 b_targets = list(current_batch.assignments.values())
@@ -1424,24 +1538,22 @@ def main() -> None:
                 except KeyboardInterrupt:
                     log("\nController check interrupted. Continuing anyway...")
 
-                # Run replay
-                log(f"\nRunning replay for {current_batch.batch_id}...")
+                log("\nRunning replay for the next pending devices...")
                 try:
-                    checkpoint = run_batch(suite, current_batch)
+                    run_batch(suite, current_batch)
                 except KeyboardInterrupt:
                     log("Replay interrupted by user. Exiting.")
                     sys.exit(130)
-                completed_batches = checkpoint.get("completed_batches", [])
-                remaining = [b.batch_id for b in suite.batches if b.batch_id not in completed_batches]
 
-                if remaining:
-                    log(f"\nDone with {current_batch.batch_id}. "
-                        f"Completed: {len(completed_batches)}/{len(suite.batches)} batches.")
-                    log(f"Remaining batches: {remaining}")
-                    log("Run this script again for the next batch.")
+                if remaining_pending:
+                    log(
+                        "\nReplay batch complete. Remaining pending devices from the current catalog: "
+                        + ", ".join(s.scenario_id for s in remaining_pending)
+                    )
+                    log("Run this script again to continue with the next pending devices.")
                     sys.exit(0)
-                else:
-                    log(f"\nAll {len(suite.batches)} batches complete!")
+
+                log("\nAll pending devices from the current catalog have been collected. Proceeding to analysis.")
 
         # ======================================================================
         # ANALYSIS PHASE

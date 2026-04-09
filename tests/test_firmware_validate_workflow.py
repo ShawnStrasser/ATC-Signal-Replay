@@ -1,6 +1,8 @@
 import importlib.util
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import duckdb
 import pandas as pd
@@ -148,10 +150,7 @@ def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path
     suite, _file_map = firmware_validate.build_suite(settings, firmware_dir, catalog, {})
 
     assert [scenario.scenario_id for scenario in suite.scenarios] == ["S1", "S2", "C1", "C2"]
-    assert [batch.assignments for batch in suite.batches] == [
-        {"S1": "127.0.0.1:9701:9701", "S2": "127.0.0.1:9702:9702"},
-        {"C1": "127.0.0.1:9701:9701", "C2": "127.0.0.1:9702:9702"},
-    ]
+    assert suite.batches == []
     assert [scenario.test_type for scenario in suite.scenarios[:2]] == [sr.TestType.SIMILARITY, sr.TestType.SIMILARITY]
     assert [scenario.test_type for scenario in suite.scenarios[2:]] == [sr.TestType.CONFLICT, sr.TestType.CONFLICT]
 
@@ -220,7 +219,7 @@ def test_extract_collected_events_writes_versioned_logs(tmp_path):
 
     exported = firmware_validate._extract_collected_events(
         suite,
-        {"scenario_db_map": {"S1": str(db_path)}},
+        db_path,
         tmp_path / "results" / "2.17.3" / "logs",
     )
 
@@ -311,7 +310,7 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
 
     out_dir = firmware_validate._export_device_csvs(
         suite,
-        {"S1": str(db_path)},
+        db_path,
         {"S1": baseline_log},
     )
 
@@ -324,10 +323,35 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
     assert combined["Parameter"].tolist() == [2, 2]
 
 
-def test_detect_current_batch_reruns_when_checkpoint_batch_members_changed(tmp_path):
+def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
-    batch = sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701"})
+    baseline_log = tmp_path / "baseline.parquet"
+    pd.DataFrame(
+        [
+            {
+                "TimeStamp": pd.Timestamp("2026-01-01 09:00:00"),
+                "EventId": 13,
+                "Parameter": 2,
+            }
+        ]
+    ).to_parquet(baseline_log, index=False)
+
+    db_path = tmp_path / "collected.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER
+        )
+        """
+    )
+    con.close()
+
     suite = sr.FirmwareTestSuite(
         suite_name="suite",
         firmware_version="2.17.3",
@@ -336,29 +360,93 @@ def test_detect_current_batch_reruns_when_checkpoint_batch_members_changed(tmp_p
             sr.TestScenario(
                 scenario_id="S1",
                 database_name="S1.bin",
-                events_source="S1.parquet",
+                events_source=str(baseline_log),
                 test_type=sr.TestType.SIMILARITY,
             )
         ],
-        batches=[batch],
+        batches=[],
         output_dir=str(tmp_path / "results"),
     )
-    run_dir = tmp_path / "results" / "2.17.3"
-    run_dir.mkdir(parents=True)
-    with open(run_dir / "checkpoint.json", "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "completed_batches": ["batch_1"],
-                "batch_members": {"batch_1": ["OLD_DEVICE"]},
-            },
-            handle,
-        )
 
-    current_batch, completed = firmware_validate.detect_current_batch(suite)
+    out_dir = firmware_validate._export_device_csvs(
+        suite,
+        db_path,
+        {"S1": baseline_log},
+    )
 
-    assert current_batch is not None
-    assert current_batch.batch_id == "batch_1"
-    assert completed == {"batch_1"}
+    assert not (out_dir / "S1.csv").exists()
+
+
+def test_select_pending_replay_batch_skips_existing_data_and_honors_replace_flag(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="2.17.3",
+        baseline_version="2.15.1",
+        scenarios=[
+            sr.TestScenario("S1", "S1.bin", "S1.parquet", sr.TestType.SIMILARITY),
+            sr.TestScenario("S2", "S2.bin", "S2.parquet", sr.TestType.SIMILARITY),
+            sr.TestScenario("S3", "S3.bin", "S3.parquet", sr.TestType.SIMILARITY),
+        ],
+        batches=[],
+        output_dir=str(tmp_path / "results"),
+    )
+    settings = {"controller_targets": ["127.0.0.1:9701", "127.0.0.1:9702"]}
+    catalog = [
+        {"TSSU": "S1", "ReplaceOnRerun": "no"},
+        {"TSSU": "S2", "ReplaceOnRerun": "YES"},
+        {"TSSU": "S3", "ReplaceOnRerun": ""},
+    ]
+
+    batch, remaining, replace_selected, skipped_existing = firmware_validate._select_pending_replay_batch(
+        suite,
+        settings,
+        catalog,
+        existing_ids={"S1", "S2"},
+    )
+
+    assert batch is not None
+    assert list(batch.assignments.keys()) == ["S2", "S3"]
+    assert replace_selected == ["S2"]
+    assert skipped_existing == ["S1"]
+    assert remaining == []
+
+
+def test_select_pending_replay_batch_returns_only_first_controller_group(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="2.17.3",
+        baseline_version="2.15.1",
+        scenarios=[
+            sr.TestScenario("S1", "S1.bin", "S1.parquet", sr.TestType.SIMILARITY),
+            sr.TestScenario("S2", "S2.bin", "S2.parquet", sr.TestType.SIMILARITY),
+            sr.TestScenario("S3", "S3.bin", "S3.parquet", sr.TestType.SIMILARITY),
+        ],
+        batches=[],
+        output_dir=str(tmp_path / "results"),
+    )
+    settings = {"controller_targets": ["127.0.0.1:9701", "127.0.0.1:9702"]}
+    catalog = [
+        {"TSSU": "S1", "ReplaceOnRerun": "yes"},
+        {"TSSU": "S2", "ReplaceOnRerun": ""},
+        {"TSSU": "S3", "ReplaceOnRerun": ""},
+    ]
+
+    batch, remaining, replace_selected, skipped_existing = firmware_validate._select_pending_replay_batch(
+        suite,
+        settings,
+        catalog,
+        existing_ids={"S1"},
+    )
+
+    assert batch is not None
+    assert list(batch.assignments.keys()) == ["S1", "S2"]
+    assert [scenario.scenario_id for scenario in remaining] == ["S3"]
+    assert replace_selected == ["S1"]
+    assert skipped_existing == []
 
 
 def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
@@ -443,7 +531,8 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
         "analysis_workers": 1,
     }
 
-    results = firmware_validate.run_analysis(suite, settings, firmware_dir)
+    with patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
+        results = firmware_validate.run_analysis(suite, settings, firmware_dir)
 
     assert len(results) == 1
     assert not (results_dir / "2.17.3" / "logs").exists()
@@ -461,3 +550,79 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
         }
     ]
     assert "Conflict observed on 2.17.3 in run(s): 2." in result.notes
+
+
+def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_errors(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    firmware_dir = tmp_path / "firmware_validation"
+    logs_dir = firmware_dir / "logs"
+    results_dir = firmware_dir / "results"
+    logs_dir.mkdir(parents=True)
+    (results_dir / "2.17.3").mkdir(parents=True)
+
+    baseline_log = logs_dir / "S1.parquet"
+    pd.DataFrame(
+        [
+            {"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1},
+            {"timestamp": pd.Timestamp("2026-01-01 09:00:05"), "event_id": 7, "parameter": 1},
+        ]
+    ).to_parquet(baseline_log, index=False)
+
+    db_path = results_dir / "2.17.3" / "collected.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER
+        )
+        """
+    )
+    con.close()
+
+    with open(results_dir / "2.17.3" / "checkpoint.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "completed_batches": ["batch_1"],
+                "scenario_db_map": {"S1": str(db_path)},
+            },
+            handle,
+        )
+
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="2.17.3",
+        baseline_version="2.15.1",
+        scenarios=[
+            sr.TestScenario(
+                scenario_id="S1",
+                database_name="S1.bin",
+                events_source=str(baseline_log),
+                test_type=sr.TestType.SIMILARITY,
+            )
+        ],
+        batches=[sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701:9701"})],
+        output_dir=str(results_dir),
+    )
+    settings = {
+        "logs_dir": "logs",
+        "results_dir": "results",
+        "firmware_version": "2.17.3",
+        "baseline_version": "2.15.1",
+        "comparison": {},
+        "analysis_workers": 1,
+    }
+
+    with patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
+        results = firmware_validate.run_analysis(suite, settings, firmware_dir)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.passed is False
+    assert result.error is not None
+    assert "No collected events found for S1" in result.error
+    assert not (results_dir / "2.17.3" / "device_events" / "S1.csv").exists()

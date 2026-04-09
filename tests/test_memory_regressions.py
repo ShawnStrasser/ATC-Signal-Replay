@@ -96,7 +96,7 @@ def test_simulation_uses_preloaded_signal_events_without_central_distribution(te
         def get_max_run_number(self, device_ids=None):
             return 0
 
-        def clear_run_data(self, _run_number=None):
+        def clear_run_data(self, _run_number=None, device_ids=None):
             return None
 
         def mark_run_started(self, _run_number):
@@ -217,6 +217,35 @@ def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
     for handler in runner.logger.handlers:
         handler.close()
     runner.logger.handlers.clear()
+
+
+def test_database_manager_clear_run_data_can_scope_to_device_ids(temp_db_path):
+    manager = sr.DatabaseManager(temp_db_path)
+
+    con = duckdb.connect(temp_db_path)
+    try:
+        con.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+            [
+                ("S1", 1, pd.Timestamp("2026-01-01 12:00:00"), 1, 1),
+                ("S1", 2, pd.Timestamp("2026-01-01 12:00:01"), 1, 1),
+                ("S2", 1, pd.Timestamp("2026-01-01 12:00:02"), 1, 1),
+            ],
+        )
+    finally:
+        con.close()
+
+    manager.clear_run_data(1, device_ids=["S1"])
+
+    con = duckdb.connect(temp_db_path)
+    try:
+        remaining = con.execute(
+            "SELECT device_id, run_number FROM events ORDER BY device_id, run_number"
+        ).fetchall()
+    finally:
+        con.close()
+
+    assert remaining == [("S1", 2), ("S2", 1)]
 
 
 def test_database_manager_rejects_old_events_schema(temp_db_path):

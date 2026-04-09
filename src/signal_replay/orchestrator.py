@@ -492,7 +492,12 @@ class ATCSimulation:
             )
             _log_memory(f"[start run {run_num}]")
             self._current_run = run_num
-            self.db.clear_run_data(run_num)
+            # Scope run cleanup to the active devices only so a later batch that
+            # reuses run number 1 does not erase previously collected devices.
+            self.db.clear_run_data(
+                run_num,
+                device_ids=[sig.device_id for sig in self.config.signals],
+            )
             self.db.mark_run_started(run_num)
             
             # Reset stop event for this run

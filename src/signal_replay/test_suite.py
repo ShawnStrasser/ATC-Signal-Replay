@@ -52,8 +52,6 @@ class FirmwareTestSuite:
     snmp_timeout_seconds: float = 2.0
     snmp_send_retries: int = 1
     snmp_retry_backoff_seconds: float = 0.25
-    heartbeat_enabled: bool = True
-    heartbeat_interval_seconds: float = 5.0
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
 

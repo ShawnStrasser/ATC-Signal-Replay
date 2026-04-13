@@ -150,8 +150,6 @@ class SimulationConfig:
         snmp_timeout_seconds: SNMP response timeout used for replay commands
         snmp_send_retries: Additional replay send attempts after the first try
         snmp_retry_backoff_seconds: Delay between replay retry attempts
-        heartbeat_enabled: If True, periodically resend the latest state for idle groups
-        heartbeat_interval_seconds: Idle time threshold before a state heartbeat is sent
         show_progress_logs: If True, print periodic "Sent x/y events" progress logs
         progress_log_interval_seconds: Interval between replay progress logs
     """
@@ -167,8 +165,6 @@ class SimulationConfig:
     snmp_timeout_seconds: float = 2.0
     snmp_send_retries: int = 0
     snmp_retry_backoff_seconds: float = 0.25
-    heartbeat_enabled: bool = False
-    heartbeat_interval_seconds: float = 5.0
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
     
@@ -231,19 +227,6 @@ class SimulationConfig:
             raise ValueError(
                 "snmp_retry_backoff_seconds must be a non-negative number, "
                 f"got {self.snmp_retry_backoff_seconds}"
-            )
-
-        # Validate heartbeat settings
-        if not isinstance(self.heartbeat_enabled, bool):
-            raise ValueError(f"heartbeat_enabled must be a boolean, got {type(self.heartbeat_enabled)}")
-
-        if (
-            not isinstance(self.heartbeat_interval_seconds, (int, float))
-            or self.heartbeat_interval_seconds <= 0
-        ):
-            raise ValueError(
-                "heartbeat_interval_seconds must be a positive number, "
-                f"got {self.heartbeat_interval_seconds}"
             )
 
         # Validate show_progress_logs

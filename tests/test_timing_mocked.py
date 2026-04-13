@@ -68,6 +68,36 @@ def create_on_off_events(
     )
 
 
+def create_on_off_on_events(
+    detector: int = 1,
+    device_id: str = 'test_device',
+) -> pd.DataFrame:
+    """Create an ON/OFF/ON sequence for one detector in a single group."""
+    base_time = datetime(2024, 1, 1, 12, 0, 0)
+    return pd.DataFrame(
+        [
+            {
+                'timestamp': base_time,
+                'event_id': 82,
+                'parameter': detector,
+                'device_id': device_id,
+            },
+            {
+                'timestamp': base_time + timedelta(milliseconds=50),
+                'event_id': 81,
+                'parameter': detector,
+                'device_id': device_id,
+            },
+            {
+                'timestamp': base_time + timedelta(milliseconds=100),
+                'event_id': 82,
+                'parameter': detector,
+                'device_id': device_id,
+            },
+        ]
+    )
+
+
 class TestOrchestratorTimingWithMocks:
     """
     Tests for orchestrator timing using mocks.
@@ -581,13 +611,13 @@ class TestReplayReliabilityWithMocks:
         assert replay._final_send_failures.get(("Vehicle", 1), 0) == 0
 
     @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
-    def test_heartbeat_resends_latest_state_after_idle_gap(
+    def test_send_command_preserves_same_group_transitions_while_send_in_flight(
         self,
         mock_send: AsyncMock,
         mock_ip,
         mock_port,
     ):
-        events = create_on_off_events(idle_gap_seconds=10.0)
+        events = create_on_off_on_events()
         config = sr.SignalConfig(
             device_id="test",
             ip=mock_ip,
@@ -599,66 +629,32 @@ class TestReplayReliabilityWithMocks:
         replay = sr.SignalReplay(
             config,
             simulation_speed=1.0,
-            heartbeat_enabled=True,
-            heartbeat_interval_seconds=0.05,
+            snmp_send_retries=0,
         )
-        row = replay.activation_feed.iloc[0]
+
+        rows = [replay.activation_feed.iloc[i] for i in range(3)]
+        first_send_started = asyncio.Event()
+        release_first_send = asyncio.Event()
+        states_seen = []
+
+        async def _send_side_effect(*args, **kwargs):
+            states_seen.append(args[2])
+            if len(states_seen) == 1:
+                first_send_started.set()
+                await release_first_send.wait()
+
+        mock_send.side_effect = _send_side_effect
 
         async def _test():
             engine = object()
-            await replay._send_command(row, snmp_engine=engine)
-            await replay._wait_for_pending_sends()
-            await asyncio.sleep(0.06)
-            heartbeat_task = asyncio.create_task(replay._heartbeat_loop(engine))
-            await asyncio.sleep(0.07)
-            replay._heartbeat_stop_requested = True
-            await heartbeat_task
+            await replay._send_command(rows[0], snmp_engine=engine)
+            await first_send_started.wait()
+            await replay._send_command(rows[1], snmp_engine=engine)
+            await replay._send_command(rows[2], snmp_engine=engine)
+            release_first_send.set()
             await replay._wait_for_pending_sends()
 
         asyncio.run(_test())
 
-        assert mock_send.call_count >= 2
-        assert mock_send.call_args_list[-1].args[2] == 1
-
-    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
-    def test_heartbeat_resends_zero_state_after_off_event(
-        self,
-        mock_send: AsyncMock,
-        mock_ip,
-        mock_port,
-    ):
-        events = create_on_off_events(idle_gap_seconds=0.2)
-        config = sr.SignalConfig(
-            device_id="test",
-            ip=mock_ip,
-            udp_port=mock_port,
-            cycle_length=0,
-            incompatible_pairs=[],
-        )
-        config.events = events
-        replay = sr.SignalReplay(
-            config,
-            simulation_speed=1.0,
-            heartbeat_enabled=True,
-            heartbeat_interval_seconds=0.05,
-        )
-
-        on_row = replay.activation_feed.iloc[0]
-        off_row = replay.activation_feed.iloc[1]
-
-        async def _test():
-            engine = object()
-            await replay._send_command(on_row, snmp_engine=engine)
-            await replay._send_command(off_row, snmp_engine=engine)
-            await replay._wait_for_pending_sends()
-            await asyncio.sleep(0.06)
-            heartbeat_task = asyncio.create_task(replay._heartbeat_loop(engine))
-            await asyncio.sleep(0.07)
-            replay._heartbeat_stop_requested = True
-            await heartbeat_task
-            await replay._wait_for_pending_sends()
-
-        asyncio.run(_test())
-
-        assert mock_send.call_count >= 3
-        assert mock_send.call_args_list[-1].args[2] == 0
+        assert states_seen == [1, 0, 1]
+        assert mock_send.call_count == 3

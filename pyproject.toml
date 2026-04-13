@@ -18,6 +18,7 @@ dependencies = [
     "pandas",
     "dtaidistance",
     "jinja2",
+    "openpyxl",
     "requests",
     "matplotlib",
     "pyyaml",

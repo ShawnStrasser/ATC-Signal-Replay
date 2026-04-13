@@ -47,7 +47,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install pytest pytest-cov build pandas pyarrow pyarrow-hotfix tomli atspm
+        pip install pytest pytest-cov build pandas pyarrow pyarrow-hotfix tomli atspm openpyxl
         pip install .
 
     - name: Build package

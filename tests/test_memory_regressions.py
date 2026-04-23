@@ -162,7 +162,7 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
         db_path = runner._run_similarity_batch(batch, ["S1", "S2"], db_loader_callback=lambda *_args: True)
 
-    assert db_path == runner.run_dir / "collected.duckdb"
+    assert db_path == runner.run_dir / "collected.db"
     assert captured["events"] is None
     # Events should be file paths (not loaded DataFrames) to avoid holding large data in memory
     assert all(isinstance(signal.events, str) for signal in captured["signals"])
@@ -208,7 +208,7 @@ def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
     with patch("signal_replay.batch_runner.ATCSimulation", FakeSimulation):
         db_path = runner._run_conflict_scenario(suite.batches[0], "S1", db_loader_callback=lambda *_args: True)
 
-    assert db_path == runner.run_dir / "collected.duckdb"
+    assert db_path == runner.run_dir / "collected.db"
     assert captured["replays"] == 25
     assert "replace_existing_device_data" not in captured
 

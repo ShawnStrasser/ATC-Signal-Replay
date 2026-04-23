@@ -16,7 +16,7 @@ firmware_validation/
 ```
 
 Each replay run keeps `logs/` as the immutable source input folder. Collected
-controller output is persisted in `results/<firmware_version>/collected.duckdb`.
+controller output is persisted in `results/<firmware_version>/collected.db`.
 Analysis reads directly from that DuckDB file. If you explicitly want one
 Parquet file per device under `results/<firmware_version>/logs/`, use the
 archive/export path after the run.
@@ -79,7 +79,7 @@ Examples:
 4. Run firmware validation:
 	 - Step 1 builds scenarios and batches from Excel.
 	 - Step 2 replays source logs from `logs/` to the target firmware.
-	 - Step 3 stores collected output in `results/<firmware_version>/collected.duckdb`.
+	 - Step 3 stores collected output in `results/<firmware_version>/collected.db`.
 	 - Step 4 compares that collected output to `results/<baseline_version>/logs/` when available.
 	 - Step 5 falls back to `logs/` only when the baseline version folder does not exist.
 	 - Step 6 exports human-readable `device_events/*.csv` files and generates the HTML report.

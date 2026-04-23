@@ -163,7 +163,7 @@ class BatchRunner:
         raise ValueError(f"Scenario '{scenario_id}' not found in suite")
 
     def _shared_db_path(self) -> Path:
-        return self.run_dir / "collected.duckdb"
+        return self.run_dir / "collected.db"
 
     def _clear_scenario_data(self, db_path: Path, scenario_ids: List[str]) -> None:
         """Delete persisted rows for the provided scenarios from a DuckDB file."""

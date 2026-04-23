@@ -37,7 +37,7 @@ def test_dedup_uses_timestamp_event_parameter_watermark():
             return None
 
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [], 80)},
     )
 
@@ -70,7 +70,7 @@ def test_insert_failures_do_not_advance_watermark_and_abort_after_three():
             return None
 
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [], 80)},
     )
     err = threading.Event()
@@ -90,7 +90,7 @@ def test_insert_failures_do_not_advance_watermark_and_abort_after_three():
 
 def test_http_collection_failures_are_non_fatal_and_logged_once(capsys):
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [], 80)},
     )
     err = threading.Event()
@@ -111,7 +111,7 @@ def test_http_collection_failures_are_non_fatal_and_logged_once(capsys):
 
 def test_single_device_fetch_failure_does_not_block_other_devices():
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={
             "bad": (("127.0.0.1", 161), [], 1031),
             "good": (("127.0.0.1", 162), [], 1032),
@@ -203,7 +203,7 @@ def test_collect_once_does_not_check_conflicts_by_default():
             return None
 
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [("Ph2", "OPed17")], 80)},
     )
 
@@ -253,7 +253,7 @@ def test_collect_once_detects_conflict_against_full_run_when_requested():
             return None
 
     collector = DataCollector(
-        db_path="ignored.duckdb",
+        db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [("Ph2", "OPed17")], 80)},
     )
 

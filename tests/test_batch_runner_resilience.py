@@ -27,7 +27,7 @@ def test_failed_batch_is_not_marked_complete_and_data_is_cleared(tmp_path):
     suite = _build_suite(tmp_path)
     runner = sr.BatchRunner(suite, debug=False)
 
-    db_path = runner.run_dir / "collected.duckdb"
+    db_path = runner.run_dir / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """

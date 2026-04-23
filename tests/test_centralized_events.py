@@ -144,7 +144,7 @@ class TestStreamlinedAPI:
     def test_init_with_centralized_events(self, tmp_path):
         """Initialize with signals + centralized events."""
         events = create_multi_device_events(['dev1', 'dev2'])
-        db_path = str(tmp_path / "test.duckdb")
+        db_path = str(tmp_path / "test.db")
         
         # This should NOT raise - just verify initialization works
         # We don't run the simulation as that requires mocking
@@ -169,7 +169,7 @@ class TestStreamlinedAPI:
     
     def test_init_without_events_raises_error(self, tmp_path):
         """Error when events parameter is missing."""
-        db_path = str(tmp_path / "test.duckdb")
+        db_path = str(tmp_path / "test.db")
         
         with pytest.raises(ValueError, match="Must provide 'events'"):
             sr.ATCSimulation(
@@ -181,7 +181,7 @@ class TestStreamlinedAPI:
     def test_cannot_mix_config_and_signals(self, tmp_path):
         """Error when both config and signals are provided."""
         events = create_multi_device_events(['dev1'])
-        db_path = str(tmp_path / "test.duckdb")
+        db_path = str(tmp_path / "test.db")
         
         config = sr.SimulationConfig(
             signals=[sr.SignalConfig(device_id='dev1', ip='127.0.0.1', udp_port=1025)],
@@ -198,7 +198,7 @@ class TestStreamlinedAPI:
     def test_legacy_api_still_works(self, tmp_path):
         """Legacy pattern with SimulationConfig still works."""
         events = create_multi_device_events(['dev1'])
-        db_path = str(tmp_path / "test.duckdb")
+        db_path = str(tmp_path / "test.db")
         
         config = sr.SimulationConfig(
             signals=[sr.SignalConfig(device_id='dev1', ip='127.0.0.1', udp_port=1025)],
@@ -218,7 +218,7 @@ class TestStreamlinedAPI:
     def test_legacy_api_with_centralized_events(self, tmp_path):
         """Legacy SimulationConfig with centralized events works."""
         events = create_multi_device_events(['dev1', 'dev2'])
-        db_path = str(tmp_path / "test.duckdb")
+        db_path = str(tmp_path / "test.db")
         
         config = sr.SimulationConfig(
             signals=[

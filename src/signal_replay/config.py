@@ -142,7 +142,7 @@ class SimulationConfig:
             The centralized data must contain a 'device_id' column (or 'DeviceId').
         simulation_replays: Number of times to replay the simulation
         stop_on_conflict: If True, stop before the next run when a conflict is detected after final end-of-run collection
-        db_path: Path to DuckDB database file (defaults to ./atc_replay.duckdb)
+        db_path: Path to DuckDB database file (defaults to ./atc_replay.db)
         controller_type: Type of controller (currently only "MAXTIME" supported)
         simulation_speed: Speed multiplier for the simulation (1.0 = real-time)
         collection_interval_minutes: How often to collect data from controllers (default: 5)
@@ -157,7 +157,7 @@ class SimulationConfig:
     events: Union[pd.DataFrame, str, Path, None]
     simulation_replays: int = 1
     stop_on_conflict: bool = True
-    db_path: str = "./atc_replay.duckdb"
+    db_path: str = "./atc_replay.db"
     controller_type: str = "MAXTIME"
     simulation_speed: float = 1.0
     collection_interval_minutes: float = 5.0

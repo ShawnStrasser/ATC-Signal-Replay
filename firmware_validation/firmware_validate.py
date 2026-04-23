@@ -35,6 +35,9 @@ import signal_replay as sr
 from signal_replay.ntcip import send_ntcip
 from signal_replay.report import generate_report
 
+COLLECTED_DB_FILENAME = "collected.db"
+BaselineSource = Tuple[str, str]
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -64,26 +67,38 @@ def get_results_dir(firmware_dir: Path, settings: dict) -> Path:
     return firmware_dir / settings["results_dir"]
 
 
+def get_version_collected_db_path(firmware_dir: Path, settings: dict, version: str) -> Path:
+    return get_results_dir(firmware_dir, settings) / version / COLLECTED_DB_FILENAME
+
+
 def get_version_logs_dir(firmware_dir: Path, settings: dict, version: str) -> Path:
     return get_results_dir(firmware_dir, settings) / version / "logs"
 
 
-def resolve_baseline_logs_dir(firmware_dir: Path, settings: dict) -> Tuple[Optional[Path], str]:
-    baseline_dir = get_version_logs_dir(firmware_dir, settings, settings["baseline_version"])
-    if baseline_dir.exists():
-        return baseline_dir, settings["baseline_version"]
+def resolve_baseline_db_path(firmware_dir: Path, settings: dict) -> Tuple[Optional[Path], str]:
+    baseline_db_path = get_version_collected_db_path(
+        firmware_dir,
+        settings,
+        settings["baseline_version"],
+    )
+    if baseline_db_path.exists():
+        return baseline_db_path, settings["baseline_version"]
     return None, f"{settings['baseline_version']} (source logs)"
 
 
-def resolve_baseline_log(
+def resolve_baseline_source(
     tssu: str,
     firmware_dir: Path,
     settings: dict,
-) -> Tuple[Optional[Path], str]:
-    baseline_dir, baseline_label = resolve_baseline_logs_dir(firmware_dir, settings)
-    if baseline_dir is not None:
-        return find_log(tssu, baseline_dir), baseline_label
-    return find_log(tssu, firmware_dir / settings["logs_dir"]), baseline_label
+) -> Tuple[Optional[BaselineSource], str]:
+    baseline_db_path, baseline_label = resolve_baseline_db_path(firmware_dir, settings)
+    if baseline_db_path is not None:
+        return ("db", str(baseline_db_path)), baseline_label
+
+    baseline_log = find_log(tssu, firmware_dir / settings["logs_dir"])
+    if baseline_log is None:
+        return None, baseline_label
+    return ("file", str(baseline_log)), baseline_label
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +172,7 @@ def build_suite(
     logs_dir = firmware_dir / settings["logs_dir"]
     databases_dir = firmware_dir / settings["databases_dir"]
     firmware_version = settings["firmware_version"]
-    _baseline_logs_dir, baseline_version = resolve_baseline_logs_dir(firmware_dir, settings)
+    _baseline_db_path, baseline_version = resolve_baseline_db_path(firmware_dir, settings)
 
     file_map: Dict[str, dict] = {}
     for r in catalog:
@@ -247,7 +262,7 @@ def _replace_on_rerun_enabled(value: object) -> bool:
 
 
 def _shared_collected_db_path(suite: sr.FirmwareTestSuite) -> Path:
-    return Path(suite.output_dir) / suite.firmware_version / "collected.duckdb"
+    return Path(suite.output_dir) / suite.firmware_version / COLLECTED_DB_FILENAME
 
 
 def _get_collected_device_ids(db_path: Path) -> set[str]:
@@ -455,6 +470,16 @@ def _load_collected_events_from_duckdb(db_path: Path | str, scenario_id: str) ->
         return con.execute(query, [scenario_id]).df()
     finally:
         con.close()
+
+
+def _load_baseline_events(baseline_source: BaselineSource, scenario_id: str) -> pd.DataFrame:
+    """Load baseline events from either a collected DuckDB or a source log file."""
+    source_kind, source_path = baseline_source
+    if source_kind == "db":
+        return _load_collected_events_from_duckdb(source_path, scenario_id)
+    if source_kind == "file":
+        return sr.load_events(source_path)
+    raise ValueError(f"Unsupported baseline source kind: {source_kind}")
 
 
 def _missing_collected_error(scenario_id: str, collected_db_path: Path | str) -> str:
@@ -729,13 +754,13 @@ def _summarize_conflicts_from_saved_events(
 
 def _analyze_conflict_scenario(
     scenario: sr.TestScenario,
-    baseline_source: Path,
+    baseline_source: BaselineSource,
     baseline_label: str,
     collected_db_path: Path,
     firmware_version: str,
 ) -> sr.ScenarioResult:
     """Build a conflict result from persisted baseline/new logs."""
-    baseline_events = sr.load_events(str(baseline_source))
+    baseline_events = _load_baseline_events(baseline_source, scenario.scenario_id)
     collected_events = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
 
     if collected_events.empty:
@@ -836,7 +861,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     All arguments are plain strings/numbers to avoid pickle issues.
     Reads collected output directly from DuckDB.
     """
-    (scenario_id, baseline_events_source, baseline_label, test_type_str, collected_db_path,
+    (scenario_id, baseline_source, baseline_label, test_type_str, collected_db_path,
      firmware_version, plots_dir_str, settle_minutes, group_tolerance,
       max_plots, window_minutes, verbose, notes_column, tod_align,
           analysis_start_time, analysis_end_time, phase_call_threshold) = args
@@ -847,7 +872,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
     test_type = sr.TestType.CONFLICT if test_type_str == "CONFLICT" else sr.TestType.SIMILARITY
 
-    baseline = sr.load_events(baseline_events_source)
+    baseline = _load_baseline_events(baseline_source, scenario_id)
     collected = _load_collected_events_from_duckdb(collected_db_path, scenario_id)
     if collected.empty:
         return {
@@ -1077,7 +1102,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
 def _export_device_csvs(
     suite: sr.FirmwareTestSuite,
     collected_db_path: Path,
-    baseline_sources: Dict[str, Path],
+    baseline_sources: Dict[str, BaselineSource],
     group_tolerance: float = 0.0,
 ) -> Path:
     """Export a combined CSV per device with baseline + collected events.
@@ -1100,12 +1125,12 @@ def _export_device_csvs(
         baseline_source = baseline_sources.get(scenario.scenario_id)
         if baseline_source is None:
             log(
-                f"WARNING: Missing baseline log for {scenario.scenario_id}; "
+                f"WARNING: Missing baseline source for {scenario.scenario_id}; "
                 "skipping device CSV export for this scenario."
             )
             continue
 
-        baseline = sr.load_events(str(baseline_source))
+        baseline = _load_baseline_events(baseline_source, scenario.scenario_id)
         collected = _load_collected_events_from_duckdb(collected_db_path, scenario.scenario_id)
 
         if baseline.empty:
@@ -1192,27 +1217,30 @@ def run_analysis(
     plots_dir.mkdir(parents=True, exist_ok=True)
     collected_db_path = _shared_collected_db_path(suite)
 
-    baseline_logs_dir, baseline_label = resolve_baseline_logs_dir(firmware_dir, settings)
-    if baseline_logs_dir is not None:
-        log(f"Baseline logs: {baseline_logs_dir}")
+    baseline_db_path, baseline_label = resolve_baseline_db_path(firmware_dir, settings)
+    if baseline_db_path is not None:
+        log(f"Baseline collected DB: {baseline_db_path}")
     else:
-        log(f"Baseline logs folder not found for {settings['baseline_version']}; using source logs/ as fallback.")
+        log(
+            f"Baseline collected DB not found for {settings['baseline_version']}; "
+            "using source logs/ as fallback."
+        )
 
     if collected_db_path.exists():
         log(f"Reading collected output directly from DuckDB: {collected_db_path}")
     else:
         log(f"Collected DuckDB not found: {collected_db_path}")
 
-    baseline_sources: Dict[str, Path] = {}
+    baseline_sources: Dict[str, BaselineSource] = {}
     for scenario in suite.scenarios:
-        baseline_path, _ = resolve_baseline_log(scenario.scenario_id, firmware_dir, settings)
-        if baseline_path is None:
+        baseline_source, _ = resolve_baseline_source(scenario.scenario_id, firmware_dir, settings)
+        if baseline_source is None:
             log(
-                f"WARNING: Missing baseline log for {scenario.scenario_id}; "
+                f"WARNING: Missing baseline source for {scenario.scenario_id}; "
                 "this scenario will be skipped during analysis."
             )
             continue
-        baseline_sources[scenario.scenario_id] = baseline_path
+        baseline_sources[scenario.scenario_id] = baseline_source
 
     # Export per-device CSVs (baseline + collected combined)
     log("Exporting per-device CSV files...")
@@ -1225,9 +1253,9 @@ def run_analysis(
     if analysis_end_time:
         log(f"TOD manual analysis end time: {analysis_end_time}")
 
-    # Build job list — all plain types for pickling (no DuckDB paths)
+    # Build job list — all plain types for pickling.
     jobs: list = []
-    conflict_jobs: List[Tuple[sr.TestScenario, Path, Path]] = []
+    conflict_jobs: List[Tuple[sr.TestScenario, BaselineSource, Path]] = []
     for scenario in suite.scenarios:
         baseline_source = baseline_sources.get(scenario.scenario_id)
         if not collected_db_path.exists():
@@ -1241,7 +1269,7 @@ def run_analysis(
         test_type_str = "CONFLICT" if scenario.test_type == sr.TestType.CONFLICT else "SIMILARITY"
         jobs.append((
             scenario.scenario_id,
-            str(baseline_source),
+            baseline_source,
             baseline_label,
             test_type_str,
             str(collected_db_path),

@@ -155,18 +155,33 @@ def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path
     assert [scenario.test_type for scenario in suite.scenarios[2:]] == [sr.TestType.CONFLICT, sr.TestType.CONFLICT]
 
 
-def test_resolve_baseline_log_prefers_versioned_baseline_logs(tmp_path):
+def test_resolve_baseline_source_prefers_baseline_collected_db(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
     firmware_dir = tmp_path / "firmware_validation"
     (firmware_dir / "logs").mkdir(parents=True)
-    versioned_dir = firmware_dir / "results" / "2.15.1" / "logs"
-    versioned_dir.mkdir(parents=True)
+    baseline_results_dir = firmware_dir / "results" / "2.15.1"
+    baseline_results_dir.mkdir(parents=True)
 
     root_log = firmware_dir / "logs" / "S1.parquet"
-    versioned_log = versioned_dir / "S1.parquet"
     pd.DataFrame([{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]).to_parquet(root_log, index=False)
-    pd.DataFrame([{"timestamp": pd.Timestamp("2026-01-02 09:00:00"), "event_id": 2, "parameter": 2}]).to_parquet(versioned_log, index=False)
+    baseline_db = baseline_results_dir / "collected.db"
+    con = duckdb.connect(str(baseline_db))
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO events VALUES ('S1', 1, '2026-01-02 09:00:00', 2, 2)"
+    )
+    con.close()
 
     settings = {
         "logs_dir": "logs",
@@ -174,16 +189,16 @@ def test_resolve_baseline_log_prefers_versioned_baseline_logs(tmp_path):
         "baseline_version": "2.15.1",
     }
 
-    baseline_path, baseline_label = firmware_validate.resolve_baseline_log("S1", firmware_dir, settings)
+    baseline_source, baseline_label = firmware_validate.resolve_baseline_source("S1", firmware_dir, settings)
 
     assert baseline_label == "2.15.1"
-    assert baseline_path == versioned_log
+    assert baseline_source == ("db", str(baseline_db))
 
 
 def test_extract_collected_events_writes_versioned_logs(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
-    db_path = tmp_path / "shared.duckdb"
+    db_path = tmp_path / "shared.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -230,7 +245,7 @@ def test_extract_collected_events_writes_versioned_logs(tmp_path):
 def test_load_collected_events_from_duckdb_reads_single_scenario(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
-    db_path = tmp_path / "collected.duckdb"
+    db_path = tmp_path / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -260,6 +275,39 @@ def test_load_collected_events_from_duckdb_reads_single_scenario(tmp_path):
     assert collected["event_id"].tolist() == [1, 10]
 
 
+def test_load_baseline_events_reads_single_scenario_from_collected_db(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    db_path = tmp_path / "baseline.db"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER
+        )
+        """
+    )
+    con.executemany(
+        "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+        [
+            ("S1", 1, pd.Timestamp("2026-01-01 12:00:00"), 5, 1),
+            ("S2", 1, pd.Timestamp("2026-01-01 12:01:00"), 9, 2),
+            ("S1", 2, pd.Timestamp("2026-01-01 12:02:00"), 7, 3),
+        ],
+    )
+    con.close()
+
+    baseline = firmware_validate._load_baseline_events(("db", str(db_path)), "S1")
+
+    assert baseline["device_id"].tolist() == ["S1", "S1"]
+    assert baseline["run_number"].tolist() == [1, 2]
+    assert baseline["event_id"].tolist() == [5, 7]
+
+
 def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
@@ -274,7 +322,7 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
         ]
     ).to_parquet(baseline_log, index=False)
 
-    db_path = tmp_path / "collected.duckdb"
+    db_path = tmp_path / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -311,7 +359,7 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
     out_dir = firmware_validate._export_device_csvs(
         suite,
         db_path,
-        {"S1": baseline_log},
+        {"S1": ("file", str(baseline_log))},
     )
 
     csv_path = out_dir / "S1.csv"
@@ -337,7 +385,7 @@ def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
         ]
     ).to_parquet(baseline_log, index=False)
 
-    db_path = tmp_path / "collected.duckdb"
+    db_path = tmp_path / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -371,7 +419,7 @@ def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
     out_dir = firmware_validate._export_device_csvs(
         suite,
         db_path,
-        {"S1": baseline_log},
+        {"S1": ("file", str(baseline_log))},
     )
 
     assert not (out_dir / "S1.csv").exists()
@@ -468,7 +516,7 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
         ]
     ).to_parquet(baseline_log, index=False)
 
-    db_path = results_dir / "2.17.3" / "collected.duckdb"
+    db_path = results_dir / "2.17.3" / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """
@@ -569,7 +617,7 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
         ]
     ).to_parquet(baseline_log, index=False)
 
-    db_path = results_dir / "2.17.3" / "collected.duckdb"
+    db_path = results_dir / "2.17.3" / "collected.db"
     con = duckdb.connect(str(db_path))
     con.execute(
         """

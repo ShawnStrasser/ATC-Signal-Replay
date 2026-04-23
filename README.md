@@ -39,7 +39,7 @@ sim = sr.ATCSimulation(
     events='2025-01-15_events.csv',  # Must have device_id column
     replays=40,
     stop_on_conflict=True,
-    db_path='./conflict_test.duckdb',
+    db_path='./conflict_test.db',
 )
 
 results = sim.run()
@@ -114,7 +114,7 @@ sim = sr.ATCSimulation(
     ],
     events='all_signals_events.csv',  # Must have 'device_id' column
     replays=5,
-    db_path='./coordination_test.duckdb',
+    db_path='./coordination_test.db',
     debug=True,
 )
 
@@ -153,7 +153,7 @@ All events, conflicts, and comparisons are stored in DuckDB:
 ```python
 import duckdb
 
-con = duckdb.connect('./conflict_test.duckdb')
+con = duckdb.connect('./conflict_test.db')
 
 # Find all conflicts
 conflicts = con.execute("""
@@ -400,7 +400,7 @@ sim = sr.ATCSimulation(
     events='events.csv',               # REQUIRED: centralized events with device_id column
     replays=5,                         # Number of simulation runs
     stop_on_conflict=False,            # Stop on first conflict
-    db_path='./test.duckdb',           # Database path
+    db_path='./test.db',               # Database path
     simulation_speed=1.0,              # Speed multiplier (must be 1.0 with tod_align)
     collection_interval_minutes=5.0,   # How often to poll controller logs
     post_replay_settle_seconds=10.0,   # Wait after replay before final collection
@@ -448,7 +448,7 @@ Configuration for individual signals. Events are provided at the simulation leve
 | `events` | DataFrame/Path | *required* | Centralized events (filtered by `device_id`) |
 | `simulation_replays` | int | 1 | Number of replay runs |
 | `stop_on_conflict` | bool | False | Stop on first conflict detection |
-| `db_path` | str | `./atc_replay.duckdb` | Database path |
+| `db_path` | str | `./atc_replay.db` | Database path |
 | `controller_type` | str | `"MAXTIME"` | Controller type (only MAXTIME supported) |
 | `simulation_speed` | float | 1.0 | Speed multiplier |
 | `collection_interval_minutes` | float | 5.0 | Minutes between controller log polls |

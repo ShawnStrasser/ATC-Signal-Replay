@@ -60,7 +60,7 @@ def live_device_ip_port(live_device_available) -> Tuple[str, int]:
 @pytest.fixture
 def temp_db_path(tmp_path):
     """Provide a temporary database path for tests and clean up after."""
-    db_file = tmp_path / "test_simulation.duckdb"
+    db_file = tmp_path / "test_simulation.db"
     db_path = str(db_file)
     yield db_path
     

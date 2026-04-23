@@ -131,7 +131,7 @@ class ATCSimulation:
         events: Union[pd.DataFrame, str, Path, None] = None,
         replays: int = 1,
         stop_on_conflict: bool = True,
-        db_path: str = "./atc_replay.duckdb",
+        db_path: str = "./atc_replay.db",
         simulation_speed: float = 1.0,
         collection_interval_minutes: float = 5.0,
         post_replay_settle_seconds: float = 10.0,

@@ -76,17 +76,23 @@ class ScenarioResult:
     runs_completed: int = 0
     total_runs: int = 0
     plot_paths: List[str] = field(default_factory=list)
+    plot_captions: List[str] = field(default_factory=list)
     duration_seconds: float = 0.0
     error: Optional[str] = None
     notes: str = ""
     notes_column: str = ""
     phase_differences: List[dict] = field(default_factory=list)
+    clearance_irregularities: List[dict] = field(default_factory=list)
     operational_differences: List[dict] = field(default_factory=list)
+    invalid_clearance_irregularities: List[dict] = field(default_factory=list)
+    invalid_operational_differences: List[dict] = field(default_factory=list)
     chunk_scores: List[dict] = field(default_factory=list)
     phase_call_chunk_scores: List[dict] = field(default_factory=list)
     included_chunk_count: int = 0
     excluded_chunk_count: int = 0
     thrown_out: bool = False
+    thrown_out_reason: str = ""
+    analysis_diagnostics: List[str] = field(default_factory=list)
     timeline_difference_analysis_available: bool = False
     sparkline_svg: str = ""
     temporal_shift_seconds: float = 0.0

@@ -21,6 +21,13 @@ Analysis reads directly from that DuckDB file. If you explicitly want one
 Parquet file per device under `results/<firmware_version>/logs/`, use the
 archive/export path after the run.
 
+For the normal behavior, use `py firmware_validate.py --report-only`.
+That keeps the original report-only flow, including refreshing
+`results/<firmware_version>/device_events/*.csv` before rebuilding the HTML.
+
+For a faster report rebuild that skips the device CSV refresh, use
+`py firmware_validate.py --report-only-fast`.
+
 ## `databases.xlsx` (Required Columns)
 
 The first worksheet must include these columns:

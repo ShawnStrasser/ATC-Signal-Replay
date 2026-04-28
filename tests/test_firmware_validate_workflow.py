@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -674,3 +675,191 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
     assert result.error is not None
     assert "No collected events found for S1" in result.error
     assert not (results_dir / "2.17.3" / "device_events" / "S1.csv").exists()
+
+
+def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    firmware_dir = tmp_path / "firmware_validation"
+    logs_dir = firmware_dir / "logs"
+    results_dir = firmware_dir / "results"
+    logs_dir.mkdir(parents=True)
+    (results_dir / "2.17.3").mkdir(parents=True)
+
+    baseline_log = logs_dir / "S1.parquet"
+    pd.DataFrame(
+        [
+            {"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1},
+            {"timestamp": pd.Timestamp("2026-01-01 09:00:05"), "event_id": 7, "parameter": 1},
+        ]
+    ).to_parquet(baseline_log, index=False)
+
+    db_path = results_dir / "2.17.3" / "collected.db"
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        """
+        CREATE TABLE events (
+            device_id VARCHAR,
+            run_number INTEGER,
+            timestamp TIMESTAMP,
+            event_id INTEGER,
+            parameter INTEGER
+        )
+        """
+    )
+    con.close()
+
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="2.17.3",
+        baseline_version="2.15.1",
+        scenarios=[
+            sr.TestScenario(
+                scenario_id="S1",
+                database_name="S1.bin",
+                events_source=str(baseline_log),
+                test_type=sr.TestType.SIMILARITY,
+            )
+        ],
+        batches=[sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701:9701"})],
+        output_dir=str(results_dir),
+    )
+    settings = {
+        "logs_dir": "logs",
+        "results_dir": "results",
+        "firmware_version": "2.17.3",
+        "baseline_version": "2.15.1",
+        "comparison": {},
+        "analysis_workers": 1,
+    }
+
+    with (
+        patch.object(firmware_validate, "_export_device_csvs", side_effect=AssertionError("device CSV export should be skipped")),
+        patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor),
+    ):
+        results = firmware_validate.run_analysis(
+            suite,
+            settings,
+            firmware_dir,
+            export_device_csvs=False,
+        )
+
+    assert len(results) == 1
+    assert results[0].error is not None
+    assert not (results_dir / "2.17.3" / "device_events").exists()
+
+
+def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    baseline = pd.DataFrame(
+        [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
+    )
+    collected = pd.DataFrame(
+        [{"timestamp": pd.Timestamp("2026-01-01 09:00:01"), "event_id": 1, "parameter": 1}]
+    )
+    empty_timeline = pd.DataFrame(columns=["EventClass", "StartTime", "EndTime"])
+
+    class FakeComparisonResult:
+        def __init__(self):
+            self.chunk_scores = []
+            self.phase_call_chunk_scores = []
+            self.included_chunk_count = 0
+            self.excluded_chunk_count = 0
+            self.divergence_windows = []
+            self.match_percentage = 0.0
+            self.temporal_shift_seconds = 0.0
+            self.thrown_out = False
+            self.thrown_out_reason = ""
+
+        def format_summary(self):
+            return "Match: thrown out\nInsufficient scored chunks remained after settling/filtering for a reliable comparison."
+
+    with (
+        patch.object(firmware_validate, "_load_baseline_events", return_value=baseline),
+        patch.object(firmware_validate, "_load_collected_events_from_duckdb", return_value=collected),
+        patch.object(
+            firmware_validate,
+            "_prepare_analysis_inputs",
+            return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 1)),
+        ),
+        patch("signal_replay.compare_runs", return_value=FakeComparisonResult()),
+        patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
+        patch("signal_replay.render_sparkline_svg", return_value=""),
+    ):
+        out = firmware_validate._compare_one_scenario(
+            (
+                "12035",
+                ("parquet", str(tmp_path / "12035.parquet")),
+                "2.15.1",
+                "SIMILARITY",
+                str(tmp_path / "collected.db"),
+                "2.17.3",
+                str(tmp_path / "plots"),
+                0.0,
+                0.0,
+                5,
+                15,
+                False,
+                "",
+                False,
+                None,
+                None,
+                90.0,
+            )
+        )
+
+    assert out["thrown_out"] is True
+    assert out["thrown_out_reason"] == "Insufficient scored chunks remained after settling/filtering for a reliable comparison."
+    assert "Match: thrown out" in out["summary"]
+
+
+def test_main_report_only_fast_skips_device_csv_export(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    firmware_dir = tmp_path / "firmware_validation"
+    firmware_dir.mkdir(parents=True)
+    settings_path = firmware_dir / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "catalog_file": "catalog.csv",
+                "conflict_pairs_file": "conflict_pairs.json",
+                "controller_targets": ["127.0.0.1:9701"],
+                "firmware_version": "2.17.3",
+                "baseline_version": "2.15.1",
+                "comparison": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (firmware_dir / "catalog.csv").write_text("TSSU,Type,CycleLength,Offset,Notes\n", encoding="utf-8")
+    (firmware_dir / "conflict_pairs.json").write_text("{}", encoding="utf-8")
+
+    suite = sr.FirmwareTestSuite(
+        suite_name="suite",
+        firmware_version="2.17.3",
+        baseline_version="2.15.1",
+        scenarios=[],
+        batches=[],
+        output_dir=str(tmp_path / "results"),
+    )
+    captured = {}
+
+    def fake_run_analysis(_suite, _settings, _firmware_dir, *, export_device_csvs=True):
+        captured["export_device_csvs"] = export_device_csvs
+        return []
+
+    with (
+        patch.object(firmware_validate, "__file__", str(firmware_dir / "firmware_validate.py")),
+        patch.object(firmware_validate, "load_settings", return_value=json.loads(settings_path.read_text(encoding="utf-8"))),
+        patch.object(firmware_validate, "read_catalog", return_value=[]),
+        patch.object(firmware_validate, "build_suite", return_value=(suite, {})),
+        patch.object(firmware_validate, "run_analysis", side_effect=fake_run_analysis),
+        patch.object(firmware_validate, "build_report", return_value=tmp_path / "report.html"),
+        patch.object(firmware_validate, "archive_and_extract"),
+        patch("sys.argv", ["firmware_validate.py", "--report-only-fast"]),
+    ):
+        firmware_validate.main()
+
+    assert captured["export_device_csvs"] is False

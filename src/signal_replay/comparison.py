@@ -170,6 +170,7 @@ class ComparisonResult:
     included_chunk_count: int = 0
     excluded_chunk_count: int = 0
     thrown_out: bool = False
+    thrown_out_reason: str = ""
     included_event_periods_a: Optional[List[Tuple[float, float]]] = None
     included_event_periods_b: Optional[List[Tuple[float, float]]] = None
     # Temporal shift applied during alignment (seconds added to B's time_delta)
@@ -188,7 +189,7 @@ class ComparisonResult:
         lines = []
         if self.thrown_out:
             lines.append("Match: thrown out")
-            lines.append("Input similarity excluded every scored chunk for this device.")
+            lines.append(self.thrown_out_reason or "Input similarity excluded every scored chunk for this device.")
         else:
             lines.append(f"Match: {self.match_percentage:.1f}%")
         
@@ -2287,7 +2288,15 @@ def compare_runs(
         included_chunk_count = 0
         excluded_chunk_count = 0
 
-    thrown_out = included_chunk_count == 0 and excluded_chunk_count > 0
+    thrown_out_reason = ""
+    if not settled_chunk_scores:
+        thrown_out = True
+        thrown_out_reason = "Insufficient scored chunks remained after settling/filtering for a reliable comparison."
+    elif included_chunk_count == 0 and excluded_chunk_count > 0:
+        thrown_out = True
+        thrown_out_reason = "Input similarity excluded every scored chunk for this device."
+    else:
+        thrown_out = False
     
     # ===== DIVERGENCE DETECTION =====
     _use_chunk_divergences = not sequence_dtw.warping_path
@@ -2407,6 +2416,7 @@ def compare_runs(
         included_chunk_count=included_chunk_count,
         excluded_chunk_count=excluded_chunk_count,
         thrown_out=thrown_out,
+        thrown_out_reason=thrown_out_reason,
         included_event_periods_a=included_event_periods_a,
         included_event_periods_b=included_event_periods_b,
         temporal_shift_seconds=temporal_shift,
@@ -2854,6 +2864,151 @@ def generate_phase_difference_summary(
     )
 
 
+def generate_clearance_irregularity_summary(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    threshold_seconds: float = 0.1,
+) -> List[Dict]:
+    """Summarize yellow/red clearance irregularities relative to each source median.
+
+    For each phase/overlap clearance state, compute the source-specific median
+    duration and separately count events that are above (high) or below (low) that
+    median by at least the configured threshold, plus the average deviation for each
+    direction.
+    """
+
+    clearance_classes = {'Yellow', 'Red', 'Overlap Yellow', 'Overlap Red'}
+
+    def _label_factory(event_class: str, event_value: int) -> str:
+        if event_class in {'Yellow', 'Red'}:
+            return f"Ph {event_value}"
+        return f"Ovlp {event_value}"
+
+    def _state_factory(event_class: str) -> str:
+        return event_class.replace('Overlap ', '')
+
+    def _compute_stats(timeline: pd.DataFrame) -> Dict:
+        filtered = timeline[timeline['EventClass'].isin(clearance_classes)].copy()
+        if filtered.empty:
+            return {}
+
+        if 'Duration' not in filtered.columns or filtered['Duration'].isna().all():
+            filtered['Duration'] = (filtered['EndTime'] - filtered['StartTime']).dt.total_seconds()
+        filtered['Duration'] = pd.to_numeric(filtered['Duration'], errors='coerce')
+        filtered = filtered.dropna(subset=['Duration'])
+
+        stats = {}
+        for (event_class, event_value), group in filtered.groupby(['EventClass', 'EventValue'], dropna=False):
+            if group.empty:
+                continue
+            value_int = int(float(event_value)) if pd.notna(event_value) else 0
+            key = (event_class, value_int)
+            durations = group['Duration'].astype(float)
+            median_seconds = float(durations.median())
+            signed_devs = durations - median_seconds
+            high_mask = signed_devs >= (threshold_seconds - 1e-9)
+            low_mask = signed_devs <= -(threshold_seconds - 1e-9)
+            irregular_mask = high_mask | low_mask
+            deviations_abs = signed_devs.abs()
+            anchor_index = deviations_abs.idxmax()
+            anchor_row = group.loc[anchor_index]
+            high_devs = signed_devs[high_mask]
+            low_devs = signed_devs[low_mask]
+            stats[key] = {
+                'median_seconds': median_seconds,
+                'irregular_count': int(irregular_mask.sum()),
+                'high_count': int(high_mask.sum()),
+                'low_count': int(low_mask.sum()),
+                'high_avg_deviation': float(high_devs.mean()) if not high_devs.empty else 0.0,
+                'low_avg_deviation': float((-low_devs).mean()) if not low_devs.empty else 0.0,
+                'sample_count': int(len(group)),
+                'max_deviation_seconds': float(deviations_abs.max()) if len(deviations_abs) else 0.0,
+                'anchor_start': pd.Timestamp(anchor_row['StartTime']),
+                'anchor_end': pd.Timestamp(anchor_row['EndTime']),
+            }
+        return stats
+
+    _empty_stats = {
+        'median_seconds': 0.0,
+        'irregular_count': 0,
+        'high_count': 0,
+        'low_count': 0,
+        'high_avg_deviation': 0.0,
+        'low_avg_deviation': 0.0,
+        'sample_count': 0,
+        'max_deviation_seconds': 0.0,
+        'anchor_start': None,
+        'anchor_end': None,
+    }
+
+    stats_a = _compute_stats(timeline_a)
+    stats_b = _compute_stats(timeline_b)
+    all_keys = sorted(set(stats_a.keys()) | set(stats_b.keys()))
+
+    results = []
+    for event_class, event_value in all_keys:
+        stats_left = stats_a.get((event_class, event_value), dict(_empty_stats))
+        stats_right = stats_b.get((event_class, event_value), dict(_empty_stats))
+
+        median_delta = stats_right['median_seconds'] - stats_left['median_seconds']
+        irregular_delta = stats_right['irregular_count'] - stats_left['irregular_count']
+
+        if (
+            stats_left['irregular_count'] == 0
+            and stats_right['irregular_count'] == 0
+            and abs(median_delta) < threshold_seconds
+        ):
+            continue
+
+        if stats_left['max_deviation_seconds'] >= stats_right['max_deviation_seconds']:
+            anchor_start = stats_left['anchor_start']
+            anchor_end = stats_left['anchor_end']
+        else:
+            anchor_start = stats_right['anchor_start']
+            anchor_end = stats_right['anchor_end']
+
+        results.append(
+            {
+                'label': _label_factory(event_class, event_value),
+                'state': _state_factory(event_class),
+                'event_class': event_class,
+                'event_value': event_value,
+                'median_a': stats_left['median_seconds'],
+                'median_b': stats_right['median_seconds'],
+                'median_delta': median_delta,
+                'irregular_count_a': stats_left['irregular_count'],
+                'irregular_count_b': stats_right['irregular_count'],
+                'irregular_count_delta': irregular_delta,
+                'high_count_a': stats_left['high_count'],
+                'high_count_b': stats_right['high_count'],
+                'high_count_delta': stats_right['high_count'] - stats_left['high_count'],
+                'low_count_a': stats_left['low_count'],
+                'low_count_b': stats_right['low_count'],
+                'low_count_delta': stats_right['low_count'] - stats_left['low_count'],
+                'high_avg_deviation_a': stats_left['high_avg_deviation'],
+                'high_avg_deviation_b': stats_right['high_avg_deviation'],
+                'low_avg_deviation_a': stats_left['low_avg_deviation'],
+                'low_avg_deviation_b': stats_right['low_avg_deviation'],
+                'sample_count_a': stats_left['sample_count'],
+                'sample_count_b': stats_right['sample_count'],
+                'max_deviation_a': stats_left['max_deviation_seconds'],
+                'max_deviation_b': stats_right['max_deviation_seconds'],
+                'anchor_start': anchor_start,
+                'anchor_end': anchor_end,
+            }
+        )
+
+    results.sort(
+        key=lambda row: (
+            abs(row['irregular_count_delta']),
+            max(row['irregular_count_a'], row['irregular_count_b']),
+            abs(row['median_delta']),
+        ),
+        reverse=True,
+    )
+    return results
+
+
 def generate_operational_difference_summary(
     timeline_a: pd.DataFrame,
     timeline_b: pd.DataFrame,
@@ -3248,7 +3403,7 @@ def create_comparison_gantt_matplotlib(
     # Configure axes
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels)
-    ax.set_xlabel('Time from analysis start', fontsize=13, fontweight='semibold', labelpad=10)
+    ax.set_xlabel('Time of Day', fontsize=13, fontweight='semibold', labelpad=10)
     ax.set_title(title, fontsize=17, fontweight='bold', pad=14)
     ax.set_xlim(window_start_sec, window_end_sec)
     ax.invert_yaxis()  # Put first row at top
@@ -3322,10 +3477,16 @@ def create_multi_divergence_plots(
     if not divergences:
         return []
 
-    selected = sorted(
-        divergences,
-        key=lambda d: d.original_start_seconds_a,
-    )[:max_plots]
+    selected: List[DivergenceWindow] = []
+    for divergence in sorted(divergences, key=lambda d: d.original_start_seconds_a):
+        if any(
+            abs(divergence.original_start_seconds_a - existing.original_start_seconds_a) < 10.0 * 60.0
+            for existing in selected
+        ):
+            continue
+        selected.append(divergence)
+        if len(selected) >= max_plots:
+            break
 
     paths: List[str] = []
     for idx, div in enumerate(selected, start=1):

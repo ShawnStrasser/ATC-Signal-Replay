@@ -8,7 +8,8 @@ to the configured baseline, and generates an HTML report with divergence charts.
 Usage:
     python firmware_validate.py                  # interactive, uses settings.json
     python firmware_validate.py --verbose        # extra debug output
-    python firmware_validate.py --report-only    # skip replay, just run analysis
+    python firmware_validate.py --report-only    # skip replay, just run analysis + report
+    python firmware_validate.py --report-only-fast
     python firmware_validate.py --settings custom_settings.json
 
 Settings are loaded from settings.json (editable JSON file in the same folder).
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import duckdb
+import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 from openpyxl import load_workbook
@@ -277,7 +279,6 @@ def _get_collected_device_ids(db_path: Path) -> set[str]:
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
             ).fetchall()
         }
-
         device_ids: set[str] = set()
         if "events" in tables:
             device_ids.update(
@@ -855,6 +856,375 @@ def _compute_export_shift(
     return (collected_start - original_start) - pd.Timedelta(seconds=shift_sec)
 
 
+def _normalize_issue_timeline_rows(
+    timeline: pd.DataFrame,
+    event_class: str,
+    event_value: int,
+) -> pd.DataFrame:
+    """Return timeline rows for a single event class/value with numeric durations."""
+    if timeline.empty:
+        return pd.DataFrame(columns=["StartTime", "EndTime", "Duration"])
+
+    filtered = timeline[timeline["EventClass"] == event_class].copy()
+    if filtered.empty:
+        return filtered
+
+    filtered["EventValue"] = pd.to_numeric(filtered["EventValue"], errors="coerce")
+    filtered = filtered[filtered["EventValue"] == event_value].copy()
+    if filtered.empty:
+        return filtered
+
+    if "Duration" not in filtered.columns or filtered["Duration"].isna().all():
+        filtered["Duration"] = (filtered["EndTime"] - filtered["StartTime"]).dt.total_seconds()
+    filtered["Duration"] = pd.to_numeric(filtered["Duration"], errors="coerce")
+    filtered = filtered.dropna(subset=["Duration"])
+    return filtered.sort_values(["StartTime", "EndTime"]).reset_index(drop=True)
+
+
+def _timeline_valid_mask(timeline: pd.DataFrame) -> pd.Series:
+    if timeline.empty:
+        return pd.Series(dtype=bool, index=timeline.index)
+
+    for column in ("IsValid", "is_valid"):
+        if column in timeline.columns:
+            return timeline[column].fillna(False).astype(bool)
+
+    return pd.Series(True, index=timeline.index)
+
+
+def _split_timeline_by_validity(
+    timeline: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if timeline.empty:
+        return timeline.copy(), timeline.copy()
+
+    valid_mask = _timeline_valid_mask(timeline)
+    return timeline[valid_mask].copy(), timeline[~valid_mask].copy()
+
+
+def _remove_ignored_timeline_events(timeline: pd.DataFrame) -> pd.DataFrame:
+    if timeline.empty:
+        return timeline.copy()
+
+    remove_events = [
+        "Ped Omit",
+        "Phase Hold",
+        "Phase Omit",
+        "Phase Call",
+    ]
+    return timeline[~timeline["EventClass"].isin(remove_events)].copy()
+
+
+def _prepare_settled_overlap_timelines(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    *,
+    settle_minutes: float,
+    tod_align: bool,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    left = timeline_a.copy()
+    right = timeline_b.copy()
+
+    if left.empty and right.empty:
+        return left, right
+
+    settle_td = pd.Timedelta(minutes=settle_minutes)
+
+    if tod_align:
+        if settle_minutes > 0:
+            if not left.empty:
+                left = left[left["StartTime"] >= left["StartTime"].min() + settle_td].copy()
+            if not right.empty:
+                right = right[right["StartTime"] >= right["StartTime"].min() + settle_td].copy()
+    else:
+        start_a = None
+        if not left.empty:
+            start_a = left["StartTime"].min()
+            left = left[left["StartTime"] >= start_a + settle_td].copy()
+        if not right.empty:
+            start_b = right["StartTime"].min()
+            if start_a is not None:
+                right["StartTime"] = start_a + (right["StartTime"] - start_b)
+                right["EndTime"] = start_a + (right["EndTime"] - start_b)
+                right = right[right["StartTime"] >= start_a + settle_td].copy()
+            else:
+                right = right[right["StartTime"] >= start_b + settle_td].copy()
+
+    if not left.empty and not right.empty:
+        overlap_end = min(left["EndTime"].max(), right["EndTime"].max())
+        left = left[left["StartTime"] <= overlap_end].copy()
+        right = right[right["StartTime"] <= overlap_end].copy()
+
+    return left, right
+
+
+def _is_significant_operational_issue(diff: Dict[str, object]) -> bool:
+    """Mirror the report thresholds so polarity and chart selection stay aligned."""
+    label = str(diff.get("label", "")).strip()
+    avg_delta = float(diff.get("duration_delta", 0.0) or 0.0)
+    total_delta = float(diff.get("total_duration_delta", 0.0) or 0.0)
+    count_delta = abs(int(diff.get("count_delta", 0) or 0))
+
+    threshold = None
+    total_threshold = None
+    if label.startswith("Preempt"):
+        threshold = 3.0
+        total_threshold = 60.0
+    elif label.startswith(("Ped", "Ovlp Ped", "Overlap Ped")):
+        threshold = 2.0
+        total_threshold = 15.0
+    elif label == "Transition":
+        threshold = 1.0
+        total_threshold = 10.0
+
+    if threshold is None:
+        return False
+    return abs(avg_delta) >= threshold or abs(total_delta) >= total_threshold or count_delta >= 1
+
+
+def _select_operational_issue_anchor(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    diff: Dict[str, object],
+) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], float]:
+    """Pick the event window with the biggest mismatch for a flagged operational diff."""
+    rows_a = _normalize_issue_timeline_rows(
+        timeline_a,
+        str(diff.get("event_class", "")),
+        int(diff.get("event_value", 0) or 0),
+    )
+    rows_b = _normalize_issue_timeline_rows(
+        timeline_b,
+        str(diff.get("event_class", "")),
+        int(diff.get("event_value", 0) or 0),
+    )
+
+    if rows_a.empty and rows_b.empty:
+        return None, None, -1.0
+
+    median_a = float(rows_a["Duration"].median()) if not rows_a.empty else None
+    median_b = float(rows_b["Duration"].median()) if not rows_b.empty else None
+    best_score = -1.0
+    best_start: Optional[pd.Timestamp] = None
+    best_end: Optional[pd.Timestamp] = None
+
+    if not rows_a.empty:
+        reference = median_b if median_b is not None else median_a
+        deviations = (rows_a["Duration"] - float(reference or 0.0)).abs()
+        idx = deviations.idxmax()
+        score = float(deviations.loc[idx])
+        if score > best_score:
+            best_score = score
+            best_start = pd.Timestamp(rows_a.loc[idx, "StartTime"])
+            best_end = pd.Timestamp(rows_a.loc[idx, "EndTime"])
+
+    if not rows_b.empty:
+        reference = median_a if median_a is not None else median_b
+        deviations = (rows_b["Duration"] - float(reference or 0.0)).abs()
+        idx = deviations.idxmax()
+        score = float(deviations.loc[idx])
+        if score > best_score:
+            best_score = score
+            best_start = pd.Timestamp(rows_b.loc[idx, "StartTime"])
+            best_end = pd.Timestamp(rows_b.loc[idx, "EndTime"])
+
+    return best_start, best_end, best_score
+
+
+def _select_clearance_issue_spec(
+    *,
+    scenario_id: str,
+    row: Dict[str, object],
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    label_a: str,
+    label_b: str,
+) -> Optional[Dict[str, object]]:
+    rows_a = _normalize_issue_timeline_rows(
+        timeline_a,
+        str(row.get("event_class", "")),
+        int(row.get("event_value", 0) or 0),
+    )
+    rows_b = _normalize_issue_timeline_rows(
+        timeline_b,
+        str(row.get("event_class", "")),
+        int(row.get("event_value", 0) or 0),
+    )
+
+    def _peak(rows: pd.DataFrame, version_label: str) -> Optional[Dict[str, object]]:
+        if rows.empty:
+            return None
+        median = float(rows["Duration"].median())
+        deviations = rows["Duration"] - median
+        idx = deviations.abs().idxmax()
+        return {
+            "version": version_label,
+            "duration": float(rows.loc[idx, "Duration"]),
+            "median": median,
+            "deviation": float(deviations.loc[idx]),
+            "start": pd.Timestamp(rows.loc[idx, "StartTime"]),
+            "end": pd.Timestamp(rows.loc[idx, "EndTime"]),
+        }
+
+    peak_a = _peak(rows_a, label_a)
+    peak_b = _peak(rows_b, label_b)
+    peaks = [peak for peak in (peak_a, peak_b) if peak is not None]
+    if not peaks:
+        return None
+
+    anchor = max(peaks, key=lambda item: abs(float(item["deviation"])))
+    detail_label = f"{str(row.get('label', '')).strip()} {str(row.get('state', '')).strip()}".strip()
+    relation = "above" if float(anchor["deviation"]) >= 0 else "below"
+
+    version_parts: List[str] = []
+    if peak_a is not None:
+        version_parts.append(
+            f"{label_a}: {peak_a['duration']:.2f}s vs median {peak_a['median']:.2f}s"
+        )
+    else:
+        version_parts.append(f"{label_a}: no flagged irregular event")
+    if peak_b is not None:
+        version_parts.append(
+            f"{label_b}: {peak_b['duration']:.2f}s vs median {peak_b['median']:.2f}s"
+        )
+    else:
+        version_parts.append(f"{label_b}: no flagged irregular event")
+
+    return {
+        "caption": (
+            f"{detail_label} shown below is {abs(float(anchor['deviation'])):.2f}s {relation} the median "
+            f"in {anchor['version']} ({'; '.join(version_parts)})"
+        ),
+        "title": f"{scenario_id} Clearance Focus - {detail_label}",
+        "start": anchor["start"],
+        "end": anchor["end"],
+        "score": abs(float(anchor["deviation"])),
+    }
+
+
+def _is_distinct_issue_window(
+    start: pd.Timestamp,
+    existing_specs: List[Dict[str, object]],
+    *,
+    min_spacing_seconds: float = 600.0,
+) -> bool:
+    return all(
+        abs((pd.Timestamp(start) - pd.Timestamp(spec["start"])).total_seconds()) >= min_spacing_seconds
+        for spec in existing_specs
+    )
+
+
+def _generate_special_issue_plots(
+    *,
+    scenario_id: str,
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    aligned_timeline_a: pd.DataFrame,
+    aligned_timeline_b: pd.DataFrame,
+    clearance_irregularities: List[dict],
+    operational_diffs: List[dict],
+    plots_dir: str,
+    label_a: str,
+    label_b: str,
+    window_minutes: float,
+    time_offset_b: float,
+    align_by_time_delta: bool,
+) -> Tuple[List[str], List[str]]:
+    """Create labeled charts for the worst flagged clearance and operational issues."""
+    if timeline_a.empty or timeline_b.empty:
+        return [], []
+
+    issue_specs: List[Dict[str, object]] = []
+    seen_keys = set()
+
+    for row in clearance_irregularities:
+        if int(row.get("irregular_count_a", 0) or 0) <= 0 and int(row.get("irregular_count_b", 0) or 0) <= 0:
+            continue
+        key = ("clearance", row.get("event_class"), row.get("event_value"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        issue_spec = _select_clearance_issue_spec(
+            scenario_id=scenario_id,
+            row=row,
+            timeline_a=aligned_timeline_a,
+            timeline_b=aligned_timeline_b,
+            label_a=label_a,
+            label_b=label_b,
+        )
+        if issue_spec is None:
+            continue
+        issue_specs.append(issue_spec)
+
+    for diff in operational_diffs:
+        if not _is_significant_operational_issue(diff):
+            continue
+        key = ("operational", diff.get("event_class"), diff.get("event_value"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        anchor_start, anchor_end, score = _select_operational_issue_anchor(aligned_timeline_a, aligned_timeline_b, diff)
+        if anchor_start is None or anchor_end is None:
+            continue
+        detail_label = f"{diff.get('label', '').strip()} {diff.get('state', '').strip()}".strip()
+        issue_specs.append(
+            {
+                "caption": (
+                    f"{detail_label}: {label_a} avg {float(diff.get('duration_a', 0.0) or 0.0):.2f}s, "
+                    f"{label_b} avg {float(diff.get('duration_b', 0.0) or 0.0):.2f}s "
+                    f"(Δ {float(diff.get('duration_delta', 0.0) or 0.0):+.2f}s)"
+                ),
+                "title": f"{scenario_id} Issue Focus - {detail_label}",
+                "start": anchor_start,
+                "end": anchor_end,
+                "score": max(
+                    score,
+                    abs(float(diff.get("duration_delta", 0.0) or 0.0)),
+                    abs(float(diff.get("total_duration_delta", 0.0) or 0.0)),
+                    abs(int(diff.get("count_delta", 0) or 0)),
+                ),
+            }
+        )
+
+    issue_specs.sort(
+        key=lambda spec: (-float(spec.get("score", 0.0) or 0.0), pd.Timestamp(spec["start"])),
+    )
+    deduped_issue_specs: List[Dict[str, object]] = []
+    for spec in issue_specs:
+        if not _is_distinct_issue_window(pd.Timestamp(spec["start"]), deduped_issue_specs):
+            continue
+        deduped_issue_specs.append(spec)
+
+    output_dir = Path(plots_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_paths: List[str] = []
+    plot_captions: List[str] = []
+    for index, spec in enumerate(deduped_issue_specs, start=1):
+        output_path = output_dir / f"{scenario_id}_issue_{index}.png"
+        fig = sr.create_comparison_gantt_matplotlib(
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            label_a=label_a,
+            label_b=label_b,
+            title=str(spec["title"]),
+            divergence_start=spec["start"],
+            divergence_end=spec["end"],
+            output_path=output_path,
+            window_minutes=window_minutes,
+            dpi=150,
+            align_by_time_delta=align_by_time_delta,
+            time_offset_b=time_offset_b,
+        )
+        if fig is None:
+            continue
+        plot_paths.append(str(output_path))
+        plot_captions.append(str(spec["caption"]))
+        plt.close(fig)
+
+    return plot_paths, plot_captions
+
+
 def _compare_one_scenario(args: Tuple) -> dict:
     """
     Worker function for ProcessPoolExecutor.
@@ -949,8 +1319,30 @@ def _compare_one_scenario(args: Tuple) -> dict:
         phase_call_threshold=phase_call_threshold,
     )
 
+    if test_type == sr.TestType.SIMILARITY and not result.thrown_out and not result.chunk_scores:
+        result.thrown_out = True
+        result.thrown_out_reason = (
+            getattr(result, "thrown_out_reason", "")
+            or "Insufficient scored chunks remained after settling/filtering for a reliable comparison."
+        )
+
     plot_paths: list = []
+    plot_captions: list = []
     timeline_a = timeline_b = None
+    valid_timeline_a = valid_timeline_b = None
+    invalid_timeline_a = invalid_timeline_b = None
+    analysis_diagnostics = []
+    chart_time_offset_b = 0.0
+    chart_align_by_time_delta = not tod_align
+    if test_type == sr.TestType.SIMILARITY:
+        analysis_diagnostics.append(
+            "Similarity chunks after settle/filtering: "
+            f"total={len(result.chunk_scores)}, included={result.included_chunk_count}, excluded={result.excluded_chunk_count}"
+        )
+        if not result.chunk_scores:
+            analysis_diagnostics.append(
+                "Comparison produced no scored chunks; match likely fell back to full-sequence DTW or a very short overlap."
+            )
     if not baseline_for_analysis.empty and not collected_for_analysis.empty:
         try:
             # Suppress atspm's verbose stdout unless --verbose
@@ -961,85 +1353,162 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 timeline_b = sr.generate_timeline(collected_for_analysis, device_id=scenario_id)
             if _devnull:
                 _devnull.close()
-            remove_events = [
-                "Ped Omit", "Phase Hold", "Phase Omit", "Phase Call",
-            ]
-            timeline_a = timeline_a[~timeline_a["EventClass"].isin(remove_events)]
-            timeline_b = timeline_b[~timeline_b["EventClass"].isin(remove_events)]
+            timeline_a = _remove_ignored_timeline_events(timeline_a)
+            timeline_b = _remove_ignored_timeline_events(timeline_b)
+            valid_timeline_a, invalid_timeline_a = _split_timeline_by_validity(timeline_a)
+            valid_timeline_b, invalid_timeline_b = _split_timeline_by_validity(timeline_b)
+            if tod_align or valid_timeline_a.empty or valid_timeline_b.empty:
+                chart_time_offset_b = 0.0
+            else:
+                chart_time_offset_b = sr.compute_timeline_offset(valid_timeline_a, valid_timeline_b)
+            analysis_diagnostics.append(
+                "Timeline rows after removing input-only classes: "
+                f"original={len(timeline_a)}, new={len(timeline_b)}"
+            )
+            analysis_diagnostics.append(
+                "Valid rows used for detailed summaries: "
+                f"original={len(valid_timeline_a)}, new={len(valid_timeline_b)}; "
+                "invalid rows reserved for Data Integrity: "
+                f"original={len(invalid_timeline_a)}, new={len(invalid_timeline_b)}"
+            )
+            if valid_timeline_a.empty or valid_timeline_b.empty:
+                analysis_diagnostics.append(
+                    "Filtered valid timelines do not contain enough signal, overlap, transition, preempt, or pedestrian-service rows for detailed summaries."
+                )
         except Exception as e:
+            analysis_diagnostics.append(f"Timeline generation failed: {e}")
             if verbose:
                 print(f"    Timeline generation failed for {scenario_id}: {e}", flush=True)
 
-    if result.divergence_windows and timeline_a is not None and not timeline_a.empty and not timeline_b.empty:
-        try:
-            _devnull2 = open(os.devnull, "w") if not verbose else None
-            _ctx2 = contextlib.redirect_stdout(_devnull2) if _devnull2 else contextlib.nullcontext()
-            with _ctx2:
-                time_offset_b = 0.0 if tod_align else sr.compute_timeline_offset(timeline_a, timeline_b)
-                plot_paths = sr.create_multi_divergence_plots(
-                    timeline_a=timeline_a, timeline_b=timeline_b,
-                    comparison_result=result, output_dir=plots_dir_str,
-                    label_a=baseline_label, label_b=firmware_version,
-                    max_plots=max_plots, window_minutes=window_minutes,
-                    time_offset_b=time_offset_b,
-                    align_by_time_delta=not tod_align,
-                )
-            if _devnull2:
-                _devnull2.close()
-        except Exception as e:
-            if verbose:
-                print(f"    Chart generation failed for {scenario_id}: {e}", flush=True)
-                import traceback as _tb
-                _tb.print_exc()
-
     passed = (not result.thrown_out) and result.match_percentage >= 95.0
     phase_diffs: list = []
+    clearance_irregularities: list = []
     operational_diffs: list = []
+    invalid_clearance_irregularities: list = []
+    invalid_operational_diffs: list = []
     timeline_difference_analysis_available = False
-    if test_type == sr.TestType.SIMILARITY and timeline_a is not None and not timeline_a.empty and not timeline_b.empty:
+    if (
+        test_type == sr.TestType.SIMILARITY
+        and valid_timeline_a is not None
+        and valid_timeline_b is not None
+        and not valid_timeline_a.empty
+        and not valid_timeline_b.empty
+    ):
         try:
-            settle_td = pd.Timedelta(minutes=compare_settle_minutes)
-            if tod_align:
-                tl_a_settled = timeline_a.copy()
-                tl_b_settled = timeline_b.copy()
-            else:
-                # The two timelines come from different absolute dates (original vs.
-                # collected replay). We need to align them by relative time from
-                # their respective starts before settle-trimming and overlap-clipping.
-                start_a = timeline_a["StartTime"].min()
-                start_b = timeline_b["StartTime"].min()
-
-                tl_a_rel = timeline_a.copy()
-                tl_b_rel = timeline_b.copy()
-
-                # Convert to a common epoch (use start_a as the reference)
-                tl_b_rel["StartTime"] = start_a + (tl_b_rel["StartTime"] - start_b)
-                tl_b_rel["EndTime"] = start_a + (tl_b_rel["EndTime"] - start_b)
-
-                tl_a_settled = tl_a_rel[tl_a_rel["StartTime"] >= start_a + settle_td].copy()
-                tl_b_settled = tl_b_rel[tl_b_rel["StartTime"] >= start_a + settle_td].copy()
-
-            overlap_end = min(tl_a_settled["EndTime"].max(), tl_b_settled["EndTime"].max())
-            tl_a_settled = tl_a_settled[tl_a_settled["StartTime"] <= overlap_end]
-            tl_b_settled = tl_b_settled[tl_b_settled["StartTime"] <= overlap_end]
+            tl_a_settled, tl_b_settled = _prepare_settled_overlap_timelines(
+                valid_timeline_a,
+                valid_timeline_b,
+                settle_minutes=compare_settle_minutes,
+                tod_align=tod_align,
+            )
+            analysis_diagnostics.append(
+                "Settled overlap rows used for timeline summaries: "
+                f"original={len(tl_a_settled)}, new={len(tl_b_settled)}"
+            )
+            if tl_a_settled.empty or tl_b_settled.empty:
+                analysis_diagnostics.append(
+                    "No overlapping settled timeline remained after alignment and overlap clipping."
+                )
 
             if verbose:
                 signal_classes = {'Green', 'Yellow', 'Red', 'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red'}
                 sig_a = tl_a_settled[tl_a_settled["EventClass"].isin(signal_classes)]
                 sig_b = tl_b_settled[tl_b_settled["EventClass"].isin(signal_classes)]
-                print(f"    [diag] timeline_a range: {timeline_a['StartTime'].min()} to {timeline_a['EndTime'].max()}", flush=True)
-                print(f"    [diag] timeline_b range: {timeline_b['StartTime'].min()} to {timeline_b['EndTime'].max()}", flush=True)
+                print(f"    [diag] valid_timeline_a range: {valid_timeline_a['StartTime'].min()} to {valid_timeline_a['EndTime'].max()}", flush=True)
+                print(f"    [diag] valid_timeline_b range: {valid_timeline_b['StartTime'].min()} to {valid_timeline_b['EndTime'].max()}", flush=True)
+                overlap_end = min(tl_a_settled["EndTime"].max(), tl_b_settled["EndTime"].max())
                 print(f"    [diag] after settle+overlap: tl_a={len(tl_a_settled)} ({len(sig_a)} signal), "
                       f"tl_b={len(tl_b_settled)} ({len(sig_b)} signal), overlap_end={overlap_end}", flush=True)
 
             phase_diffs = sr.generate_phase_difference_summary(tl_a_settled, tl_b_settled, tolerance_seconds=0.2)
+            clearance_irregularities = sr.generate_clearance_irregularity_summary(
+                tl_a_settled,
+                tl_b_settled,
+                threshold_seconds=0.1,
+            )
             operational_diffs = sr.generate_operational_difference_summary(tl_a_settled, tl_b_settled, tolerance_seconds=0.2)
             timeline_difference_analysis_available = True
+
+            try:
+                _devnull2 = open(os.devnull, "w") if not verbose else None
+                _ctx2 = contextlib.redirect_stdout(_devnull2) if _devnull2 else contextlib.nullcontext()
+                with _ctx2:
+                    issue_plot_paths, issue_plot_captions = _generate_special_issue_plots(
+                        scenario_id=scenario_id,
+                        timeline_a=valid_timeline_a,
+                        timeline_b=valid_timeline_b,
+                        aligned_timeline_a=tl_a_settled,
+                        aligned_timeline_b=tl_b_settled,
+                        clearance_irregularities=clearance_irregularities,
+                        operational_diffs=operational_diffs,
+                        plots_dir=plots_dir_str,
+                        label_a=baseline_label,
+                        label_b=firmware_version,
+                        window_minutes=window_minutes,
+                        time_offset_b=chart_time_offset_b,
+                        align_by_time_delta=chart_align_by_time_delta,
+                    )
+
+                    remaining_divergence_plots = max(0, max_plots - len(issue_plot_paths))
+                    divergence_paths = sr.create_multi_divergence_plots(
+                        timeline_a=valid_timeline_a,
+                        timeline_b=valid_timeline_b,
+                        comparison_result=result,
+                        output_dir=plots_dir_str,
+                        label_a=baseline_label,
+                        label_b=firmware_version,
+                        max_plots=remaining_divergence_plots,
+                        window_minutes=window_minutes,
+                        time_offset_b=chart_time_offset_b,
+                        align_by_time_delta=chart_align_by_time_delta,
+                    ) if remaining_divergence_plots > 0 else []
+
+                plot_paths = issue_plot_paths + divergence_paths
+                plot_captions = issue_plot_captions + [
+                    f"Divergence {index}" for index in range(1, len(divergence_paths) + 1)
+                ]
+                if _devnull2:
+                    _devnull2.close()
+            except Exception as e:
+                if verbose:
+                    print(f"    Chart generation failed for {scenario_id}: {e}", flush=True)
+                    import traceback as _tb
+                    _tb.print_exc()
         except Exception as e:
+            analysis_diagnostics.append(f"Timeline difference summary failed: {e}")
             if verbose:
                 print(f"    Phase breakdown failed for {scenario_id}: {e}", flush=True)
                 import traceback as _tb
                 _tb.print_exc()
+
+    if test_type == sr.TestType.SIMILARITY and invalid_timeline_a is not None and invalid_timeline_b is not None:
+        try:
+            tl_a_invalid, tl_b_invalid = _prepare_settled_overlap_timelines(
+                invalid_timeline_a,
+                invalid_timeline_b,
+                settle_minutes=compare_settle_minutes,
+                tod_align=tod_align,
+            )
+            if not tl_a_invalid.empty or not tl_b_invalid.empty:
+                invalid_clearance_irregularities = sr.generate_clearance_irregularity_summary(
+                    tl_a_invalid,
+                    tl_b_invalid,
+                    threshold_seconds=0.1,
+                )
+                invalid_operational_diffs = sr.generate_operational_difference_summary(
+                    tl_a_invalid,
+                    tl_b_invalid,
+                    tolerance_seconds=0.2,
+                )
+        except Exception as e:
+            analysis_diagnostics.append(f"Invalid-event timeline summary failed: {e}")
+            if verbose:
+                print(f"    Invalid-event breakdown failed for {scenario_id}: {e}", flush=True)
+                import traceback as _tb
+                _tb.print_exc()
+
+    if test_type == sr.TestType.SIMILARITY and not timeline_difference_analysis_available and not analysis_diagnostics:
+        analysis_diagnostics.append("Detailed timeline analysis was unavailable for this scenario.")
 
     # Truncate the summary to show at most 10 divergences
     raw_summary = result.format_summary()
@@ -1065,8 +1534,13 @@ def _compare_one_scenario(args: Tuple) -> dict:
         "num_divergences": len(result.divergence_windows),
         "summary": "\n".join(truncated_lines),
         "plot_paths": plot_paths,
+        "plot_captions": plot_captions,
         "phase_diffs": phase_diffs,
+        "clearance_irregularities": clearance_irregularities,
         "operational_diffs": operational_diffs,
+        "invalid_clearance_irregularities": invalid_clearance_irregularities,
+        "invalid_operational_diffs": invalid_operational_diffs,
+        "analysis_diagnostics": analysis_diagnostics,
         "timeline_difference_analysis_available": timeline_difference_analysis_available,
         "notes_column": notes_column,
         "chunk_scores": [
@@ -1086,6 +1560,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
         "included_chunk_count": result.included_chunk_count,
         "excluded_chunk_count": result.excluded_chunk_count,
         "thrown_out": result.thrown_out,
+        "thrown_out_reason": getattr(result, "thrown_out_reason", ""),
         "temporal_shift_seconds": result.temporal_shift_seconds,
         "runs_completed": 1,
         "total_runs": 1,
@@ -1202,6 +1677,8 @@ def run_analysis(
     suite: sr.FirmwareTestSuite,
     settings: dict,
     firmware_dir: Path,
+    *,
+    export_device_csvs: bool = True,
 ) -> List[sr.ScenarioResult]:
     """Run comparisons with multiprocessing. Returns list of ScenarioResult."""
     firmware_version = suite.firmware_version
@@ -1242,9 +1719,12 @@ def run_analysis(
             continue
         baseline_sources[scenario.scenario_id] = baseline_source
 
-    # Export per-device CSVs (baseline + collected combined)
-    log("Exporting per-device CSV files...")
-    _export_device_csvs(suite, collected_db_path, baseline_sources, group_tolerance=group_tolerance)
+    if export_device_csvs:
+        # Export per-device CSVs (baseline + collected combined)
+        log("Exporting per-device CSV files...")
+        _export_device_csvs(suite, collected_db_path, baseline_sources, group_tolerance=group_tolerance)
+    else:
+        log("Skipping per-device CSV export.")
 
     analysis_start_time = comp.get("analysis_start_time")
     analysis_end_time = comp.get("analysis_end_time")
@@ -1321,8 +1801,12 @@ def run_analysis(
                         notes=out["summary"],
                         notes_column=out.get("notes_column", ""),
                         plot_paths=out["plot_paths"],
+                        plot_captions=out.get("plot_captions", []),
                         phase_differences=out["phase_diffs"],
+                        clearance_irregularities=out.get("clearance_irregularities", []),
                         operational_differences=out.get("operational_diffs", []),
+                        invalid_clearance_irregularities=out.get("invalid_clearance_irregularities", []),
+                        invalid_operational_differences=out.get("invalid_operational_diffs", []),
                         runs_completed=out.get("runs_completed", 1),
                         total_runs=out.get("total_runs", 1),
                         chunk_scores=out.get("chunk_scores", []),
@@ -1330,6 +1814,8 @@ def run_analysis(
                         included_chunk_count=out.get("included_chunk_count", 0),
                         excluded_chunk_count=out.get("excluded_chunk_count", 0),
                         thrown_out=out.get("thrown_out", False),
+                        thrown_out_reason=out.get("thrown_out_reason", ""),
+                        analysis_diagnostics=out.get("analysis_diagnostics", []),
                         timeline_difference_analysis_available=out.get("timeline_difference_analysis_available", False),
                         sparkline_svg=out.get("sparkline_svg", ""),
                         temporal_shift_seconds=out.get("temporal_shift_seconds", 0.0),
@@ -1422,13 +1908,26 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Firmware validation: replay, compare, report.")
     parser.add_argument("--settings", default="settings.json", help="Path to settings JSON file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
-    parser.add_argument("--report-only", action="store_true", help="Skip replay, just run analysis + report")
+    report_mode = parser.add_mutually_exclusive_group()
+    report_mode.add_argument("--report-only", action="store_true", help="Skip replay, just run analysis + report")
+    report_mode.add_argument(
+        "--report-only-fast",
+        action="store_true",
+        help="Skip replay and rebuild the report without refreshing device CSV exports",
+    )
     parser.add_argument("--archive", action="store_true", help="Refresh the versioned collected logs after report generation")
     parser.add_argument(
         "--settle-minutes",
         type=float,
         default=None,
         help="Override the initial minutes excluded from similarity analysis/reporting",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Limit the report to the first N scenarios (by scenario ID). Useful for quick local testing.",
     )
     args = parser.parse_args()
 
@@ -1508,7 +2007,7 @@ def main() -> None:
         # ======================================================================
         # REPLAY PHASE
         # ======================================================================
-        if not args.report_only:
+        if not args.report_only and not args.report_only_fast:
             existing_ids = _get_collected_device_ids(_shared_collected_db_path(suite))
             current_batch, remaining_pending, replace_selected, skipped_existing = _select_pending_replay_batch(
                 suite,
@@ -1590,7 +2089,20 @@ def main() -> None:
         log(f"ANALYSIS: Comparing {suite.firmware_version} output to {suite.baseline_version}")
         log(f"{'='*70}")
 
-        results = run_analysis(suite, settings, firmware_dir)
+        if args.top_n is not None:
+            suite.scenarios = suite.scenarios[:args.top_n]
+            log(f"--top-n {args.top_n}: limiting analysis to {len(suite.scenarios)} scenario(s): {', '.join(s.scenario_id for s in suite.scenarios)}")
+
+        export_device_csvs = not args.report_only_fast
+        if args.report_only_fast:
+            log("Report-only-fast mode: skipping device CSV refresh.")
+
+        results = run_analysis(
+            suite,
+            settings,
+            firmware_dir,
+            export_device_csvs=export_device_csvs,
+        )
         passed = sum(1 for r in results if r.passed)
         log(f"\nResults: {passed}/{len(results)} passed")
 

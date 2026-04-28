@@ -46,3 +46,4 @@ firmware_validation/logs- test/
 
 dist/
 firmware_validation/logs*
+firmware_validation/coord_patterns/

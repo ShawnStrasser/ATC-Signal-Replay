@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 import pandas as pd
+import signal_replay as sr
 
 from signal_replay.comparison import (
     ChunkScore,
@@ -10,6 +11,7 @@ from signal_replay.comparison import (
     clip_timeline_to_relative_periods,
     compare_runs,
     filter_divergence_windows_to_periods,
+    generate_clearance_irregularity_summary,
     generate_operational_difference_summary,
     generate_phase_difference_summary,
     render_sparkline_svg,
@@ -22,6 +24,10 @@ from signal_replay.test_suite import (
     TestScenario as SuiteScenario,
     TestType as SuiteTestType,
 )
+
+
+def test_signal_replay_package_exports_clearance_summary():
+    assert callable(sr.generate_clearance_irregularity_summary)
 
 
 def _make_events(main_offsets, phase_offsets=None):
@@ -81,6 +87,46 @@ def test_compare_runs_excludes_chunk_when_phase_call_similarity_is_below_thresho
     assert result.included_chunk_count == 0
     assert result.excluded_chunk_count == 1
     assert result.match_percentage == 0.0
+
+
+def test_generate_clearance_irregularity_summary_counts_off_median_events():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+
+    def _make_clearance_timeline(durations):
+        rows = []
+        cursor = base_time
+        for duration in durations:
+            start_time = cursor
+            end_time = start_time + timedelta(seconds=duration)
+            rows.append(
+                {
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "Duration": duration,
+                    "EventClass": "Yellow",
+                    "EventValue": 2,
+                }
+            )
+            cursor = end_time + timedelta(seconds=10)
+        return pd.DataFrame(rows)
+
+    timeline_a = _make_clearance_timeline([4.0, 4.0, 4.0, 4.3])
+    timeline_b = _make_clearance_timeline([4.2, 4.2, 4.5, 4.2])
+
+    rows = generate_clearance_irregularity_summary(timeline_a, timeline_b, threshold_seconds=0.2)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["label"] == "Ph 2"
+    assert row["state"] == "Yellow"
+    assert row["median_a"] == 4.0
+    assert row["median_b"] == 4.2
+    assert row["irregular_count_a"] == 1
+    assert row["irregular_count_b"] == 1
+    assert row["high_count_a"] == 1
+    assert row["low_count_a"] == 0
+    assert row["high_count_b"] == 1
+    assert row["low_count_b"] == 0
 
 
 def test_compare_runs_does_not_exclude_low_activity_phase_call_chunk():
@@ -349,7 +395,25 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
                 database_name="03013.bin",
                 events_source="03013.parquet",
                 test_type=SuiteTestType.SIMILARITY,
-            )
+            ),
+            SuiteScenario(
+                scenario_id="03014",
+                database_name="03014.bin",
+                events_source="03014.parquet",
+                test_type=SuiteTestType.SIMILARITY,
+            ),
+            SuiteScenario(
+                scenario_id="03015",
+                database_name="03015.bin",
+                events_source="03015.parquet",
+                test_type=SuiteTestType.SIMILARITY,
+            ),
+            SuiteScenario(
+                scenario_id="03016",
+                database_name="03016.bin",
+                events_source="03016.parquet",
+                test_type=SuiteTestType.SIMILARITY,
+            ),
         ],
         batches=[SuiteBatch(batch_id="batch_1", assignments={"03013": "127.0.0.1:9701"})],
         output_dir=str(tmp_path),
@@ -370,24 +434,115 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
             {
                 "label": "Ph 2",
                 "state": "Green",
-                "count_a": 1,
-                "count_b": 1,
-                "count_delta": 0,
-                "duration_a": 10.0,
-                "duration_b": 12.0,
-                "duration_delta": 2.0,
+                "count_a": 20,
+                "count_b": 19,
+                "count_delta": -1,
+                "duration_a": 32.0,
+                "duration_b": 32.3,
+                "duration_delta": 0.3,
+                "total_duration_a": 640.0,
+                "total_duration_b": 613.7,
+                "total_duration_delta": -26.3,
+            }
+        ],
+        clearance_irregularities=[
+            {
+                "label": "Ph 2",
+                "state": "Yellow",
+                "median_a": 4.0,
+                "median_b": 4.3,
+                "median_delta": 0.3,
+                "irregular_count_a": 1,
+                "irregular_count_b": 4,
+                "irregular_count_delta": 3,
+                "high_count_a": 1,
+                "high_count_b": 4,
+                "low_count_a": 0,
+                "low_count_b": 0,
+                "high_avg_deviation_a": 0.4,
+                "high_avg_deviation_b": 0.3,
+                "low_avg_deviation_a": 0.0,
+                "low_avg_deviation_b": 0.0,
+                "sample_count_a": 20,
+                "sample_count_b": 19,
+            }
+        ],
+        invalid_clearance_irregularities=[
+            {
+                "label": "Ph 4",
+                "state": "Red",
+                "median_a": 1.5,
+                "median_b": 1.4,
+                "median_delta": -0.1,
+                "irregular_count_a": 1,
+                "irregular_count_b": 2,
+                "irregular_count_delta": 1,
+                "high_count_a": 0,
+                "high_count_b": 0,
+                "low_count_a": 1,
+                "low_count_b": 2,
+                "high_avg_deviation_a": 0.0,
+                "high_avg_deviation_b": 0.0,
+                "low_avg_deviation_a": 0.25,
+                "low_avg_deviation_b": 0.35,
+                "sample_count_a": 20,
+                "sample_count_b": 19,
             }
         ],
         operational_differences=[
             {
-                "label": "Transition",
-                "state": "Longway",
-                "count_a": 1,
-                "count_b": 2,
+                "label": "Preempt 6",
+                "state": "Active",
+                "count_a": 2,
+                "count_b": 3,
                 "count_delta": 1,
-                "duration_a": 5.0,
-                "duration_b": 7.0,
-                "duration_delta": 2.0,
+                "duration_a": 2240.9,
+                "duration_b": 86.3,
+                "duration_delta": -2154.6,
+                "total_duration_a": 4481.8,
+                "total_duration_b": 258.9,
+                "total_duration_delta": -4222.9,
+            },
+            {
+                "label": "Ped 2",
+                "state": "Service",
+                "count_a": 4,
+                "count_b": 4,
+                "count_delta": 0,
+                "duration_a": 8.0,
+                "duration_b": 11.0,
+                "duration_delta": 3.0,
+                "total_duration_a": 32.0,
+                "total_duration_b": 44.0,
+                "total_duration_delta": 12.0,
+            },
+            {
+                "label": "Ovlp Ped 3",
+                "state": "Service",
+                "count_a": 3,
+                "count_b": 3,
+                "count_delta": 0,
+                "duration_a": 9.0,
+                "duration_b": 11.5,
+                "duration_delta": 2.5,
+                "total_duration_a": 27.0,
+                "total_duration_b": 34.5,
+                "total_duration_delta": 7.5,
+            }
+        ],
+        invalid_operational_differences=[
+            {
+                "label": "Transition",
+                "state": "Active",
+                "count_a": 5,
+                "count_b": 6,
+                "count_delta": 1,
+                "duration_a": 10.0,
+                "duration_b": 14.0,
+                "duration_delta": 4.0,
+                "total_duration_a": 50.0,
+                "total_duration_b": 84.0,
+                "total_duration_delta": 34.0,
             }
         ],
         phase_call_chunk_scores=[
@@ -409,6 +564,134 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
         timeline_difference_analysis_available=True,
     )
 
+    trend_peer = ScenarioResult(
+        scenario_id="03015",
+        test_type=SuiteTestType.SIMILARITY,
+        firmware_version="2.17.3",
+        passed=False,
+        match_percentage=91.2,
+        num_divergences=1,
+        runs_completed=1,
+        total_runs=1,
+        notes="Recurring preempt drift",
+        phase_differences=[
+            {
+                "label": "Ph 6",
+                "state": "Green",
+                "count_a": 18,
+                "count_b": 18,
+                "count_delta": 0,
+                "duration_a": 44.4,
+                "duration_b": 43.9,
+                "duration_delta": -0.5,
+                "total_duration_a": 799.2,
+                "total_duration_b": 790.2,
+                "total_duration_delta": -9.0,
+            }
+        ],
+        clearance_irregularities=[
+            {
+                "label": "Ph 6",
+                "state": "Yellow",
+                "median_a": 4.4,
+                "median_b": 3.9,
+                "median_delta": -0.5,
+                "irregular_count_a": 2,
+                "irregular_count_b": 1,
+                "irregular_count_delta": -1,
+                "high_count_a": 2,
+                "high_count_b": 1,
+                "low_count_a": 0,
+                "low_count_b": 0,
+                "high_avg_deviation_a": 0.35,
+                "high_avg_deviation_b": 0.3,
+                "low_avg_deviation_a": 0.0,
+                "low_avg_deviation_b": 0.0,
+                "sample_count_a": 18,
+                "sample_count_b": 18,
+            }
+        ],
+        invalid_clearance_irregularities=[
+            {
+                "label": "Ph 4",
+                "state": "Red",
+                "median_a": 1.6,
+                "median_b": 1.5,
+                "median_delta": -0.1,
+                "irregular_count_a": 2,
+                "irregular_count_b": 1,
+                "irregular_count_delta": -1,
+                "high_count_a": 0,
+                "high_count_b": 0,
+                "low_count_a": 2,
+                "low_count_b": 1,
+                "high_avg_deviation_a": 0.0,
+                "high_avg_deviation_b": 0.0,
+                "low_avg_deviation_a": 0.20,
+                "low_avg_deviation_b": 0.30,
+                "sample_count_a": 18,
+                "sample_count_b": 18,
+            }
+        ],
+        operational_differences=[
+            {
+                "label": "Preempt 6",
+                "state": "Active",
+                "count_a": 6,
+                "count_b": 6,
+                "count_delta": 0,
+                "duration_a": 200.0,
+                "duration_b": 100.0,
+                "duration_delta": -100.0,
+                "total_duration_a": 1200.0,
+                "total_duration_b": 600.0,
+                "total_duration_delta": -600.0,
+            },
+            {
+                "label": "Ped 5",
+                "state": "Service",
+                "count_a": 4,
+                "count_b": 4,
+                "count_delta": 0,
+                "duration_a": 7.5,
+                "duration_b": 10.5,
+                "duration_delta": 3.0,
+                "total_duration_a": 30.0,
+                "total_duration_b": 42.0,
+                "total_duration_delta": 12.0,
+            },
+            {
+                "label": "Ovlp Ped 7",
+                "state": "Service",
+                "count_a": 3,
+                "count_b": 3,
+                "count_delta": 0,
+                "duration_a": 8.5,
+                "duration_b": 11.0,
+                "duration_delta": 2.5,
+                "total_duration_a": 25.5,
+                "total_duration_b": 33.0,
+                "total_duration_delta": 7.5,
+            }
+        ],
+        invalid_operational_differences=[
+            {
+                "label": "Transition",
+                "state": "Active",
+                "count_a": 4,
+                "count_b": 5,
+                "count_delta": 1,
+                "duration_a": 9.0,
+                "duration_b": 10.0,
+                "duration_delta": 1.0,
+                "total_duration_a": 36.0,
+                "total_duration_b": 50.0,
+                "total_duration_delta": 14.0,
+            }
+        ],
+        timeline_difference_analysis_available=True,
+    )
+
     thrown_out = ScenarioResult(
         scenario_id="03014",
         test_type=SuiteTestType.SIMILARITY,
@@ -422,6 +705,7 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
         included_chunk_count=0,
         excluded_chunk_count=2,
         thrown_out=True,
+        thrown_out_reason="Insufficient scored chunks remained after settling/filtering for a reliable comparison.",
         phase_call_chunk_scores=[
             {
                 "center_seconds": 1350.0,
@@ -434,8 +718,27 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
         timeline_difference_analysis_available=True,
     )
 
+    unavailable = ScenarioResult(
+        scenario_id="03016",
+        test_type=SuiteTestType.SIMILARITY,
+        firmware_version="2.17.3",
+        passed=False,
+        match_percentage=None,
+        num_divergences=0,
+        runs_completed=0,
+        total_runs=1,
+        notes="Match: 0.0%\nDivergences: 0",
+        error="No collected events found for 03016 in collected.db. Replay data for this scenario is missing, so the comparison and device CSV export are invalid until that device is collected again.",
+        analysis_diagnostics=[
+            "Similarity chunks after settle/filtering: total=0, included=0, excluded=0",
+            "Timeline rows after removing input-only classes: original=120, new=0",
+            "Filtered timelines do not contain enough signal, overlap, transition, preempt, or pedestrian-service rows for detailed summaries.",
+        ],
+        timeline_difference_analysis_available=False,
+    )
+
     report_path = tmp_path / "report.html"
-    generate_report([result, thrown_out], suite, str(report_path))
+    generate_report([result, thrown_out, trend_peer, unavailable], suite, str(report_path))
 
     html = report_path.read_text(encoding="utf-8")
     assert "Combined Timeline" in html
@@ -444,5 +747,48 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     assert "90.0%" in html
     assert "Transition / Preempt / Ped Service Differences" in html
     assert "Thrown out" in html
-    assert ">97.5%</div>" in html
+    assert "97.5%" in html
     assert "No meaningful transition, preempt, or pedestrian-service differences were found." in html
+    assert "Timeline Difference Analysis" in html
+    assert "original=120, new=0" in html
+    assert "Device Trends" in html
+    assert "Cross-Device Trends" not in html
+    assert "Clearance Irregularities" in html
+    assert "Preempt 6 Active" in html
+    assert "Phase Yellow" in html
+    assert "Ped Service" in html
+    assert "Overlap Ped Service" in html
+    assert "Data Integrity" in html
+    assert "Valid Timeline Events" in html
+    assert "&#8593; Orig" in html
+    assert "&#8593; New" in html
+    assert "Total Dur Orig (s)" in html
+    assert "Comparison Details" not in html
+    assert "Affected<br>Devices" not in html
+    assert "Type</th><th>Avg<br>Delta (s)</th><th>Total Count<br>Delta</th><th>Devices" in html
+    assert "Type</th><th>2.15.1<br>Irregular Count</th><th>2.17.3<br>Irregular Count</th><th>2.15.1<br>Avg Dev (s)</th><th>2.17.3<br>Avg Dev (s)</th><th>&#916; Avg Dev (s)</th><th>Devices" in html
+    assert "Type</th><th>2.15.1<br>Invalid Count</th><th>2.17.3<br>Invalid Count</th><th>Devices" in html
+    assert "Example Scenarios" not in html
+    assert "Special Device Notes" not in html
+    trends_block = html.split("Device Trends", 1)[1].split("Combined Timeline", 1)[0]
+    assert "03013, 03015" in trends_block
+    assert ">Phase Yellow \u2193<" in trends_block
+    assert ">Ped Service \u2191<" in trends_block
+    assert ">Overlap Ped Service \u2191<" in trends_block
+    assert ">3<" in trends_block
+    assert ">5<" in trends_block
+    assert ">-0.08<" in trends_block
+    assert ">-1127.3<" in trends_block
+    assert ">+1<" in trends_block
+    assert "Ph 4 Red Clearance" in trends_block
+    assert "Transition Active" in trends_block
+    assert 'class="trend-row trend-yellow"' in trends_block
+    assert 'class="trend-row trend-preempt"' in trends_block
+    assert 'class="trend-row trend-ped"' in trends_block
+    assert 'class="trend-row trend-overlap-ped"' in trends_block
+    similarity_results_block = html.split("Similarity Results", 1)[1].split("Device Trends", 1)[0]
+    assert '&mdash;' in similarity_results_block
+    assert similarity_results_block.count("THROWN OUT") == 2
+    assert html.count(">1/2<") >= 2
+    assert "Insufficient scored chunks remained after settling/filtering for a reliable comparison." in html
+    assert "No collected events found for 03016 in collected.db." in html

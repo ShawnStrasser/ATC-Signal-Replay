@@ -487,6 +487,28 @@ def _build_similarity_trends(
 def _build_integrity_summary(
   results: List[ScenarioResult],
 ) -> List[Dict[str, Any]]:
+  def _clearance_type_label(diff: Dict[str, Any]) -> str:
+    event_class = str(diff.get("event_class", "")).strip()
+    label = str(diff.get("label", "")).strip()
+    state = str(diff.get("state", "")).strip()
+    if event_class in {"Yellow", "Red"} or label.startswith("Ph "):
+      return f"Phase {state} Clearance".strip()
+    return f"Overlap {state} Clearance".strip()
+
+  def _operational_type_label(diff: Dict[str, Any]) -> str:
+    event_class = str(diff.get("event_class", "")).strip()
+    label = str(diff.get("label", "")).strip()
+    state = str(diff.get("state", "")).strip()
+    if event_class in {"Transition Longway", "Transition Shortway"}:
+      return event_class
+    if label.startswith(("Ovlp Ped", "Overlap Ped")):
+      return "Overlap Ped Service"
+    if event_class == "Ped Service" or label.startswith("Ped "):
+      return "Ped Service"
+    if event_class == "Preempt" or label.startswith("Preempt"):
+      return "Preempt"
+    return f"{label} {state}".strip()
+
   type_map: Dict[str, Dict[str, Any]] = defaultdict(
     lambda: {"baseline_count": 0, "new_count": 0, "devices": set()}
   )
@@ -494,15 +516,12 @@ def _build_integrity_summary(
     if row.test_type != TestType.SIMILARITY:
       continue
     for diff in _normalize_clearance_rows(getattr(row, "invalid_clearance_irregularities", [])):
-      label = (
-        f"{str(diff.get('label', '')).strip()} "
-        f"{str(diff.get('state', '')).strip()} Clearance"
-      ).strip()
+      label = _clearance_type_label(diff)
       type_map[label]["baseline_count"] += _as_int(diff.get("irregular_count_a"))
       type_map[label]["new_count"] += _as_int(diff.get("irregular_count_b"))
       type_map[label]["devices"].add(row.scenario_id)
     for diff in _normalize_difference_rows(getattr(row, "invalid_operational_differences", [])):
-      label = f"{str(diff.get('label', '')).strip()} {str(diff.get('state', '')).strip()}".strip()
+      label = _operational_type_label(diff)
       type_map[label]["baseline_count"] += _as_int(diff.get("count_a"))
       type_map[label]["new_count"] += _as_int(diff.get("count_b"))
       type_map[label]["devices"].add(row.scenario_id)
@@ -811,7 +830,7 @@ a:hover { text-decoration: underline; }
 
       {% if integrity_rows %}
       <div style="padding:16px 20px 8px; font-weight:600;">Data Integrity</div>
-      <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total count of timeline rows where ATSPM marked the event as invalid (<code>IsValid = False</code>), grouped by movement type. The detailed device breakdowns and flagged charts below use only valid timeline rows.</div>
+      <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total count of timeline rows where ATSPM marked the event as invalid (<code>IsValid = False</code>), grouped by main event type instead of movement number. The detailed device breakdowns and flagged charts below use only valid timeline rows.</div>
       <table class="trends-table">
         <thead>
           <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Invalid Count</th><th>{{ suite.firmware_version }}<br>Invalid Count</th><th>Devices</th></tr>
@@ -872,10 +891,6 @@ a:hover { text-decoration: underline; }
         <div><span class="label">Included chunks:</span> <span class="val">{{ row.included_chunk_count }}</span></div>
         <div><span class="label">Excluded chunks:</span> <span class="val">{{ row.excluded_chunk_count }}</span></div>
         {% endif %}
-        {% if row.test_type == 'similarity' %}
-        <div><span class="label">Timeline diff analysis:</span> <span class="val">{{ 'Available' if row.timeline_difference_analysis_available else 'Unavailable' }}</span></div>
-        {% endif %}
-
         {% if row.annotation %}<div><span class="label">Note:</span> <span class="val">{{ row.annotation }}</span></div>{% endif %}
       </div>
 
@@ -901,20 +916,6 @@ a:hover { text-decoration: underline; }
         <details open>
           <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Conflicts ({{ row.conflicts_found|length }})</summary>
           <div class="notes error">{{ row.conflicts_found }}</div>
-        </details>
-      {% endif %}
-
-      {% if row.test_type == 'similarity' %}
-        <details{% if not row.timeline_difference_analysis_available %} open{% endif %}>
-          <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Timeline Difference Analysis</summary>
-          {% if row.timeline_difference_analysis_available %}
-          <div class="chart-note">Detailed phase, overlap, transition, preempt, and pedestrian-service summaries were generated for this scenario.</div>
-          {% else %}
-          <div class="chart-note">Detailed phase and operational tables were unavailable because the comparison did not produce usable settled timelines after filtering and overlap clipping.</div>
-          {% endif %}
-          {% if row.analysis_diagnostics %}
-          <div class="notes">{{ row.analysis_diagnostics|join('\n') }}</div>
-          {% endif %}
         </details>
       {% endif %}
 

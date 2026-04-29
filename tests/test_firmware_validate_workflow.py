@@ -119,6 +119,58 @@ def test_build_suite_keeps_settle_for_non_tod_scenarios(tmp_path):
     assert suite.analysis_settle_minutes == 10.0
 
 
+def test_load_coord_split_schedules_groups_rows_by_device(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    coord_dir = tmp_path / "coord_patterns"
+    coord_dir.mkdir()
+    (coord_dir / "2B045_coord_splits.csv").write_text(
+        "Phase,start_time,end_time\nP2,09:00:00,09:00:32\nP6,09:00:00,09:00:44\n",
+        encoding="utf-8",
+    )
+    (coord_dir / "ignore_me.csv").write_text(
+        "Phase,start_time,end_time\nP4,10:00:00,10:00:30\n",
+        encoding="utf-8",
+    )
+
+    schedules = firmware_validate._load_coord_split_schedules(str(coord_dir))
+
+    assert list(schedules) == ["2B045"]
+    assert schedules["2B045"] == [
+        {
+            "phase": 2,
+            "start_time": datetime.strptime("09:00:00", "%H:%M:%S").time(),
+            "end_time": datetime.strptime("09:00:32", "%H:%M:%S").time(),
+        },
+        {
+            "phase": 6,
+            "start_time": datetime.strptime("09:00:00", "%H:%M:%S").time(),
+            "end_time": datetime.strptime("09:00:44", "%H:%M:%S").time(),
+        },
+    ]
+
+
+def test_load_coord_split_schedules_refreshes_csvs_from_json(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    coord_dir = tmp_path / "coord_patterns"
+    coord_dir.mkdir()
+    (tmp_path / "coord_split_schedule.py").write_text(
+        "from pathlib import Path\n"
+        "def convert_all_pattern_files(coord_patterns_dir: Path):\n"
+        "    out = coord_patterns_dir / '2B049_coord_splits.csv'\n"
+        "    out.write_text('Phase,start_time,end_time\\nP4,10:00:00,10:00:30\\n', encoding='utf-8')\n"
+        "    return [(out, 1)]\n",
+        encoding="utf-8",
+    )
+    (coord_dir / "2B049.json").write_text("{}", encoding="utf-8")
+
+    schedules = firmware_validate._load_coord_split_schedules(str(coord_dir))
+
+    assert list(schedules) == ["2B049"]
+    assert schedules["2B049"][0]["phase"] == 4
+
+
 def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 
@@ -863,3 +915,721 @@ def test_main_report_only_fast_skips_device_csv_export(tmp_path):
         firmware_validate.main()
 
     assert captured["export_device_csvs"] is False
+
+
+def _build_issue_timeline(rows):
+    if not rows:
+        return pd.DataFrame(columns=["EventClass", "EventValue", "StartTime", "EndTime", "Duration"])
+    timeline = pd.DataFrame(rows)
+    timeline["StartTime"] = pd.to_datetime(timeline["StartTime"])
+    timeline["EndTime"] = pd.to_datetime(timeline["EndTime"])
+    timeline["Duration"] = (timeline["EndTime"] - timeline["StartTime"]).dt.total_seconds()
+    return timeline
+
+
+def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_duration_outlier():
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-02-16 10:33:00",
+                "EndTime": "2026-02-16 10:33:30",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-02-16 10:34:00",
+                "EndTime": "2026-02-16 10:34:30",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-02-16 12:04:58",
+                "EndTime": "2026-02-16 12:05:28",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-02-16 12:04:58",
+                "EndTime": "2026-02-16 12:05:15.400000",
+            },
+        ]
+    )
+
+    issue_window = firmware_validate._select_operational_issue_anchor(
+        timeline_a,
+        timeline_b,
+        {
+            "event_class": "Ped Service",
+            "event_value": 8,
+            "label": "Ped 8",
+            "state": "Service",
+        },
+    )
+
+    assert issue_window is not None
+    assert issue_window["start"] == pd.Timestamp("2026-02-16 10:33:00")
+    assert issue_window["end"] == pd.Timestamp("2026-02-16 10:34:30")
+    assert issue_window["mismatch_seconds"] == 60.0
+    assert issue_window["count_a"] == 2
+    assert issue_window["count_b"] == 0
+
+
+def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 11:00:00",
+                "EndTime": "2026-01-01 11:00:20",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 11:00:00",
+                "EndTime": "2026-01-01 11:00:40",
+            },
+        ]
+    )
+
+    captured = {}
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured["divergence_start"] = kwargs["divergence_start"]
+        captured["divergence_end"] = kwargs["divergence_end"]
+        captured["programmed_split_timeline"] = kwargs["programmed_split_timeline"]
+        Path(kwargs["output_path"]).write_bytes(b"png")
+        return object()
+
+    with (
+        patch.object(
+            firmware_validate,
+            "_load_coord_split_schedules",
+            return_value={
+                "S1": [
+                    {
+                        "phase": 4,
+                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
+                    }
+                ]
+            },
+        ),
+        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(firmware_validate.plt, "close"),
+    ):
+        plot_paths, plot_captions = firmware_validate._generate_special_issue_plots(
+            scenario_id="S1",
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            aligned_timeline_a=timeline_a,
+            aligned_timeline_b=timeline_b,
+            phase_differences=[
+                {
+                    "label": "Ph 4",
+                    "state": "Green",
+                    "event_class": "Green",
+                    "event_value": 4,
+                    "count_a": 1,
+                    "count_b": 1,
+                    "count_delta": 0,
+                    "duration_a": 20.0,
+                    "duration_b": 40.0,
+                    "duration_delta": 20.0,
+                    "total_duration_a": 20.0,
+                    "total_duration_b": 40.0,
+                    "total_duration_delta": 20.0,
+                }
+            ],
+            clearance_irregularities=[],
+            operational_diffs=[],
+            plots_dir=str(tmp_path / "plots"),
+            label_a="2.15.1",
+            label_b="2.17.3",
+            window_minutes=10.0,
+            time_offset_b=0.0,
+            align_by_time_delta=False,
+            tod_align=True,
+        )
+
+    assert len(plot_paths) == 1
+    assert len(plot_captions) == 1
+    assert plot_captions[0].startswith("Ph 4 Green: largest local mismatch window")
+    assert "2.15.1 events 0, active 0.00s" in plot_captions[0]
+    assert "2.17.3 events 1, active 20.00s" in plot_captions[0]
+    assert captured["divergence_start"] == pd.Timestamp("2026-01-01 11:00:20")
+    assert captured["divergence_end"] == pd.Timestamp("2026-01-01 11:00:40")
+    assert captured["programmed_split_timeline"] is not None
+    assert captured["programmed_split_timeline"]["Phase"].tolist() == [4]
+
+
+def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transition_with_base_device_fallback(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 2,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:35",
+            },
+            {
+                "EventClass": "Transition Longway",
+                "EventValue": 1,
+                "StartTime": "2026-01-01 09:00:35",
+                "EndTime": "2026-01-01 09:00:50",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 2,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:25",
+            },
+        ]
+    )
+
+    captured = {}
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured["programmed_split_timeline"] = kwargs["programmed_split_timeline"]
+        Path(kwargs["output_path"]).write_bytes(b"png")
+        return object()
+
+    with (
+        patch.object(
+            firmware_validate,
+            "_load_coord_split_schedules",
+            return_value={
+                "2B045": [
+                    {
+                        "phase": 2,
+                        "start_time": datetime.strptime("09:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("09:00:40", "%H:%M:%S").time(),
+                    }
+                ]
+            },
+        ),
+        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(firmware_validate.plt, "close"),
+    ):
+        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+            scenario_id="2B045_c",
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            aligned_timeline_a=timeline_a,
+            aligned_timeline_b=timeline_b,
+            phase_differences=[],
+            clearance_irregularities=[],
+            operational_diffs=[
+                {
+                    "label": "Transition",
+                    "state": "Longway",
+                    "event_class": "Transition Longway",
+                    "event_value": 1,
+                    "count_delta": -1,
+                    "duration_delta": -15.0,
+                    "total_duration_delta": -15.0,
+                }
+            ],
+            plots_dir=str(tmp_path / "plots"),
+            label_a="2.15.1",
+            label_b="2.17.3",
+            window_minutes=10.0,
+            time_offset_b=0.0,
+            align_by_time_delta=False,
+            tod_align=True,
+        )
+
+    assert len(plot_paths) == 1
+    assert captured["programmed_split_timeline"] is not None
+    assert captured["programmed_split_timeline"]["Phase"].tolist() == [2]
+    assert captured["programmed_split_timeline"]["StartTime"].iloc[0] == pd.Timestamp("2026-01-01 09:00:05")
+
+
+def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Overlap Green",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 11:00:00",
+                "EndTime": "2026-01-01 11:00:20",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Overlap Green",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 11:00:00",
+                "EndTime": "2026-01-01 11:00:40",
+            },
+        ]
+    )
+
+    captured = {}
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured["programmed_split_timeline"] = kwargs["programmed_split_timeline"]
+        Path(kwargs["output_path"]).write_bytes(b"png")
+        return object()
+
+    with (
+        patch.object(
+            firmware_validate,
+            "_load_coord_split_schedules",
+            return_value={
+                "S1": [
+                    {
+                        "phase": 4,
+                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
+                    }
+                ]
+            },
+        ),
+        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(firmware_validate.plt, "close"),
+    ):
+        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+            scenario_id="S1",
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            aligned_timeline_a=timeline_a,
+            aligned_timeline_b=timeline_b,
+            phase_differences=[
+                {
+                    "label": "Ovlp 4",
+                    "state": "Green",
+                    "event_class": "Overlap Green",
+                    "event_value": 4,
+                    "count_a": 1,
+                    "count_b": 1,
+                    "count_delta": 0,
+                    "duration_a": 20.0,
+                    "duration_b": 40.0,
+                    "duration_delta": 20.0,
+                    "total_duration_a": 20.0,
+                    "total_duration_b": 40.0,
+                    "total_duration_delta": 20.0,
+                }
+            ],
+            clearance_irregularities=[],
+            operational_diffs=[],
+            plots_dir=str(tmp_path / "plots"),
+            label_a="2.15.1",
+            label_b="2.17.3",
+            window_minutes=10.0,
+            time_offset_b=0.0,
+            align_by_time_delta=False,
+            tod_align=True,
+        )
+
+    assert len(plot_paths) == 1
+    assert captured["programmed_split_timeline"] is not None
+    assert captured["programmed_split_timeline"]["Phase"].tolist() == [4]
+
+
+def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:30",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-01-01 09:20:00",
+                "EndTime": "2026-01-01 09:20:30",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-01-01 09:21:00",
+                "EndTime": "2026-01-01 09:21:30",
+            },
+            {
+                "EventClass": "Preempt",
+                "EventValue": 5,
+                "StartTime": "2026-01-01 09:40:00",
+                "EndTime": "2026-01-01 09:40:45",
+            },
+            {
+                "EventClass": "Preempt",
+                "EventValue": 6,
+                "StartTime": "2026-01-01 10:00:00",
+                "EndTime": "2026-01-01 10:00:50",
+            },
+            {
+                "EventClass": "Transition Longway",
+                "EventValue": 1,
+                "StartTime": "2026-01-01 10:20:00",
+                "EndTime": "2026-01-01 10:20:20",
+            },
+            {
+                "EventClass": "Transition Longway",
+                "EventValue": 2,
+                "StartTime": "2026-01-01 10:40:00",
+                "EndTime": "2026-01-01 10:41:10",
+            },
+            {
+                "EventClass": "Transition Shortway",
+                "EventValue": 3,
+                "StartTime": "2026-01-01 11:00:00",
+                "EndTime": "2026-01-01 11:00:25",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 1,
+                "StartTime": "2026-01-01 08:00:00",
+                "EndTime": "2026-01-01 08:00:05",
+            },
+        ]
+    )
+
+    captured_titles = []
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured_titles.append(kwargs["title"])
+        Path(kwargs["output_path"]).write_bytes(b"png")
+        return object()
+
+    with (
+        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(firmware_validate.plt, "close"),
+    ):
+        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+            scenario_id="S1",
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            aligned_timeline_a=timeline_a,
+            aligned_timeline_b=timeline_b,
+            phase_differences=[],
+            clearance_irregularities=[],
+            operational_diffs=[
+                {
+                    "label": "Ped 4",
+                    "state": "Service",
+                    "event_class": "Ped Service",
+                    "event_value": 4,
+                    "count_delta": -1,
+                    "duration_delta": -30.0,
+                    "total_duration_delta": -30.0,
+                },
+                {
+                    "label": "Ped 8",
+                    "state": "Service",
+                    "event_class": "Ped Service",
+                    "event_value": 8,
+                    "count_delta": -2,
+                    "duration_delta": -30.0,
+                    "total_duration_delta": -60.0,
+                },
+                {
+                    "label": "Preempt 5",
+                    "state": "Active",
+                    "event_class": "Preempt",
+                    "event_value": 5,
+                    "count_delta": -1,
+                    "duration_delta": -45.0,
+                    "total_duration_delta": -45.0,
+                },
+                {
+                    "label": "Preempt 6",
+                    "state": "Active",
+                    "event_class": "Preempt",
+                    "event_value": 6,
+                    "count_delta": -1,
+                    "duration_delta": -50.0,
+                    "total_duration_delta": -50.0,
+                },
+                {
+                    "label": "Transition",
+                    "state": "Longway",
+                    "event_class": "Transition Longway",
+                    "event_value": 1,
+                    "count_delta": -1,
+                    "duration_delta": -20.0,
+                    "total_duration_delta": -20.0,
+                },
+                {
+                    "label": "Transition",
+                    "state": "Longway",
+                    "event_class": "Transition Longway",
+                    "event_value": 2,
+                    "count_delta": -1,
+                    "duration_delta": -70.0,
+                    "total_duration_delta": -70.0,
+                },
+                {
+                    "label": "Transition",
+                    "state": "Shortway",
+                    "event_class": "Transition Shortway",
+                    "event_value": 3,
+                    "count_delta": -1,
+                    "duration_delta": -25.0,
+                    "total_duration_delta": -25.0,
+                },
+            ],
+            plots_dir=str(tmp_path / "plots"),
+            label_a="2.15.1",
+            label_b="2.17.3",
+            window_minutes=10.0,
+            time_offset_b=0.0,
+            align_by_time_delta=False,
+        )
+
+    assert len(plot_paths) == 5
+    assert captured_titles == [
+        "S1 Issue Focus - Transition Longway",
+        "S1 Issue Focus - Ped 8 Service",
+        "S1 Issue Focus - Preempt 6 Active",
+        "S1 Issue Focus - Preempt 5 Active",
+        "S1 Issue Focus - Transition Shortway",
+    ]
+
+
+def test_select_operational_issue_anchor_handles_transition_rows_with_missing_event_value():
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Transition Shortway",
+                "EventValue": None,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:45",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Transition Shortway",
+                "EventValue": None,
+                "StartTime": "2026-01-01 09:10:00",
+                "EndTime": "2026-01-01 09:10:00",
+            },
+        ]
+    )
+
+    issue_window = firmware_validate._select_operational_issue_anchor(
+        timeline_a,
+        timeline_b,
+        {
+            "event_class": "Transition Shortway",
+            "event_value": 0,
+            "label": "Transition",
+            "state": "Shortway",
+        },
+    )
+
+    assert issue_window is not None
+    assert issue_window["start"] == pd.Timestamp("2026-01-01 09:00:00")
+    assert issue_window["end"] == pd.Timestamp("2026-01-01 09:00:45")
+
+
+def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conflicts(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 6,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:10:00",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-01-01 09:05:00",
+                "EndTime": "2026-01-01 09:06:00",
+            },
+            {
+                "EventClass": "Ped Service",
+                "EventValue": 8,
+                "StartTime": "2026-01-01 09:20:00",
+                "EndTime": "2026-01-01 09:20:30",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Green",
+                "EventValue": 1,
+                "StartTime": "2026-01-01 08:00:00",
+                "EndTime": "2026-01-01 08:00:05",
+            },
+        ]
+    )
+
+    captured = []
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured.append((kwargs["title"], kwargs["divergence_start"], kwargs["divergence_end"]))
+        Path(kwargs["output_path"]).write_bytes(b"png")
+        return object()
+
+    with (
+        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(firmware_validate.plt, "close"),
+    ):
+        plot_paths, plot_captions = firmware_validate._generate_special_issue_plots(
+            scenario_id="S1",
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            aligned_timeline_a=timeline_a,
+            aligned_timeline_b=timeline_b,
+            phase_differences=[
+                {
+                    "label": "Ph 6",
+                    "state": "Green",
+                    "event_class": "Green",
+                    "event_value": 6,
+                    "count_a": 1,
+                    "count_b": 0,
+                    "count_delta": -1,
+                    "duration_a": 600.0,
+                    "duration_b": 0.0,
+                    "duration_delta": -600.0,
+                    "total_duration_a": 600.0,
+                    "total_duration_b": 0.0,
+                    "total_duration_delta": -600.0,
+                }
+            ],
+            clearance_irregularities=[],
+            operational_diffs=[
+                {
+                    "label": "Ped 8",
+                    "state": "Service",
+                    "event_class": "Ped Service",
+                    "event_value": 8,
+                    "count_a": 2,
+                    "count_b": 0,
+                    "count_delta": -2,
+                    "duration_a": 45.0,
+                    "duration_b": 0.0,
+                    "duration_delta": -45.0,
+                    "total_duration_a": 90.0,
+                    "total_duration_b": 0.0,
+                    "total_duration_delta": -90.0,
+                }
+            ],
+            plots_dir=str(tmp_path / "plots"),
+            label_a="2.15.1",
+            label_b="2.17.3",
+            window_minutes=10.0,
+            time_offset_b=0.0,
+            align_by_time_delta=False,
+        )
+
+    assert len(plot_paths) == 2
+    assert [title for title, _start, _end in captured] == [
+        "S1 Issue Focus - Ph 6 Green",
+        "S1 Issue Focus - Ped 8 Service",
+    ]
+    ped_chart = next(item for item in captured if item[0] == "S1 Issue Focus - Ped 8 Service")
+    assert ped_chart[1] == pd.Timestamp("2026-01-01 09:20:00")
+    assert ped_chart[2] == pd.Timestamp("2026-01-01 09:20:30")
+    assert any(caption.startswith("Ped 8 Service: largest local mismatch window") for caption in plot_captions)
+
+
+def test_select_clearance_issue_spec_remains_median_based():
+    firmware_validate = _load_firmware_validate_module()
+
+    timeline_a = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:10:00",
+                "EndTime": "2026-01-01 09:10:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:20:00",
+                "EndTime": "2026-01-01 09:20:09",
+            },
+        ]
+    )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:10:00",
+                "EndTime": "2026-01-01 09:10:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:20:00",
+                "EndTime": "2026-01-01 09:20:05",
+            },
+        ]
+    )
+
+    issue_spec = firmware_validate._select_clearance_issue_spec(
+        scenario_id="S1",
+        row={
+            "label": "Ph 4",
+            "state": "Yellow",
+            "event_class": "Yellow",
+            "event_value": 4,
+        },
+        timeline_a=timeline_a,
+        timeline_b=timeline_b,
+        label_a="2.15.1",
+        label_b="2.17.3",
+    )
+
+    assert issue_spec is not None
+    assert issue_spec["start"] == pd.Timestamp("2026-01-01 09:20:00")
+    assert issue_spec["end"] == pd.Timestamp("2026-01-01 09:20:09")
+    assert "2.15.1: 9.00s vs median 5.00s" in issue_spec["caption"]

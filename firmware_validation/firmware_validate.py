@@ -18,6 +18,7 @@ Settings are loaded from settings.json (editable JSON file in the same folder).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
@@ -39,6 +40,7 @@ from signal_replay.report import generate_report
 
 COLLECTED_DB_FILENAME = "collected.db"
 BaselineSource = Tuple[str, str]
+COORD_PATTERNS_DIR = Path(__file__).resolve().parent / "coord_patterns"
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -55,6 +57,129 @@ def log(msg: str, *, always: bool = True) -> None:
 def vlog(msg: str) -> None:
     """Verbose-only log."""
     log(msg, always=False)
+
+
+def _extract_coord_split_device_id(path: Path) -> Optional[str]:
+    stem = path.stem
+    suffix = "_coord_splits"
+    if not stem.endswith(suffix):
+        return None
+    device_id = stem[:-len(suffix)].strip()
+    return device_id or None
+
+
+def _parse_coord_split_clock_time(value: object) -> dt_time:
+    text = str(value).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+    raise ValueError(f"invalid coord split time: {value!r}")
+
+
+def _parse_coord_split_phase(value: object) -> Optional[int]:
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _refresh_coord_split_csvs(coord_dir: Path) -> None:
+    module_path = coord_dir.parent / "coord_split_schedule.py"
+    if not module_path.exists():
+        log(f"WARNING: coord split generator not found: {module_path}")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location("coord_split_schedule_runtime", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load module spec for {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.convert_all_pattern_files(coord_dir)
+    except Exception as exc:
+        log(f"WARNING: Failed to refresh coord split CSVs from JSON files: {exc}")
+
+
+def _load_coord_split_schedules(coord_dir: str) -> Dict[str, List[Dict[str, object]]]:
+    schedules: Dict[str, List[Dict[str, object]]] = {}
+    path = Path(coord_dir)
+    if not path.exists():
+        return schedules
+
+    _refresh_coord_split_csvs(path)
+
+    for csv_path in sorted(path.glob("*.csv")):
+        device_id = _extract_coord_split_device_id(csv_path)
+        if device_id is None:
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as exc:
+            log(f"WARNING: Failed to read coord split CSV {csv_path.name}: {exc}")
+            continue
+
+        rows: List[Dict[str, object]] = []
+        for row in df.to_dict("records"):
+            try:
+                phase = _parse_coord_split_phase(row.get("Phase"))
+                start_time = _parse_coord_split_clock_time(row.get("start_time"))
+                end_time = _parse_coord_split_clock_time(row.get("end_time"))
+            except Exception as exc:
+                log(f"WARNING: Skipping malformed coord split row in {csv_path.name}: {exc}")
+                continue
+            if phase is None:
+                log(f"WARNING: Skipping coord split row with missing phase in {csv_path.name}")
+                continue
+            rows.append(
+                {
+                    "phase": phase,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                }
+            )
+
+        if rows:
+            rows.sort(key=lambda row: (row["start_time"], row["phase"]))
+            schedules[device_id] = rows
+
+    return schedules
+
+
+def _resolve_coord_split_device_id(
+    scenario_id: str,
+    schedules: Dict[str, List[Dict[str, object]]],
+) -> Optional[str]:
+    if scenario_id in schedules:
+        return scenario_id
+    base_device_id = scenario_id.split("_", 1)[0]
+    if base_device_id in schedules:
+        return base_device_id
+    return None
+
+
+def _build_programmed_split_timeline(
+    schedule_rows: List[Dict[str, object]],
+    anchor_time: pd.Timestamp,
+) -> pd.DataFrame:
+    if not schedule_rows:
+        return pd.DataFrame(columns=["Phase", "StartTime", "EndTime"])
+
+    anchor_ts = pd.Timestamp(anchor_time)
+    base_date = anchor_ts.normalize().to_pydatetime().date()
+    rows: List[Dict[str, object]] = []
+    for schedule_row in schedule_rows:
+        start_ts = pd.Timestamp(datetime.combine(base_date, schedule_row["start_time"]))
+        end_ts = pd.Timestamp(datetime.combine(base_date, schedule_row["end_time"]))
+        if end_ts <= start_ts:
+            end_ts += pd.Timedelta(days=1)
+        rows.append(
+            {
+                "Phase": int(schedule_row["phase"]),
+                "StartTime": start_ts,
+                "EndTime": end_ts,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +995,11 @@ def _normalize_issue_timeline_rows(
         return filtered
 
     filtered["EventValue"] = pd.to_numeric(filtered["EventValue"], errors="coerce")
-    filtered = filtered[filtered["EventValue"] == event_value].copy()
+    if event_value == 0:
+        value_mask = filtered["EventValue"].fillna(0) == 0
+    else:
+        value_mask = filtered["EventValue"] == event_value
+    filtered = filtered[value_mask].copy()
     if filtered.empty:
         return filtered
 
@@ -959,35 +1088,85 @@ def _prepare_settled_overlap_timelines(
 
 
 def _is_significant_operational_issue(diff: Dict[str, object]) -> bool:
-    """Mirror the report thresholds so polarity and chart selection stay aligned."""
-    label = str(diff.get("label", "")).strip()
+    """Mirror report thresholds for non-clearance issue plots, including green rows."""
+    event_class = str(diff.get("event_class", "")).strip()
     avg_delta = float(diff.get("duration_delta", 0.0) or 0.0)
     total_delta = float(diff.get("total_duration_delta", 0.0) or 0.0)
     count_delta = abs(int(diff.get("count_delta", 0) or 0))
 
     threshold = None
     total_threshold = None
-    if label.startswith("Preempt"):
+    if event_class == "Preempt":
         threshold = 3.0
         total_threshold = 60.0
-    elif label.startswith(("Ped", "Ovlp Ped", "Overlap Ped")):
+    elif event_class == "Ped Service":
         threshold = 2.0
         total_threshold = 15.0
-    elif label == "Transition":
+    elif event_class in {"Transition Longway", "Transition Shortway"}:
         threshold = 1.0
         total_threshold = 10.0
+    elif event_class in {"Green", "Overlap Green", "Overlap Yellow", "Overlap Red"}:
+        threshold = 2.0
+        total_threshold = 15.0
 
     if threshold is None:
         return False
     return abs(avg_delta) >= threshold or abs(total_delta) >= total_threshold or count_delta >= 1
 
 
-def _select_operational_issue_anchor(
+def _merge_issue_spans(
+    spans: List[Dict[str, object]],
+    *,
+    gap_seconds: float,
+) -> List[Dict[str, object]]:
+    if not spans:
+        return []
+
+    ordered = sorted(spans, key=lambda span: pd.Timestamp(span["start"]))
+    merged: List[Dict[str, object]] = [dict(ordered[0])]
+    for span in ordered[1:]:
+        gap = (
+            pd.Timestamp(span["start"]) - pd.Timestamp(merged[-1]["end"])
+        ).total_seconds()
+        if gap <= gap_seconds:
+            merged[-1]["end"] = pd.Timestamp(span["end"])
+            merged[-1]["mismatch_seconds"] = float(merged[-1]["mismatch_seconds"]) + float(span["mismatch_seconds"])
+            continue
+        merged.append(dict(span))
+    return merged
+
+
+def _window_activity_stats(
+    rows: pd.DataFrame,
+    *,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+) -> Tuple[int, float, float]:
+    if rows.empty or window_end <= window_start:
+        return 0, 0.0, 0.0
+
+    count = 0
+    active_seconds = 0.0
+    for row in rows.itertuples(index=False):
+        row_start = pd.Timestamp(row.StartTime)
+        row_end = pd.Timestamp(row.EndTime)
+        overlap_start = max(row_start, window_start)
+        overlap_end = min(row_end, window_end)
+        if overlap_end <= overlap_start:
+            continue
+        count += 1
+        active_seconds += (overlap_end - overlap_start).total_seconds()
+
+    avg_duration = active_seconds / count if count else 0.0
+    return count, active_seconds, avg_duration
+
+
+def _rank_operational_issue_windows(
     timeline_a: pd.DataFrame,
     timeline_b: pd.DataFrame,
     diff: Dict[str, object],
-) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], float]:
-    """Pick the event window with the biggest mismatch for a flagged operational diff."""
+) -> List[Dict[str, object]]:
+    """Return ranked local A-vs-B mismatch windows for a non-clearance row."""
     rows_a = _normalize_issue_timeline_rows(
         timeline_a,
         str(diff.get("event_class", "")),
@@ -1000,35 +1179,171 @@ def _select_operational_issue_anchor(
     )
 
     if rows_a.empty and rows_b.empty:
-        return None, None, -1.0
+        return []
 
-    median_a = float(rows_a["Duration"].median()) if not rows_a.empty else None
-    median_b = float(rows_b["Duration"].median()) if not rows_b.empty else None
-    best_score = -1.0
-    best_start: Optional[pd.Timestamp] = None
-    best_end: Optional[pd.Timestamp] = None
+    boundary_deltas: Dict[pd.Timestamp, List[int]] = {}
 
+    def _record_boundaries(rows: pd.DataFrame, run_index: int) -> None:
+        for row in rows.itertuples(index=False):
+            start = pd.Timestamp(row.StartTime)
+            end = pd.Timestamp(row.EndTime)
+            if end <= start:
+                continue
+            boundary_deltas.setdefault(start, [0, 0])[run_index] += 1
+            boundary_deltas.setdefault(end, [0, 0])[run_index] -= 1
+
+    _record_boundaries(rows_a, 0)
+    _record_boundaries(rows_b, 1)
+
+    boundaries = sorted(boundary_deltas)
+    if len(boundaries) < 2:
+        return []
+
+    mismatch_spans: List[Dict[str, object]] = []
+    active_a = 0
+    active_b = 0
+    for current, nxt in zip(boundaries, boundaries[1:]):
+        delta_a, delta_b = boundary_deltas[current]
+        active_a += delta_a
+        active_b += delta_b
+        if nxt <= current or bool(active_a) == bool(active_b):
+            continue
+        mismatch_spans.append(
+            {
+                "start": current,
+                "end": nxt,
+                "mismatch_seconds": (pd.Timestamp(nxt) - pd.Timestamp(current)).total_seconds(),
+            }
+        )
+
+    if not mismatch_spans:
+        return []
+
+    durations: List[float] = []
+    for rows in (rows_a, rows_b):
+        if rows.empty:
+            continue
+        durations.extend(float(value) for value in rows["Duration"].tolist())
+
+    typical_duration = float(pd.Series(durations).median()) if durations else 0.0
+    merge_gap_seconds = min(60.0, max(10.0, typical_duration))
+    candidate_windows = _merge_issue_spans(mismatch_spans, gap_seconds=merge_gap_seconds)
+
+    ranked_windows: List[Dict[str, object]] = []
+    for window in candidate_windows:
+        window_start = pd.Timestamp(window["start"])
+        window_end = pd.Timestamp(window["end"])
+        count_a, active_seconds_a, avg_duration_a = _window_activity_stats(
+            rows_a,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        count_b, active_seconds_b, avg_duration_b = _window_activity_stats(
+            rows_b,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        ranked_windows.append(
+            {
+                "start": window_start,
+                "end": window_end,
+                "score": float(window["mismatch_seconds"]),
+                "mismatch_seconds": float(window["mismatch_seconds"]),
+                "count_a": count_a,
+                "count_b": count_b,
+                "count_imbalance": abs(count_a - count_b),
+                "active_seconds_a": active_seconds_a,
+                "active_seconds_b": active_seconds_b,
+                "active_imbalance": abs(active_seconds_a - active_seconds_b),
+                "avg_duration_a": avg_duration_a,
+                "avg_duration_b": avg_duration_b,
+            }
+        )
+
+    ranked_windows.sort(
+        key=lambda window: (
+            -float(window.get("score", 0.0) or 0.0),
+            -int(window.get("count_imbalance", 0) or 0),
+            -float(window.get("active_imbalance", 0.0) or 0.0),
+            pd.Timestamp(window["start"]),
+        ),
+    )
+    return ranked_windows
+
+
+def _select_operational_issue_anchor(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    diff: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    """Select the largest local A-vs-B mismatch window for a non-clearance row."""
+    ranked_windows = _rank_operational_issue_windows(timeline_a, timeline_b, diff)
+    if not ranked_windows:
+        return None
+    return ranked_windows[0]
+
+
+def _format_operational_issue_caption(
+    issue_window: Dict[str, object],
+    diff: Dict[str, object],
+    *,
+    label_a: str,
+    label_b: str,
+) -> str:
+    detail_label = f"{str(diff.get('label', '')).strip()} {str(diff.get('state', '')).strip()}".strip()
+    parts = [
+        f"{detail_label}: largest local mismatch window",
+        f"mismatch {float(issue_window.get('mismatch_seconds', 0.0) or 0.0):.2f}s",
+        (
+            f"{label_a} events {int(issue_window.get('count_a', 0) or 0)}, "
+            f"active {float(issue_window.get('active_seconds_a', 0.0) or 0.0):.2f}s"
+        ),
+        (
+            f"{label_b} events {int(issue_window.get('count_b', 0) or 0)}, "
+            f"active {float(issue_window.get('active_seconds_b', 0.0) or 0.0):.2f}s"
+        ),
+    ]
+
+    count_a = int(issue_window.get("count_a", 0) or 0)
+    count_b = int(issue_window.get("count_b", 0) or 0)
+    if count_a > 0 and count_b > 0:
+        parts.append(
+            f"window avg {label_a} {float(issue_window.get('avg_duration_a', 0.0) or 0.0):.2f}s vs "
+            f"{label_b} {float(issue_window.get('avg_duration_b', 0.0) or 0.0):.2f}s"
+        )
+
+    return "; ".join(parts)
+
+
+def _treat_phase_diff_as_non_clearance_issue(
+    diff: Dict[str, object],
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    *,
+    overlap_clearance_median_threshold: float = 6.0,
+) -> bool:
+    event_class = str(diff.get("event_class", "")).strip()
+    if event_class in {"Green", "Overlap Green"}:
+        return True
+    if event_class not in {"Overlap Yellow", "Overlap Red"}:
+        return False
+
+    rows_a = _normalize_issue_timeline_rows(
+        timeline_a,
+        event_class,
+        int(diff.get("event_value", 0) or 0),
+    )
+    rows_b = _normalize_issue_timeline_rows(
+        timeline_b,
+        event_class,
+        int(diff.get("event_value", 0) or 0),
+    )
+    medians: List[float] = []
     if not rows_a.empty:
-        reference = median_b if median_b is not None else median_a
-        deviations = (rows_a["Duration"] - float(reference or 0.0)).abs()
-        idx = deviations.idxmax()
-        score = float(deviations.loc[idx])
-        if score > best_score:
-            best_score = score
-            best_start = pd.Timestamp(rows_a.loc[idx, "StartTime"])
-            best_end = pd.Timestamp(rows_a.loc[idx, "EndTime"])
-
+        medians.append(float(rows_a["Duration"].median()))
     if not rows_b.empty:
-        reference = median_a if median_a is not None else median_b
-        deviations = (rows_b["Duration"] - float(reference or 0.0)).abs()
-        idx = deviations.idxmax()
-        score = float(deviations.loc[idx])
-        if score > best_score:
-            best_score = score
-            best_start = pd.Timestamp(rows_b.loc[idx, "StartTime"])
-            best_end = pd.Timestamp(rows_b.loc[idx, "EndTime"])
-
-    return best_start, best_end, best_score
+        medians.append(float(rows_b["Duration"].median()))
+    return bool(medians) and max(medians) >= overlap_clearance_median_threshold
 
 
 def _select_clearance_issue_spec(
@@ -1114,6 +1429,48 @@ def _is_distinct_issue_window(
     )
 
 
+def _non_clearance_issue_group_key(diff: Dict[str, object]) -> Tuple[str, ...]:
+    event_class = str(diff.get("event_class", "")).strip()
+    label = str(diff.get("label", "")).strip()
+    event_value = int(diff.get("event_value", 0) or 0)
+
+    if event_class == "Preempt":
+        return ("preempt", str(event_value))
+    if event_class in {"Transition Longway", "Transition Shortway"}:
+        return ("transition", event_class)
+    if event_class == "Green":
+        return ("phase_green",)
+    if event_class == "Overlap Green":
+        return ("overlap_green",)
+    if event_class == "Overlap Yellow":
+        return ("overlap_yellow",)
+    if event_class == "Overlap Red":
+        return ("overlap_red",)
+    if event_class == "Ped Service":
+        if label.startswith(("Ovlp Ped", "Overlap Ped")):
+            return ("overlap_ped",)
+        return ("ped",)
+    return ("non_clearance", event_class)
+
+
+def _issue_spec_priority(spec: Dict[str, object]) -> Tuple[float, int, float, float]:
+    return (
+        float(spec.get("score", 0.0) or 0.0),
+        int(spec.get("count_imbalance", 0) or 0),
+        float(spec.get("active_imbalance", 0.0) or 0.0),
+        -float(pd.Timestamp(spec["start"]).value),
+    )
+
+
+def _issue_spec_sort_key(spec: Dict[str, object]) -> Tuple[float, int, float, pd.Timestamp]:
+    return (
+        -float(spec.get("score", 0.0) or 0.0),
+        -int(spec.get("count_imbalance", 0) or 0),
+        -float(spec.get("active_imbalance", 0.0) or 0.0),
+        pd.Timestamp(spec["start"]),
+    )
+
+
 def _generate_special_issue_plots(
     *,
     scenario_id: str,
@@ -1121,6 +1478,7 @@ def _generate_special_issue_plots(
     timeline_b: pd.DataFrame,
     aligned_timeline_a: pd.DataFrame,
     aligned_timeline_b: pd.DataFrame,
+    phase_differences: List[dict],
     clearance_irregularities: List[dict],
     operational_diffs: List[dict],
     plots_dir: str,
@@ -1129,6 +1487,7 @@ def _generate_special_issue_plots(
     window_minutes: float,
     time_offset_b: float,
     align_by_time_delta: bool,
+    tod_align: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """Create labeled charts for the worst flagged clearance and operational issues."""
     if timeline_a.empty or timeline_b.empty:
@@ -1136,6 +1495,9 @@ def _generate_special_issue_plots(
 
     issue_specs: List[Dict[str, object]] = []
     seen_keys = set()
+    non_clearance_candidates_by_group: Dict[Tuple[str, ...], List[Dict[str, object]]] = {}
+    coord_split_schedules = _load_coord_split_schedules(str(COORD_PATTERNS_DIR)) if tod_align else {}
+    programmed_split_device_id = _resolve_coord_split_device_id(scenario_id, coord_split_schedules) if tod_align else None
 
     for row in clearance_irregularities:
         if int(row.get("irregular_count_a", 0) or 0) <= 0 and int(row.get("irregular_count_b", 0) or 0) <= 0:
@@ -1156,39 +1518,61 @@ def _generate_special_issue_plots(
             continue
         issue_specs.append(issue_spec)
 
-    for diff in operational_diffs:
+    phase_state_diffs = [
+        diff for diff in phase_differences
+        if _treat_phase_diff_as_non_clearance_issue(diff, aligned_timeline_a, aligned_timeline_b)
+    ]
+
+    for diff in [*operational_diffs, *phase_state_diffs]:
         if not _is_significant_operational_issue(diff):
             continue
-        key = ("operational", diff.get("event_class"), diff.get("event_value"))
+        key = ("non_clearance", diff.get("event_class"), diff.get("event_value"))
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        anchor_start, anchor_end, score = _select_operational_issue_anchor(aligned_timeline_a, aligned_timeline_b, diff)
-        if anchor_start is None or anchor_end is None:
+        ranked_issue_windows = _rank_operational_issue_windows(aligned_timeline_a, aligned_timeline_b, diff)
+        if not ranked_issue_windows:
             continue
         detail_label = f"{diff.get('label', '').strip()} {diff.get('state', '').strip()}".strip()
-        issue_specs.append(
-            {
-                "caption": (
-                    f"{detail_label}: {label_a} avg {float(diff.get('duration_a', 0.0) or 0.0):.2f}s, "
-                    f"{label_b} avg {float(diff.get('duration_b', 0.0) or 0.0):.2f}s "
-                    f"(Δ {float(diff.get('duration_delta', 0.0) or 0.0):+.2f}s)"
-                ),
-                "title": f"{scenario_id} Issue Focus - {detail_label}",
-                "start": anchor_start,
-                "end": anchor_end,
-                "score": max(
-                    score,
-                    abs(float(diff.get("duration_delta", 0.0) or 0.0)),
-                    abs(float(diff.get("total_duration_delta", 0.0) or 0.0)),
-                    abs(int(diff.get("count_delta", 0) or 0)),
-                ),
-            }
-        )
+        group_key = _non_clearance_issue_group_key(diff)
+        non_clearance_candidates_by_group.setdefault(group_key, [])
+        for issue_window in ranked_issue_windows:
+            event_class = str(diff.get("event_class", "")).strip()
+            non_clearance_candidates_by_group[group_key].append(
+                {
+                    "caption": _format_operational_issue_caption(
+                        issue_window,
+                        diff,
+                        label_a=label_a,
+                        label_b=label_b,
+                    ),
+                    "title": f"{scenario_id} Issue Focus - {detail_label}",
+                    "start": issue_window["start"],
+                    "end": issue_window["end"],
+                    "score": float(issue_window.get("score", 0.0) or 0.0),
+                    "count_imbalance": int(issue_window.get("count_imbalance", 0) or 0),
+                    "active_imbalance": float(issue_window.get("active_imbalance", 0.0) or 0.0),
+                    "group_key": group_key,
+                    "show_programmed_splits": programmed_split_device_id is not None,
+                }
+            )
 
-    issue_specs.sort(
-        key=lambda spec: (-float(spec.get("score", 0.0) or 0.0), pd.Timestamp(spec["start"])),
-    )
+    selected_so_far = list(issue_specs)
+    ranked_groups = []
+    for specs in non_clearance_candidates_by_group.values():
+        specs.sort(key=_issue_spec_sort_key)
+        ranked_groups.append(specs)
+
+    ranked_groups.sort(key=lambda specs: _issue_spec_sort_key(specs[0]))
+    for specs in ranked_groups:
+        for spec in specs:
+            if not _is_distinct_issue_window(pd.Timestamp(spec["start"]), selected_so_far):
+                continue
+            issue_specs.append(spec)
+            selected_so_far.append(spec)
+            break
+
+    issue_specs.sort(key=_issue_spec_sort_key)
     deduped_issue_specs: List[Dict[str, object]] = []
     for spec in issue_specs:
         if not _is_distinct_issue_window(pd.Timestamp(spec["start"]), deduped_issue_specs):
@@ -1202,6 +1586,12 @@ def _generate_special_issue_plots(
     plot_captions: List[str] = []
     for index, spec in enumerate(deduped_issue_specs, start=1):
         output_path = output_dir / f"{scenario_id}_issue_{index}.png"
+        programmed_split_timeline = None
+        if spec.get("show_programmed_splits") and programmed_split_device_id is not None:
+            programmed_split_timeline = _build_programmed_split_timeline(
+                coord_split_schedules[programmed_split_device_id],
+                pd.Timestamp(spec["start"]),
+            )
         fig = sr.create_comparison_gantt_matplotlib(
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1215,6 +1605,7 @@ def _generate_special_issue_plots(
             dpi=150,
             align_by_time_delta=align_by_time_delta,
             time_offset_b=time_offset_b,
+            programmed_split_timeline=programmed_split_timeline,
         )
         if fig is None:
             continue
@@ -1433,12 +1824,23 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 _devnull2 = open(os.devnull, "w") if not verbose else None
                 _ctx2 = contextlib.redirect_stdout(_devnull2) if _devnull2 else contextlib.nullcontext()
                 with _ctx2:
+                    programmed_split_timeline = None
+                    if tod_align:
+                        coord_split_schedules = _load_coord_split_schedules(str(COORD_PATTERNS_DIR))
+                        programmed_split_device_id = _resolve_coord_split_device_id(scenario_id, coord_split_schedules)
+                        if programmed_split_device_id is not None:
+                            programmed_split_timeline = _build_programmed_split_timeline(
+                                coord_split_schedules[programmed_split_device_id],
+                                valid_timeline_a["StartTime"].min(),
+                            )
+
                     issue_plot_paths, issue_plot_captions = _generate_special_issue_plots(
                         scenario_id=scenario_id,
                         timeline_a=valid_timeline_a,
                         timeline_b=valid_timeline_b,
                         aligned_timeline_a=tl_a_settled,
                         aligned_timeline_b=tl_b_settled,
+                        phase_differences=phase_diffs,
                         clearance_irregularities=clearance_irregularities,
                         operational_diffs=operational_diffs,
                         plots_dir=plots_dir_str,
@@ -1447,6 +1849,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         window_minutes=window_minutes,
                         time_offset_b=chart_time_offset_b,
                         align_by_time_delta=chart_align_by_time_delta,
+                        tod_align=tod_align,
                     )
 
                     remaining_divergence_plots = max(0, max_plots - len(issue_plot_paths))
@@ -1461,6 +1864,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         window_minutes=window_minutes,
                         time_offset_b=chart_time_offset_b,
                         align_by_time_delta=chart_align_by_time_delta,
+                        programmed_split_timeline=programmed_split_timeline,
                     ) if remaining_divergence_plots > 0 else []
 
                 plot_paths = issue_plot_paths + divergence_paths

@@ -113,6 +113,43 @@ def test_prepare_analysis_inputs_for_tod_uses_shared_wall_clock_anchor():
     assert start_b == datetime(2026, 3, 25, 9, 0, 14, 600000)
 
 
+def test_build_programmed_split_timeline_anchors_rows_to_issue_day():
+    schedule_rows = [
+        {
+            "phase": 2,
+            "start_time": datetime.strptime("09:00:05", "%H:%M:%S").time(),
+            "end_time": datetime.strptime("09:00:40", "%H:%M:%S").time(),
+        }
+    ]
+
+    split_timeline = fv._build_programmed_split_timeline(
+        schedule_rows,
+        pd.Timestamp("2026-03-25 09:12:00"),
+    )
+
+    assert split_timeline["Phase"].tolist() == [2]
+    assert split_timeline["StartTime"].iloc[0] == pd.Timestamp("2026-03-25 09:00:05")
+    assert split_timeline["EndTime"].iloc[0] == pd.Timestamp("2026-03-25 09:00:40")
+
+
+def test_build_programmed_split_timeline_rolls_overnight_end_to_next_day():
+    schedule_rows = [
+        {
+            "phase": 4,
+            "start_time": datetime.strptime("23:58:00", "%H:%M:%S").time(),
+            "end_time": datetime.strptime("00:02:00", "%H:%M:%S").time(),
+        }
+    ]
+
+    split_timeline = fv._build_programmed_split_timeline(
+        schedule_rows,
+        pd.Timestamp("2026-03-25 23:59:00"),
+    )
+
+    assert split_timeline["StartTime"].iloc[0] == pd.Timestamp("2026-03-25 23:58:00")
+    assert split_timeline["EndTime"].iloc[0] == pd.Timestamp("2026-03-26 00:02:00")
+
+
 def test_resolve_manual_analysis_start_uses_collected_run_date():
     collected = pd.DataFrame(
         {

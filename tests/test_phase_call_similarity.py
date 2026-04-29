@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 
+import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.figure import Figure
 import signal_replay as sr
 
 from signal_replay.comparison import (
@@ -10,6 +12,7 @@ from signal_replay.comparison import (
     build_included_event_periods,
     clip_timeline_to_relative_periods,
     compare_runs,
+    create_comparison_gantt_matplotlib,
     filter_divergence_windows_to_periods,
     generate_clearance_irregularity_summary,
     generate_operational_difference_summary,
@@ -127,6 +130,35 @@ def test_generate_clearance_irregularity_summary_counts_off_median_events():
     assert row["low_count_a"] == 0
     assert row["high_count_b"] == 1
     assert row["low_count_b"] == 0
+
+
+def test_generate_clearance_irregularity_summary_skips_long_overlap_yellow_red():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+
+    def _make_overlap_clearance_timeline(durations):
+        rows = []
+        cursor = base_time
+        for duration in durations:
+            start_time = cursor
+            end_time = start_time + timedelta(seconds=duration)
+            rows.append(
+                {
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "Duration": duration,
+                    "EventClass": "Overlap Yellow",
+                    "EventValue": 5,
+                }
+            )
+            cursor = end_time + timedelta(seconds=5)
+        return pd.DataFrame(rows)
+
+    timeline_a = _make_overlap_clearance_timeline([8.0, 8.0, 8.0, 12.0])
+    timeline_b = _make_overlap_clearance_timeline([8.0, 8.0, 8.0, 9.0])
+
+    rows = generate_clearance_irregularity_summary(timeline_a, timeline_b, threshold_seconds=0.2)
+
+    assert rows == []
 
 
 def test_compare_runs_does_not_exclude_low_activity_phase_call_chunk():
@@ -279,6 +311,42 @@ def test_render_sparkline_draws_phase_call_overlay_and_exclusion_legend():
     assert 'opacity="0.42"' in svg
 
 
+def test_create_comparison_gantt_matplotlib_omits_transition_section_text():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=20),
+            "Duration": 20.0,
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+        {
+            "StartTime": base_time + timedelta(seconds=40),
+            "EndTime": base_time + timedelta(seconds=60),
+            "Duration": 20.0,
+            "EventClass": "Transition Shortway",
+            "EventValue": None,
+        },
+    ])
+
+    fig = create_comparison_gantt_matplotlib(
+        timeline_a=timeline,
+        timeline_b=timeline.iloc[0:0].copy(),
+        label_a="2.15.1",
+        label_b="2.17.3",
+        title="03013 Issue Focus - Transition Shortway",
+        window_minutes=5.0,
+        align_by_time_delta=False,
+        time_offset_b=0.0,
+    )
+
+    assert fig is not None
+    text_values = [text.get_text() for text in fig.axes[0].texts]
+    assert "Transition / Preempt / Ped Service" not in text_values
+    plt.close(fig)
+
+
 def test_combined_timeline_chart_uses_dynamic_y_axis_without_exclusion_legend():
     svg = render_sparkline_svg(
         [],
@@ -294,6 +362,143 @@ def test_combined_timeline_chart_uses_dynamic_y_axis_without_exclusion_legend():
     assert 'Excluded from match average' not in svg
     assert '>0%</text>' not in svg
     assert '>100%</text>' not in svg
+
+
+def test_comparison_gantt_overlays_programmed_splits_without_adding_rows():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline_a = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=20),
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+    ])
+    timeline_b = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=25),
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+    ])
+    programmed_split_timeline = pd.DataFrame(
+        [
+            {
+                "Phase": 2,
+                "StartTime": base_time + timedelta(seconds=5),
+                "EndTime": base_time + timedelta(seconds=15),
+            }
+        ]
+    )
+
+    original_subplots = sr.comparison.plt.subplots
+
+    def fake_subplots(*args, **kwargs):
+        fig = Figure(figsize=kwargs.get("figsize"))
+        ax = fig.add_subplot(111)
+        return fig, ax
+
+    sr.comparison.plt.subplots = fake_subplots
+
+    try:
+        fig = create_comparison_gantt_matplotlib(
+            timeline_a=timeline_a,
+            timeline_b=timeline_b,
+            label_a="2.15.1",
+            label_b="2.17.3",
+            title="2B045 Issue Focus - Ph 2 Green",
+            window_minutes=5.0,
+            align_by_time_delta=False,
+            programmed_split_timeline=programmed_split_timeline,
+        )
+    finally:
+        sr.comparison.plt.subplots = original_subplots
+
+    assert fig is not None
+    axis = fig.axes[0]
+    row_labels = [tick.get_text() for tick in axis.get_yticklabels()]
+    legend = axis.get_legend()
+
+    assert row_labels == ["Ph 2 (2.15.1)", "Ph 2 (2.17.3)"]
+    assert legend is not None
+    assert [text.get_text() for text in legend.get_texts()] == ["Programed Split"]
+    assert len(axis.collections) >= 4
+    plt.close(fig)
+
+
+def test_create_multi_divergence_plots_passes_programmed_splits_through(monkeypatch, tmp_path):
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline_a = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=20),
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+    ])
+    timeline_b = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=25),
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+    ])
+    programmed_split_timeline = pd.DataFrame(
+        [
+            {
+                "Phase": 2,
+                "StartTime": base_time + timedelta(seconds=5),
+                "EndTime": base_time + timedelta(seconds=15),
+            }
+        ]
+    )
+    captured = {}
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured["programmed_split_timeline"] = kwargs["programmed_split_timeline"]
+        return object()
+
+    monkeypatch.setattr(sr.comparison, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+    monkeypatch.setattr(plt, "close", lambda fig: None)
+
+    result = sr.ComparisonResult(
+        device_id="2B045",
+        run_a="Original",
+        run_b="Replay",
+        sequence_dtw=sr.DTWResult(0.0, 0.0, [], 1, 1),
+        timing_dtw=sr.DTWResult(0.0, 0.0, [], 1, 1),
+        divergence_windows=[
+            sr.DivergenceWindow(
+                start_index_a=0,
+                end_index_a=0,
+                start_index_b=0,
+                end_index_b=0,
+                start_time_delta_a=0.0,
+                end_time_delta_a=30.0,
+                start_time_delta_b=0.0,
+                end_time_delta_b=30.0,
+                original_start_seconds_a=0.0,
+                original_end_seconds_a=30.0,
+                original_start_seconds_b=0.0,
+                original_end_seconds_b=30.0,
+            )
+        ],
+        match_percentage=100.0,
+    )
+
+    paths = sr.create_multi_divergence_plots(
+        timeline_a=timeline_a,
+        timeline_b=timeline_b,
+        comparison_result=result,
+        output_dir=tmp_path,
+        programmed_split_timeline=programmed_split_timeline,
+        align_by_time_delta=False,
+    )
+
+    assert len(paths) == 1
+    assert captured["programmed_split_timeline"] is programmed_split_timeline
 
 
 def test_phase_and_operational_summaries_are_split_by_event_class():
@@ -749,8 +954,9 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     assert "Thrown out" in html
     assert "97.5%" in html
     assert "No meaningful transition, preempt, or pedestrian-service differences were found." in html
-    assert "Timeline Difference Analysis" in html
-    assert "original=120, new=0" in html
+    assert "Timeline Difference Analysis" not in html
+    assert "Timeline diff analysis:" not in html
+    assert "original=120, new=0" not in html
     assert "Device Trends" in html
     assert "Cross-Device Trends" not in html
     assert "Clearance Irregularities" in html
@@ -780,7 +986,8 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     assert ">-0.08<" in trends_block
     assert ">-1127.3<" in trends_block
     assert ">+1<" in trends_block
-    assert "Ph 4 Red Clearance" in trends_block
+    assert "Phase Red Clearance" in trends_block
+    assert "Ph 4 Red Clearance" not in trends_block
     assert "Transition Active" in trends_block
     assert 'class="trend-row trend-yellow"' in trends_block
     assert 'class="trend-row trend-preempt"' in trends_block

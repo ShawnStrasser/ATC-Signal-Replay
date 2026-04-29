@@ -2878,6 +2878,7 @@ def generate_clearance_irregularity_summary(
     """
 
     clearance_classes = {'Yellow', 'Red', 'Overlap Yellow', 'Overlap Red'}
+    overlap_clearance_median_threshold = 6.0
 
     def _label_factory(event_class: str, event_value: int) -> str:
         if event_class in {'Yellow', 'Red'}:
@@ -2905,6 +2906,8 @@ def generate_clearance_irregularity_summary(
             key = (event_class, value_int)
             durations = group['Duration'].astype(float)
             median_seconds = float(durations.median())
+            if event_class in {'Overlap Yellow', 'Overlap Red'} and median_seconds >= overlap_clearance_median_threshold:
+                continue
             signed_devs = durations - median_seconds
             high_mask = signed_devs >= (threshold_seconds - 1e-9)
             low_mask = signed_devs <= -(threshold_seconds - 1e-9)
@@ -3149,7 +3152,8 @@ def create_comparison_gantt_matplotlib(
     event_classes: Optional[List[str]] = None,
     dpi: int = 150,
     align_by_time_delta: bool = True,
-    time_offset_b: float = 0.0
+    time_offset_b: float = 0.0,
+    programmed_split_timeline: Optional[pd.DataFrame] = None,
 ) -> Optional[Any]:
     """
     Create a Gantt chart comparing two timelines using matplotlib (reliable PNG export).
@@ -3176,6 +3180,9 @@ def create_comparison_gantt_matplotlib(
         time_offset_b: Time offset in seconds to apply to timeline B. Positive values
                       shift B's events to the right (later in time). Use this when the
                       raw events started at different points in the signal cycle.
+        programmed_split_timeline: Optional DataFrame with Phase, StartTime, EndTime
+                  columns describing programmed split service windows to overlay on
+                  top of the matching phase rows.
     
     Returns:
         matplotlib Figure object, or None if matplotlib not available
@@ -3218,6 +3225,7 @@ def create_comparison_gantt_matplotlib(
         df_b['EventValue'] = pd.to_numeric(df_b['EventValue'], errors='coerce')
     
     # Calculate time deltas from respective starts
+    common_start = None
     if align_by_time_delta:
         # Each timeline is relative to its own start time
         if not df_a.empty:
@@ -3297,6 +3305,27 @@ def create_comparison_gantt_matplotlib(
         df_a = df_a[(df_a['EndDelta'] >= window_start_sec) & (df_a['TimeDelta'] <= window_end_sec)].copy()
     if not df_b.empty:
         df_b = df_b[(df_b['EndDelta'] >= window_start_sec) & (df_b['TimeDelta'] <= window_end_sec)].copy()
+
+    split_df = None
+    if programmed_split_timeline is not None and not programmed_split_timeline.empty:
+        split_df = programmed_split_timeline.copy()
+        split_df['Phase'] = pd.to_numeric(split_df['Phase'], errors='coerce')
+        split_df = split_df.dropna(subset=['Phase', 'StartTime', 'EndTime']).copy()
+        if not split_df.empty:
+            split_df['StartTime'] = pd.to_datetime(split_df['StartTime'])
+            split_df['EndTime'] = pd.to_datetime(split_df['EndTime'])
+            split_origin = start_a if align_by_time_delta else common_start
+            if split_origin is not None:
+                split_df['TimeDelta'] = (split_df['StartTime'] - split_origin).dt.total_seconds()
+                split_df['EndDelta'] = (split_df['EndTime'] - split_origin).dt.total_seconds()
+                split_df = split_df[(split_df['EndDelta'] >= window_start_sec) & (split_df['TimeDelta'] <= window_end_sec)].copy()
+                if not split_df.empty:
+                    split_df['RelStart'] = split_df['TimeDelta']
+                    split_df['RelEnd'] = split_df['EndDelta']
+                    split_df['Duration'] = split_df['RelEnd'] - split_df['RelStart']
+                    split_df = split_df[split_df['Duration'] > 0].copy()
+            else:
+                split_df = None
     
     # Keep absolute time deltas (from aligned start) for x-axis positioning
     if not df_a.empty:
@@ -3346,7 +3375,18 @@ def create_comparison_gantt_matplotlib(
     # Dedup on BaseLabel only - different EventClasses (Green/Yellow/Red) share
     # the same BaseLabel (e.g., "Ph 2") but have different SortKeys. We want
     # ONE row per phase per source, not one row per phase per EventClass.
-    base_sort = combined_df.groupby('BaseLabel')['SortKey'].min().reset_index()
+    def _section_group(event_class: str) -> str:
+        if event_class in {
+            'Green', 'Yellow', 'Red',
+            'Overlap Green', 'Overlap Trail Green', 'Overlap Yellow', 'Overlap Red',
+        }:
+            return 'signal'
+        return 'transition'
+
+    base_sort = combined_df.groupby('BaseLabel').agg(
+        SortKey=('SortKey', 'min'),
+        SectionGroup=('EventClass', lambda values: _section_group(next(iter(values)))),
+    ).reset_index()
     base_sort = base_sort.sort_values('SortKey')
     
     row_labels = []
@@ -3367,6 +3407,39 @@ def create_comparison_gantt_matplotlib(
     # Create figure
     fig_height = max(5.0, 0.34 * len(row_labels))
     fig, ax = plt.subplots(figsize=(18, fig_height))
+    legend_handles = []
+
+    overlay_specs = []
+    overlay_drawn = False
+    if split_df is not None and not split_df.empty:
+        overlay_face = to_rgba('#808080', 0.12)
+        overlay_edge = '#505050'
+        for split in split_df.itertuples(index=False):
+            base_label = f"Ph {int(split.Phase)}"
+            target_labels = [f"{base_label} ({label_a})", f"{base_label} ({label_b})"]
+            y_positions = sorted(row_to_y[label] for label in target_labels if label in row_to_y)
+            if not y_positions:
+                continue
+            y_start = y_positions[0] - 0.72 / 2.0
+            y_height = max(0.72, (y_positions[-1] + 0.72 / 2.0) - y_start)
+            overlay_specs.append((float(split.RelStart), float(split.Duration), y_start, y_height, overlay_edge))
+            ax.broken_barh(
+                [(float(split.RelStart), float(split.Duration))],
+                (y_start, y_height),
+                facecolors=overlay_face,
+                edgecolors='none',
+                zorder=0.5,
+            )
+            overlay_drawn = True
+        if overlay_drawn:
+            legend_handles.append(
+                mpatches.Patch(
+                    facecolor=overlay_face,
+                    edgecolor=overlay_edge,
+                    linewidth=1.45,
+                    label='Programed Split',
+                )
+            )
     
     # Plot bars using broken_barh
     bar_height = 0.72
@@ -3378,7 +3451,18 @@ def create_comparison_gantt_matplotlib(
             (y_pos - bar_height/2, bar_height),
             facecolors=color,
             edgecolors='black',
-            linewidth=0.5
+            linewidth=0.5,
+            zorder=2.0,
+        )
+
+    for rel_start, duration, y_start, y_height, overlay_edge in overlay_specs:
+        ax.broken_barh(
+            [(rel_start, duration)],
+            (y_start, y_height),
+            facecolors='none',
+            edgecolors=overlay_edge,
+            linewidth=1.45,
+            zorder=3.0,
         )
     
     # Add divergence marker if specified
@@ -3399,11 +3483,20 @@ def create_comparison_gantt_matplotlib(
             else:
                 # Narrow divergence - just show a single line
                 ax.axvline(x=vis_start, color='red', linestyle='--', linewidth=2, label='Divergence')
+            legend_handles.append(
+                mpatches.Patch(
+                    facecolor=to_rgba('red', 0.15),
+                    edgecolor='red',
+                    linewidth=1.0,
+                    label='Divergence',
+                )
+            )
     
     # Configure axes
     ax.set_yticks(range(len(row_labels)))
     ax.set_yticklabels(row_labels)
-    ax.set_xlabel('Time of Day', fontsize=13, fontweight='semibold', labelpad=10)
+    showing_time_of_day = (not align_by_time_delta) and (common_start is not None)
+    ax.set_xlabel('Time of Day' if showing_time_of_day else 'Time Since Start', fontsize=13, fontweight='semibold', labelpad=10)
     ax.set_title(title, fontsize=17, fontweight='bold', pad=14)
     ax.set_xlim(window_start_sec, window_end_sec)
     ax.invert_yaxis()  # Put first row at top
@@ -3416,8 +3509,19 @@ def create_comparison_gantt_matplotlib(
 
     # Format x-axis as HH:MM at clean minute intervals
     import matplotlib.ticker as mticker
+    base_seconds_of_day = 0
+    if showing_time_of_day:
+        base_seconds_of_day = (
+            common_start.hour * 3600
+            + common_start.minute * 60
+            + common_start.second
+        )
+
     def _fmt_hhmm(x, _pos=None):
-        h, rem = divmod(int(x), 3600)
+        total_seconds = int(x)
+        if showing_time_of_day:
+            total_seconds = (base_seconds_of_day + total_seconds) % (24 * 3600)
+        h, rem = divmod(total_seconds, 3600)
         m = rem // 60
         return f'{h:02d}:{m:02d}'
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_hhmm))
@@ -3431,12 +3535,41 @@ def create_comparison_gantt_matplotlib(
         tick_step = 10 * 60  # 10 min
     else:
         tick_step = 30 * 60  # 30 min
-    first_tick = (int(window_start_sec) // tick_step + 1) * tick_step
-    ticks = list(range(first_tick, int(window_end_sec) + 1, tick_step))
+    if showing_time_of_day:
+        absolute_start = base_seconds_of_day + window_start_sec
+        absolute_end = base_seconds_of_day + window_end_sec
+        first_absolute_tick = int((absolute_start + tick_step - 1) // tick_step) * tick_step
+        ticks = [
+            absolute_tick - base_seconds_of_day
+            for absolute_tick in range(first_absolute_tick, int(absolute_end) + 1, tick_step)
+        ]
+    else:
+        first_tick = (int(window_start_sec) // tick_step + 1) * tick_step
+        ticks = list(range(first_tick, int(window_end_sec) + 1, tick_step))
+
     if ticks:
         ax.set_xticks(ticks)
+
+    if legend_handles:
+        deduped_handles = []
+        seen_labels = set()
+        for handle in legend_handles:
+            label = handle.get_label()
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            deduped_handles.append(handle)
+        # Keep legend above the plotting area so bars remain uncluttered.
+        ax.legend(
+            handles=deduped_handles,
+            loc='upper right',
+            bbox_to_anchor=(1.0, 1.08),
+            frameon=True,
+            fontsize=10,
+            borderaxespad=0.0,
+        )
     
-    plt.tight_layout()
+    plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
     
     # Save if output path specified
     if output_path:
@@ -3461,6 +3594,7 @@ def create_multi_divergence_plots(
     dpi: int = 150,
     time_offset_b: float = 0.0,
     align_by_time_delta: bool = True,
+    programmed_split_timeline: Optional[pd.DataFrame] = None,
 ) -> List[str]:
     """Create up to max_plots divergence-focused Gantt charts.
 
@@ -3507,6 +3641,7 @@ def create_multi_divergence_plots(
             dpi=dpi,
             align_by_time_delta=align_by_time_delta,
             time_offset_b=time_offset_b,
+            programmed_split_timeline=programmed_split_timeline,
         )
         if fig is not None:
             plt.close(fig)

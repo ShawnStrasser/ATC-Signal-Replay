@@ -17,6 +17,7 @@ from signal_replay.comparison import (
     generate_clearance_irregularity_summary,
     generate_operational_difference_summary,
     generate_phase_difference_summary,
+    is_overlap_clearance_interval_candidate,
     render_sparkline_svg,
 )
 from signal_replay.report import generate_report
@@ -161,6 +162,68 @@ def test_generate_clearance_irregularity_summary_skips_long_overlap_yellow_red()
     assert rows == []
 
 
+def test_generate_clearance_irregularity_summary_skips_mixed_use_overlap_yellow():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+
+    def _make_overlap_yellow_timeline(durations):
+        rows = []
+        cursor = base_time
+        for duration in durations:
+            start_time = cursor
+            end_time = start_time + timedelta(seconds=duration)
+            rows.append(
+                {
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "Duration": duration,
+                    "EventClass": "Overlap Yellow",
+                    "EventValue": 5,
+                }
+            )
+            cursor = end_time + timedelta(seconds=5)
+        return pd.DataFrame(rows)
+
+    timeline_a = _make_overlap_yellow_timeline([4.0] * 8 + [20.0, 22.0])
+    timeline_b = _make_overlap_yellow_timeline([4.0] * 9 + [21.0])
+
+    rows = generate_clearance_irregularity_summary(timeline_a, timeline_b, threshold_seconds=0.2)
+
+    assert rows == []
+    assert not is_overlap_clearance_interval_candidate(pd.Series([4.0] * 94 + [20.0] * 6))
+
+
+def test_generate_clearance_irregularity_summary_keeps_tightly_clustered_overlap_yellow():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+
+    def _make_overlap_yellow_timeline(durations):
+        rows = []
+        cursor = base_time
+        for duration in durations:
+            start_time = cursor
+            end_time = start_time + timedelta(seconds=duration)
+            rows.append(
+                {
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "Duration": duration,
+                    "EventClass": "Overlap Yellow",
+                    "EventValue": 5,
+                }
+            )
+            cursor = end_time + timedelta(seconds=5)
+        return pd.DataFrame(rows)
+
+    timeline_a = _make_overlap_yellow_timeline([4.0, 4.0, 4.0, 4.4])
+    timeline_b = _make_overlap_yellow_timeline([4.0, 4.0, 4.0, 4.5])
+
+    rows = generate_clearance_irregularity_summary(timeline_a, timeline_b, threshold_seconds=0.2)
+
+    assert len(rows) == 1
+    assert rows[0]["label"] == "Ovlp 5"
+    assert rows[0]["state"] == "Yellow"
+    assert is_overlap_clearance_interval_candidate(pd.Series([4.0] * 95 + [7.0] * 5))
+
+
 def test_compare_runs_does_not_exclude_low_activity_phase_call_chunk():
     main_offsets = [0, 600, 1200, 1800, 2400, 2800]
     phase_offsets_a = [(43, 900, 2)]
@@ -183,6 +246,61 @@ def test_compare_runs_does_not_exclude_low_activity_phase_call_chunk():
     assert result.included_chunk_count == 1
     assert result.excluded_chunk_count == 0
     assert result.match_percentage == 100.0
+
+
+def test_compare_runs_reports_percent_timing_match_from_aligned_exact_matches():
+    main_offsets = list(range(0, 3001, 60))
+    shifted_offsets = [
+        offset + (2.0 if idx % 5 == 0 else 0.0)
+        for idx, offset in enumerate(main_offsets)
+    ]
+
+    events_a = _make_events(main_offsets)
+    events_b = _make_events(shifted_offsets)
+
+    result = compare_runs(
+        events_a,
+        events_b,
+        device_id="03013",
+        auto_align=False,
+        phase_call_threshold=0.0,
+    )
+
+    assert result.match_percentage == 100.0
+    assert result.timing_match_percentage is not None
+    assert 0.0 <= result.timing_match_percentage < 90.0
+    assert result.timing_p95_error_seconds is not None
+    assert result.timing_p95_error_seconds > 0.5
+    assert result.timing_max_error_seconds is not None
+    assert result.timing_max_error_seconds > 0.5
+
+
+def test_compare_runs_reports_timing_match_when_full_series_dtw_is_skipped():
+    main_offsets = list(range(0, 432000, 60))
+    shifted_offsets = [
+        offset + (2.0 if idx % 5 == 0 else 0.0)
+        for idx, offset in enumerate(main_offsets)
+    ]
+
+    events_a = _make_events(main_offsets)
+    events_b = _make_events(shifted_offsets)
+
+    result = compare_runs(
+        events_a,
+        events_b,
+        device_id="03013",
+        auto_align=False,
+        phase_call_threshold=0.0,
+    )
+
+    assert result.sequence_dtw.warping_path == []
+    assert result.match_percentage == 100.0
+    assert result.timing_match_percentage is not None
+    assert 0.0 <= result.timing_match_percentage < 90.0
+    assert result.timing_p95_error_seconds is not None
+    assert result.timing_p95_error_seconds > 0.5
+    assert result.timing_max_error_seconds is not None
+    assert result.timing_max_error_seconds > 0.5
 
 
 def test_build_included_event_periods_merges_overlapping_good_chunks():
@@ -631,6 +749,9 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
         firmware_version="2.17.3",
         passed=True,
         match_percentage=97.5,
+        timing_match_percentage=92.5,
+        timing_p95_error_seconds=0.432,
+        timing_max_error_seconds=0.876,
         num_divergences=0,
         runs_completed=1,
         total_runs=1,
@@ -648,6 +769,20 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
                 "total_duration_a": 640.0,
                 "total_duration_b": 613.7,
                 "total_duration_delta": -26.3,
+            },
+            {
+                "label": "Ovlp 4",
+                "state": "Yellow",
+                "event_class": "Overlap Yellow",
+                "count_a": 10,
+                "count_b": 14,
+                "count_delta": 4,
+                "duration_a": 4.0,
+                "duration_b": 4.0,
+                "duration_delta": 0.0,
+                "total_duration_a": 40.0,
+                "total_duration_b": 56.0,
+                "total_duration_delta": 16.0,
             }
         ],
         clearance_irregularities=[
@@ -946,13 +1081,26 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     generate_report([result, thrown_out, trend_peer, unavailable], suite, str(report_path))
 
     html = report_path.read_text(encoding="utf-8")
+    assert f"Generated {datetime.now():%Y-%m-%d}" in html
+    assert f"Generated {datetime.now():%Y-%m-%d} " not in html
     assert "Combined Timeline" in html
     assert "system-wide sanity check" in html
     assert "Phase-call similarity threshold" in html
+    assert "Timing match threshold" in html
+    assert "90.0% within 0.5s" in html
+    assert "Timing DTW" not in html
     assert "90.0%" in html
     assert "Transition / Preempt / Ped Service Differences" in html
     assert "Thrown out" in html
     assert "97.5%" in html
+    assert "92.5%" in html
+    assert "Avg Timing Match" in html
+    assert "Similarity Tests" not in html
+    assert "Conflict Tests" not in html
+    assert "Timing p95 error:" in html
+    assert "0.432s" in html
+    assert "Timing max error:" in html
+    assert "0.876s" in html
     assert "No meaningful transition, preempt, or pedestrian-service differences were found." in html
     assert "Timeline Difference Analysis" not in html
     assert "Timeline diff analysis:" not in html
@@ -965,25 +1113,25 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     assert "Ped Service" in html
     assert "Overlap Ped Service" in html
     assert "Data Integrity" in html
-    assert "Valid Timeline Events" in html
-    assert "&#8593; Orig" in html
-    assert "&#8593; New" in html
+    assert "Clearance Interval Checks (Valid Timeline Events)" in html
+    assert "Irregular Orig" in html
+    assert "Irregular New" in html
     assert "Total Dur Orig (s)" in html
     assert "Comparison Details" not in html
     assert "Affected<br>Devices" not in html
     assert "Type</th><th>Avg<br>Delta (s)</th><th>Total Count<br>Delta</th><th>Devices" in html
-    assert "Type</th><th>2.15.1<br>Irregular Count</th><th>2.17.3<br>Irregular Count</th><th>2.15.1<br>Avg Dev (s)</th><th>2.17.3<br>Avg Dev (s)</th><th>&#916; Avg Dev (s)</th><th>Devices" in html
-    assert "Type</th><th>2.15.1<br>Invalid Count</th><th>2.17.3<br>Invalid Count</th><th>Devices" in html
+    assert "Type</th><th>2.15.1<br>Irregular Count</th><th>2.17.3<br>Irregular Count</th><th>&#916; Count</th><th>Devices" in html
+    assert "Type</th><th>2.15.1<br>Invalid Count</th><th>2.17.3<br>Invalid Count</th><th>&#916; Count</th><th>Devices" in html
     assert "Example Scenarios" not in html
     assert "Special Device Notes" not in html
     trends_block = html.split("Device Trends", 1)[1].split("Combined Timeline", 1)[0]
     assert "03013, 03015" in trends_block
-    assert ">Phase Yellow \u2193<" in trends_block
+    assert ">Phase Yellow<" in trends_block
+    assert ">Overlap Yellow Occurrences<" in trends_block
     assert ">Ped Service \u2191<" in trends_block
     assert ">Overlap Ped Service \u2191<" in trends_block
     assert ">3<" in trends_block
     assert ">5<" in trends_block
-    assert ">-0.08<" in trends_block
     assert ">-1127.3<" in trends_block
     assert ">+1<" in trends_block
     assert "Phase Red Clearance" in trends_block
@@ -994,8 +1142,15 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     assert 'class="trend-row trend-ped"' in trends_block
     assert 'class="trend-row trend-overlap-ped"' in trends_block
     similarity_results_block = html.split("Similarity Results", 1)[1].split("Device Trends", 1)[0]
+    similarity_summary_table = similarity_results_block.split("</table>", 1)[0]
+    assert "Sequence Match" in similarity_summary_table
+    assert "Timing Match" in similarity_summary_table
+    assert "(events within 0.5s)" in similarity_summary_table
+    assert "Description" not in similarity_summary_table
+    assert "Bar" not in similarity_summary_table
+    assert "Divergences" not in similarity_summary_table
     assert '&mdash;' in similarity_results_block
     assert similarity_results_block.count("THROWN OUT") == 2
-    assert html.count(">1/2<") >= 2
+    assert html.count(">1/2<") >= 1
     assert "Insufficient scored chunks remained after settling/filtering for a reliable comparison." in html
     assert "No collected events found for 03016 in collected.db." in html

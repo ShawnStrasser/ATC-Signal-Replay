@@ -154,6 +154,8 @@ def _normalize_clearance_rows(rows: List[dict]) -> List[Dict[str, Any]]:
         row["high_avg_deviation_b"] = _as_float(row.get("high_avg_deviation_b"))
         row["low_avg_deviation_a"] = _as_float(row.get("low_avg_deviation_a"))
         row["low_avg_deviation_b"] = _as_float(row.get("low_avg_deviation_b"))
+        row["avg_deviation_a"] = _signed_clearance_avg_deviation(row, "a")
+        row["avg_deviation_b"] = _signed_clearance_avg_deviation(row, "b")
         row["sample_count_a"] = _as_int(row.get("sample_count_a"))
         row["sample_count_b"] = _as_int(row.get("sample_count_b"))
         normalized.append(row)
@@ -229,8 +231,20 @@ def _trend_row_class(trend_type: str, pattern: str) -> str:
     return "trend-operational"
 
 
-def _flag_clearance_irregularities(row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return 0-2 flagged dicts for a single clearance row: one ↑ and/or one ↓."""
+def _signed_clearance_avg_deviation(row: Dict[str, Any], suffix: str) -> float:
+    high_count = _as_int(row.get(f"high_count_{suffix}"))
+    low_count = _as_int(row.get(f"low_count_{suffix}"))
+    total_count = high_count + low_count
+    if total_count <= 0:
+        return 0.0
+
+    high_total = high_count * _as_float(row.get(f"high_avg_deviation_{suffix}"))
+    low_total = low_count * _as_float(row.get(f"low_avg_deviation_{suffix}"))
+    return (high_total - low_total) / total_count
+
+
+def _flag_clearance_irregularity(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return one flagged dict for a clearance row using total irregular counts."""
     label = str(row.get("label", "")).strip()
     state = str(row.get("state", "")).strip()
 
@@ -242,50 +256,26 @@ def _flag_clearance_irregularities(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         base_pattern = f"{label} {state}".strip()
 
     detail_label = f"{label} {state}".strip()
+    count_a = _as_int(row.get("irregular_count_a"))
+    count_b = _as_int(row.get("irregular_count_b"))
+    if count_a <= 0 and count_b <= 0:
+        return None
 
-    flagged: List[Dict[str, Any]] = []
-
-    high_count_a = _as_int(row.get("high_count_a"))
-    high_count_b = _as_int(row.get("high_count_b"))
-    if high_count_a > 0 or high_count_b > 0:
-        high_avg_a = _as_float(row.get("high_avg_deviation_a"))
-        high_avg_b = _as_float(row.get("high_avg_deviation_b"))
-        flagged.append({
-            "type": "Clearance irregularities",
-            "pattern": f"{base_pattern} \u2191",
-            "direction": "high",
-            "message": (
-              f"{detail_label} \u2191: {high_count_a}\u2192{high_count_b} affected events "
-              f"(avg {high_avg_b:+.2f}s from median)"
-            ),
-            "count_a": high_count_a,
-            "count_b": high_count_b,
-            "count_delta": high_count_b - high_count_a,
-            "avg_deviation_a": high_avg_a,
-            "avg_deviation_b": high_avg_b,
-        })
-
-    low_count_a = _as_int(row.get("low_count_a"))
-    low_count_b = _as_int(row.get("low_count_b"))
-    if low_count_a > 0 or low_count_b > 0:
-        low_avg_a = -_as_float(row.get("low_avg_deviation_a"))
-        low_avg_b = -_as_float(row.get("low_avg_deviation_b"))
-        flagged.append({
-            "type": "Clearance irregularities",
-            "pattern": f"{base_pattern} \u2193",
-            "direction": "low",
-            "message": (
-              f"{detail_label} \u2193: {low_count_a}\u2192{low_count_b} affected events "
-              f"(avg {low_avg_b:+.2f}s from median)"
-            ),
-            "count_a": low_count_a,
-            "count_b": low_count_b,
-            "count_delta": low_count_b - low_count_a,
-            "avg_deviation_a": low_avg_a,
-            "avg_deviation_b": low_avg_b,
-        })
-
-    return flagged
+    avg_deviation_a = _signed_clearance_avg_deviation(row, "a")
+    avg_deviation_b = _signed_clearance_avg_deviation(row, "b")
+    return {
+        "type": "Clearance irregularities",
+        "pattern": base_pattern,
+        "message": (
+          f"{detail_label}: {count_a}\u2192{count_b} irregular events "
+          f"(new avg deviation {avg_deviation_b:+.2f}s from median)"
+        ),
+        "count_a": count_a,
+        "count_b": count_b,
+        "count_delta": count_b - count_a,
+        "avg_deviation_a": avg_deviation_a,
+        "avg_deviation_b": avg_deviation_b,
+    }
 
 
 def _average(values: List[float]) -> float:
@@ -337,10 +327,47 @@ def _flag_operational_difference(diff: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
+def _flag_overlap_signal_occurrence_difference(diff: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    label = str(diff.get("label", "")).strip()
+    state = str(diff.get("state", "")).strip()
+    event_class = str(diff.get("event_class", "")).strip()
+
+    is_overlap = label.startswith(("Ovlp ", "Overlap ")) or event_class.startswith("Overlap ")
+    if not is_overlap or state not in {"Yellow", "Red"}:
+        return None
+
+    count_delta = _as_int(diff.get("count_delta"))
+    if count_delta == 0:
+        return None
+
+    pattern = f"Overlap {state} Occurrences"
+    count_a = _as_int(diff.get("count_a"))
+    count_b = _as_int(diff.get("count_b"))
+    detail_label = f"{label} {state}".strip()
+    return {
+        "type": "Signal occurrence change",
+        "pattern": pattern,
+        "message": f"{detail_label} count {count_a}\u2192{count_b} ({count_delta:+d})",
+        "avg_duration_delta": None,
+        "count_delta": count_delta,
+    }
+
+
+def _include_phase_difference_detail(diff: Dict[str, Any]) -> bool:
+    state = str(diff.get("state", "")).strip()
+    if state not in {"Yellow", "Red"}:
+        return True
+
+    label = str(diff.get("label", "")).strip()
+    event_class = str(diff.get("event_class", "")).strip()
+    return label.startswith(("Ovlp ", "Overlap ")) or event_class.startswith("Overlap ")
+
+
 def _build_similarity_trends(
   results: List[ScenarioResult],
   *,
   clearance_attr: str = "clearance_irregularities",
+  phase_attr: str = "phase_differences",
   operational_attr: str = "operational_differences",
   include_scenario_flags: bool = False,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, List[str]]]:
@@ -349,12 +376,9 @@ def _build_similarity_trends(
     lambda: {
       "type": "",
       "pattern": "",
-      "direction": "",
       "devices": set(),
       "count_a_values": [],
       "count_b_values": [],
-      "avg_deviation_a_values": [],
-      "avg_deviation_b_values": [],
     }
   )
   operational_trend_map: Dict[tuple, Dict[str, Any]] = defaultdict(
@@ -378,21 +402,34 @@ def _build_similarity_trends(
     flags: List[str] = []
 
     for diff in _normalize_clearance_rows(getattr(row, clearance_attr, [])):
-      for flagged in _flag_clearance_irregularities(diff):
-        trend_key = (flagged["type"], flagged["pattern"])
-        if include_scenario_flags:
-          flags.append(f"{flagged['type']}: {flagged['message']}")
-        trend = clearance_trend_map[trend_key]
-        trend["type"] = flagged["type"]
-        trend["pattern"] = flagged["pattern"]
-        trend["direction"] = flagged["direction"]
-        trend["devices"].add(row.scenario_id)
-        trend["count_a_values"].append(flagged["count_a"])
-        trend["count_b_values"].append(flagged["count_b"])
-        if flagged["count_a"] > 0:
-          trend["avg_deviation_a_values"].append(flagged["avg_deviation_a"])
-        if flagged["count_b"] > 0:
-          trend["avg_deviation_b_values"].append(flagged["avg_deviation_b"])
+      flagged = _flag_clearance_irregularity(diff)
+      if not flagged:
+        continue
+      trend_key = (flagged["type"], flagged["pattern"])
+      if include_scenario_flags:
+        flags.append(f"{flagged['type']}: {flagged['message']}")
+      trend = clearance_trend_map[trend_key]
+      trend["type"] = flagged["type"]
+      trend["pattern"] = flagged["pattern"]
+      trend["devices"].add(row.scenario_id)
+      trend["count_a_values"].append(flagged["count_a"])
+      trend["count_b_values"].append(flagged["count_b"])
+
+    for diff in _normalize_difference_rows(getattr(row, phase_attr, [])):
+      flagged = _flag_overlap_signal_occurrence_difference(diff)
+      if not flagged:
+        continue
+      trend_key = (flagged["type"], flagged["pattern"])
+      if include_scenario_flags:
+        flags.append(f"{flagged['type']}: {flagged['message']}")
+      trend = operational_trend_map[trend_key]
+      trend["type"] = flagged["type"]
+      trend["pattern"] = flagged["pattern"]
+      trend["devices"].add(row.scenario_id)
+      if flagged["avg_duration_delta"] is not None:
+        trend["avg_duration_deltas"].append(flagged["avg_duration_delta"])
+      trend["count_deltas"].append(flagged["count_delta"])
+
     for diff in _normalize_difference_rows(getattr(row, operational_attr, [])):
       flagged = _flag_operational_difference(diff)
       if not flagged:
@@ -413,6 +450,11 @@ def _build_similarity_trends(
         if flag not in deduped_flags:
           deduped_flags.append(flag)
       scenario_flags[row.scenario_id] = deduped_flags[:4]
+      hidden_flag_count = max(0, len(deduped_flags) - len(scenario_flags[row.scenario_id]))
+      if hidden_flag_count:
+        scenario_flags[row.scenario_id].append(
+          f"{hidden_flag_count} additional trend flag(s) are listed in the detailed tables below."
+        )
 
   clearance_trends: List[Dict[str, Any]] = []
   trends: List[Dict[str, Any]] = []
@@ -424,23 +466,14 @@ def _build_similarity_trends(
 
     baseline_count = sum(trend["count_a_values"])
     new_count = sum(trend["count_b_values"])
-    avg_deviation_a = _average(trend["avg_deviation_a_values"])
-    avg_deviation_b = _average(trend["avg_deviation_b_values"])
-    avg_deviation_delta = avg_deviation_b - avg_deviation_a
-    base_pattern_no_arrow = trend["pattern"].rstrip(" \u2191\u2193")
-    delta_arrow = "\u2191" if avg_deviation_delta >= 0 else "\u2193"
-    display_pattern = f"{base_pattern_no_arrow} {delta_arrow}"
     clearance_trends.append(
       {
         "type": trend["type"],
-        "pattern": display_pattern,
-        "direction": trend["direction"],
+        "pattern": trend["pattern"],
         "device_count": len(scenarios),
         "baseline_count": baseline_count,
         "new_count": new_count,
-        "avg_deviation_a": avg_deviation_a,
-        "avg_deviation_b": avg_deviation_b,
-        "avg_deviation_delta": avg_deviation_delta,
+        "count_delta": new_count - baseline_count,
         "devices": ", ".join(scenarios),
         "row_class": _trend_row_class(trend["type"], trend["pattern"]),
       }
@@ -456,7 +489,7 @@ def _build_similarity_trends(
         "type": trend["type"],
         "pattern": trend["pattern"],
         "device_count": len(scenarios),
-        "avg_duration_delta": _average(trend["avg_duration_deltas"]),
+        "avg_duration_delta": _average(trend["avg_duration_deltas"]) if trend["avg_duration_deltas"] else None,
         "total_count_delta": sum(trend["count_deltas"]),
         "devices": ", ".join(scenarios),
         "row_class": _trend_row_class(trend["type"], trend["pattern"]),
@@ -465,7 +498,7 @@ def _build_similarity_trends(
 
   clearance_trends.sort(
     key=lambda item: (
-      abs(item["avg_deviation_delta"]),
+      abs(item["count_delta"]),
       item["baseline_count"] + item["new_count"],
       item["device_count"],
     ),
@@ -474,7 +507,7 @@ def _build_similarity_trends(
 
   trends.sort(
     key=lambda item: (
-      abs(item["avg_duration_delta"]),
+      abs(item["avg_duration_delta"] or 0.0),
       abs(item["total_count_delta"]),
       item["device_count"],
     ),
@@ -532,6 +565,7 @@ def _build_integrity_summary(
         "type": type_label,
         "baseline_count": data["baseline_count"],
         "new_count": data["new_count"],
+        "count_delta": data["new_count"] - data["baseline_count"],
         "devices": ", ".join(sorted(data["devices"])),
       })
   output.sort(key=lambda r: max(r["baseline_count"], r["new_count"]), reverse=True)
@@ -586,14 +620,6 @@ body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background
 .tile.pass .value { color: var(--pass); }
 .tile.fail .value { color: var(--fail); }
 .tile.neutral .value { color: var(--text); }
-
-/* Match bar */
-.match-bar-wrap { display: flex; align-items: center; gap: 8px; }
-.match-bar { flex: 1; height: 10px; background: #eee; border-radius: 5px; overflow: hidden; max-width: 120px; }
-.match-bar-fill { height: 100%; border-radius: 5px; transition: width .3s; }
-.match-bar-fill.high  { background: var(--pass); }
-.match-bar-fill.med   { background: var(--warn); }
-.match-bar-fill.low   { background: var(--fail); }
 
 /* Tables */
 table { width: 100%; border-collapse: collapse; font-size: 15px; }
@@ -705,21 +731,13 @@ a:hover { text-decoration: underline; }
     <div class="value">{{ total_pass }}/{{ total_count }}</div>
     <div class="label">Scenarios Passed</div>
   </div>
-  {% if summary_similarity_rows|length > 0 %}
-  <div class="tile {{ 'pass' if similarity_scored_count > 0 and similarity_fail == 0 else ('neutral' if similarity_scored_count == 0 else 'fail') }}">
-    <div class="value">{{ similarity_pass }}/{{ similarity_scored_count }}</div>
-    <div class="label">Similarity Tests</div>
-  </div>
-  {% endif %}
-  {% if conflict|length > 0 %}
-  <div class="tile {{ 'pass' if conflict_fail == 0 else 'fail' }}">
-    <div class="value">{{ conflict_pass }}/{{ conflict|length }}</div>
-    <div class="label">Conflict Tests</div>
-  </div>
-  {% endif %}
   <div class="tile {{ avg_match_class }}">
     <div class="value">{{ avg_match_display }}</div>
-    <div class="label">Avg Match (Similarity)</div>
+    <div class="label">Avg Sequence Match</div>
+  </div>
+  <div class="tile {{ avg_timing_match_class }}">
+    <div class="value">{{ avg_timing_match_display }}</div>
+    <div class="label">Avg Timing Match</div>
   </div>
 </div>
 
@@ -730,24 +748,18 @@ a:hover { text-decoration: underline; }
   <div class="card-body" style="padding:0;">
     <table>
       <thead>
-        <tr><th>Scenario</th><th>Description</th><th>Match</th><th style="min-width:140px;">Bar</th><th>Divergences</th><th>Status</th></tr>
+        <tr><th>Scenario</th><th>Sequence Match</th><th>Timing Match<br><span style="font-size:12px;font-weight:500;color:var(--muted);">(events within 0.5s)</span></th><th>Status</th></tr>
       </thead>
       <tbody>
       {% for r in summary_similarity_rows %}
         <tr>
           <td><a href="#{{ r.scenario_id }}">{{ r.scenario_id }}</a></td>
-          <td>{{ r.notes.split('\n')[0][:80] if r.notes else '' }}</td>
           <td style="font-weight:600;{% if r.thrown_out %} color:var(--muted);{% elif r.match_percentage is not none and r.match_percentage >= 95 %} color:var(--pass);{% elif r.match_percentage is not none and r.match_percentage >= 80 %} color:var(--warn);{% elif r.match_percentage is not none %} color:var(--fail);{% endif %}">
             {{ '&mdash;' if r.thrown_out else ('%.1f%%'|format(r.match_percentage) if r.match_percentage is not none else '&mdash;') }}
           </td>
-          <td>
-            {% if r.match_percentage is not none and not r.thrown_out %}
-            <div class="match-bar-wrap">
-              <div class="match-bar"><div class="match-bar-fill {{ 'high' if r.match_percentage >= 95 else ('med' if r.match_percentage >= 80 else 'low') }}" style="width:{{ [r.match_percentage, 100]|min }}%"></div></div>
-            </div>
-            {% endif %}
+          <td style="font-weight:600;{% if r.thrown_out or r.timing_match_percentage is none %} color:var(--muted);{% elif r.timing_match_percentage >= 90 %} color:var(--pass);{% elif r.timing_match_percentage >= 80 %} color:var(--warn);{% else %} color:var(--fail);{% endif %}">
+            {{ '&mdash;' if r.thrown_out else ('%.1f%%'|format(r.timing_match_percentage) if r.timing_match_percentage is not none else '&mdash;') }}
           </td>
-          <td>{{ r.num_divergences }}</td>
           <td><span class="badge {{ 'warn' if r.thrown_out else ('pass' if r.passed else 'fail') }}">{{ 'THROWN OUT' if r.thrown_out else ('PASS' if r.passed else 'FAIL') }}</span></td>
         </tr>
       {% endfor %}
@@ -785,12 +797,12 @@ a:hover { text-decoration: underline; }
     <div class="card-header"><h2>Device Trends</h2></div>
     <div class="card-body" style="padding:0;">
       {% if clearance_trends or device_trends %}
-      <div style="padding:16px 20px 8px; font-weight:600;">Valid Timeline Events</div>
+      <div style="padding:16px 20px 8px; font-weight:600;">Clearance Interval Checks (Valid Timeline Events)</div>
       {% if clearance_trends %}
-      <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Counts clearance events whose duration is at least 0.1s above (&#8593;) or below (&#8595;) that movement's own median within each source run. Avg Dev is computed from each affected phase/overlap clearance interval's own median, then averaged across only the affected movement rows in this trend.</div>
+      <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total clearance events whose duration differs from that movement's own median by at least 0.1s. Overlap yellow/red rows are included here only when their median is at most 6.0s and at least 95% of samples are within 2.0s of that median.</div>
       <table class="trends-table">
         <thead>
-          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Irregular Count</th><th>{{ suite.firmware_version }}<br>Irregular Count</th><th>{{ suite.baseline_version }}<br>Avg Dev (s)</th><th>{{ suite.firmware_version }}<br>Avg Dev (s)</th><th>&#916; Avg Dev (s)</th><th>Devices</th></tr>
+          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Irregular Count</th><th>{{ suite.firmware_version }}<br>Irregular Count</th><th>&#916; Count</th><th>Devices</th></tr>
         </thead>
         <tbody>
         {% for trend in clearance_trends %}
@@ -798,9 +810,7 @@ a:hover { text-decoration: underline; }
             <td><span class="trend-chip">{{ trend.pattern }}</span></td>
             <td class="num">{{ trend.baseline_count }}</td>
             <td class="num">{{ trend.new_count }}</td>
-            <td class="num">{{ '%+.2f'|format(trend.avg_deviation_a) if trend.avg_deviation_a else '&mdash;' }}</td>
-            <td class="num">{{ '%+.2f'|format(trend.avg_deviation_b) if trend.avg_deviation_b else '&mdash;' }}</td>
-            <td class="num trend-delta {{ 'pos' if trend.avg_deviation_delta > 0 else ('neg' if trend.avg_deviation_delta < 0 else '') }}">{{ '%+.2f'|format(trend.avg_deviation_delta) if trend.avg_deviation_delta else '&mdash;' }}</td>
+            <td class="num trend-delta {{ 'pos' if trend.count_delta > 0 else ('neg' if trend.count_delta < 0 else '') }}">{{ '%+d'|format(trend.count_delta) if trend.count_delta != 0 else '&mdash;' }}</td>
             <td>{{ trend.devices }}</td>
           </tr>
         {% endfor %}
@@ -809,7 +819,7 @@ a:hover { text-decoration: underline; }
       {% endif %}
 
       {% if device_trends %}
-      <div style="padding:16px 20px 8px; font-weight:600;">Preempt / Transition / Ped Trends</div>
+      <div style="padding:16px 20px 8px; font-weight:600;">Signal / Operational Trends</div>
       <table class="trends-table">
         <thead>
           <tr><th>Type</th><th>Avg<br>Delta (s)</th><th>Total Count<br>Delta</th><th>Devices</th></tr>
@@ -818,7 +828,7 @@ a:hover { text-decoration: underline; }
         {% for trend in device_trends %}
           <tr class="trend-row {{ trend.row_class }}">
             <td><span class="trend-chip">{{ trend.pattern }}</span></td>
-            <td class="num trend-delta {{ 'pos' if trend.avg_duration_delta > 0 else ('neg' if trend.avg_duration_delta < 0 else '') }}">{{ '%+.1f'|format(trend.avg_duration_delta) }}</td>
+            <td class="num trend-delta {{ 'pos' if trend.avg_duration_delta is not none and trend.avg_duration_delta > 0 else ('neg' if trend.avg_duration_delta is not none and trend.avg_duration_delta < 0 else '') }}">{{ '%+.1f'|format(trend.avg_duration_delta) if trend.avg_duration_delta is not none else '&mdash;' }}</td>
             <td class="num trend-delta {{ 'pos' if trend.total_count_delta > 0 else ('neg' if trend.total_count_delta < 0 else '') }}">{{ '%+d'|format(trend.total_count_delta) if trend.total_count_delta != 0 else '&mdash;' }}</td>
             <td>{{ trend.devices }}</td>
           </tr>
@@ -833,7 +843,7 @@ a:hover { text-decoration: underline; }
       <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total count of timeline rows where ATSPM marked the event as invalid (<code>IsValid = False</code>), grouped by main event type instead of movement number. The detailed device breakdowns and flagged charts below use only valid timeline rows.</div>
       <table class="trends-table">
         <thead>
-          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Invalid Count</th><th>{{ suite.firmware_version }}<br>Invalid Count</th><th>Devices</th></tr>
+          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Invalid Count</th><th>{{ suite.firmware_version }}<br>Invalid Count</th><th>&#916; Count</th><th>Devices</th></tr>
         </thead>
         <tbody>
         {% for row in integrity_rows %}
@@ -841,6 +851,7 @@ a:hover { text-decoration: underline; }
             <td>{{ row.type }}</td>
             <td class="num">{{ row.baseline_count }}</td>
             <td class="num">{{ row.new_count }}</td>
+            <td class="num trend-delta {{ 'pos' if row.count_delta > 0 else ('neg' if row.count_delta < 0 else '') }}">{{ '%+d'|format(row.count_delta) if row.count_delta != 0 else '&mdash;' }}</td>
             <td>{{ row.devices }}</td>
           </tr>
         {% endfor %}
@@ -880,12 +891,20 @@ a:hover { text-decoration: underline; }
 
       <div class="meta-grid">
         {% if row.thrown_out %}
-        <div><span class="label">Match:</span> <span class="val" style="color:var(--warn)">Thrown out</span></div>
+        <div><span class="label">Sequence Match:</span> <span class="val" style="color:var(--warn)">Thrown out</span></div>
         <div><span class="label">Reason:</span> <span class="val">{{ row.thrown_out_reason or 'All scored chunks fell below the input similarity threshold' }}</span></div>
         {% elif row.match_percentage is not none %}
-        <div><span class="label">Match:</span> <span class="val{% if row.match_percentage >= 95 %}" style="color:var(--pass){% elif row.match_percentage >= 80 %}" style="color:var(--warn){% else %}" style="color:var(--fail){% endif %}">{{ '%.1f%%'|format(row.match_percentage) }}</span></div>
+        <div><span class="label">Sequence Match:</span> <span class="val" style="color:{% if row.match_percentage >= 95 %}var(--pass){% elif row.match_percentage >= 80 %}var(--warn){% else %}var(--fail){% endif %}">{{ '%.1f%%'|format(row.match_percentage) }}</span></div>
         {% endif %}
-        <div><span class="label">Divergences:</span> <span class="val">{{ row.num_divergences }}</span></div>
+        {% if row.test_type == 'similarity' and not row.thrown_out %}
+        <div><span class="label">Timing Match:</span> <span class="val" style="color:{% if row.timing_match_percentage is none %}var(--muted){% elif row.timing_match_percentage >= 90 %}var(--pass){% elif row.timing_match_percentage >= 80 %}var(--warn){% else %}var(--fail){% endif %}">{{ '%.1f%%'|format(row.timing_match_percentage) if row.timing_match_percentage is not none else '&mdash;' }}</span></div>
+        {% if row.timing_p95_error_seconds is not none %}
+        <div><span class="label">Timing p95 error:</span> <span class="val">{{ '%.3fs'|format(row.timing_p95_error_seconds) }}</span></div>
+        {% endif %}
+        {% if row.timing_max_error_seconds is not none %}
+        <div><span class="label">Timing max error:</span> <span class="val">{{ '%.3fs'|format(row.timing_max_error_seconds) }}</span></div>
+        {% endif %}
+        {% endif %}
         <div><span class="label">Runs:</span> <span class="val">{{ row.runs_completed }} / {{ row.total_runs }}</span></div>
         {% if row.test_type == 'similarity' and row.sparkline_svg %}
         <div><span class="label">Included chunks:</span> <span class="val">{{ row.included_chunk_count }}</span></div>
@@ -924,19 +943,18 @@ a:hover { text-decoration: underline; }
           <summary style="cursor:pointer;font-weight:600;margin-bottom:6px;">Phase / Overlap Differences</summary>
           {% if row.timeline_difference_analysis_available and row.clearance_irregularities %}
           <div style="font-weight:600;margin:10px 0 6px;">Clearance Irregularities</div>
-          <div class="chart-note">Counts clearance events at least 0.1s above (&#8593;) or below (&#8595;) that movement's median within each source run.</div>
+          <div class="chart-note">Counts clearance events at least 0.1s away from that movement's median within each source run. Avg Dev is the signed average deviation of those irregular events from the median.</div>
           <table class="phase-table">
             <thead>
               <tr>
                 <th>Movement</th>
                 <th class="num">Median Orig (s)</th>
                 <th class="num">Median New (s)</th>
-                <th class="num">&#8593; Orig</th>
-                <th class="num">&#8593; New</th>
-                <th class="num">&#8593; Avg Dev (s)</th>
-                <th class="num">&#8595; Orig</th>
-                <th class="num">&#8595; New</th>
-                <th class="num">&#8595; Avg Dev (s)</th>
+                <th class="num">Irregular Orig</th>
+                <th class="num">Irregular New</th>
+                <th class="num">&Delta; Count</th>
+                <th class="num">Avg Dev Orig (s)</th>
+                <th class="num">Avg Dev New (s)</th>
               </tr>
             </thead>
             <tbody>
@@ -945,12 +963,11 @@ a:hover { text-decoration: underline; }
                 <td>{{ d.label }} {{ d.state }}</td>
                 <td class="num">{{ '%.1f'|format(d.median_a) }}</td>
                 <td class="num">{{ '%.1f'|format(d.median_b) }}</td>
-                <td class="num">{{ d.high_count_a if d.high_count_a else '&mdash;' }}</td>
-                <td class="num {{ 'pos' if d.high_count_b > d.high_count_a else ('neg' if d.high_count_b < d.high_count_a else '') }}">{{ d.high_count_b if d.high_count_b else '&mdash;' }}</td>
-                <td class="num">{{ '+%.2f'|format(d.high_avg_deviation_b) if d.high_count_b else '&mdash;' }}</td>
-                <td class="num">{{ d.low_count_a if d.low_count_a else '&mdash;' }}</td>
-                <td class="num {{ 'pos' if d.low_count_b > d.low_count_a else ('neg' if d.low_count_b < d.low_count_a else '') }}">{{ d.low_count_b if d.low_count_b else '&mdash;' }}</td>
-                <td class="num">{{ '-%.2f'|format(d.low_avg_deviation_b) if d.low_count_b else '&mdash;' }}</td>
+                <td class="num">{{ d.irregular_count_a }}</td>
+                <td class="num {{ 'pos' if d.irregular_count_b > d.irregular_count_a else ('neg' if d.irregular_count_b < d.irregular_count_a else '') }}">{{ d.irregular_count_b }}</td>
+                <td class="num trend-delta {{ 'pos' if d.irregular_count_delta > 0 else ('neg' if d.irregular_count_delta < 0 else '') }}">{{ '%+d'|format(d.irregular_count_delta) if d.irregular_count_delta != 0 else '&mdash;' }}</td>
+                <td class="num">{{ '%+.2f'|format(d.avg_deviation_a) if d.irregular_count_a else '&mdash;' }}</td>
+                <td class="num">{{ '%+.2f'|format(d.avg_deviation_b) if d.irregular_count_b else '&mdash;' }}</td>
               </tr>
             {% endfor %}
             </tbody>
@@ -1085,10 +1102,9 @@ a:hover { text-decoration: underline; }
       <tr><td>Manual analysis end time</td><td>{{ suite.analysis_end_time }}</td><td>Clock time used to stop TOD scenario analysis, using the run end date for overnight windows</td></tr>
       {% endif %}
       {% if suite.comparison_thresholds %}
-      <tr><td>Sequence DTW threshold</td><td>{{ suite.comparison_thresholds.sequence_threshold }}</td><td>Max normalised DTW distance for event-sequence similarity</td></tr>
-      <tr><td>Timing DTW threshold</td><td>{{ suite.comparison_thresholds.timing_threshold }}</td><td>Max normalised DTW distance for timing similarity</td></tr>
-      <tr><td>Match threshold</td><td>{{ suite.comparison_thresholds.match_threshold }}%</td><td>Minimum DTW match percentage to pass a scenario</td></tr>
+      <tr><td>Sequence match threshold</td><td>{{ suite.comparison_thresholds.match_threshold }}%</td><td>Minimum event-sequence match percentage to pass a scenario</td></tr>
       {% endif %}
+      <tr><td>Timing match threshold</td><td>90.0% within 0.5s</td><td>Minimum percentage of aligned matching event groups whose timing error is within 0.5 seconds</td></tr>
       <tr><td>Phase-call similarity threshold</td><td>{{ phase_call_similarity_threshold }}%</td><td>Vehicular phase-call input similarity below this value excludes a chunk from the device-level match average while leaving the chunk bar visible as a reliability sanity check</td></tr>
       </tbody>
     </table>
@@ -1131,6 +1147,7 @@ def generate_report(
           "scenario_id": row.scenario_id,
           "notes": row.notes,
           "match_percentage": row.match_percentage,
+          "timing_match_percentage": getattr(row, "timing_match_percentage", None),
           "num_divergences": row.num_divergences,
           "passed": row.passed,
           "thrown_out": is_thrown_out,
@@ -1156,6 +1173,24 @@ def generate_report(
     else:
       avg_match_display = f"{avg_match:.1f}%"
       avg_match_class = "pass" if avg_match >= 95 else ("neutral" if avg_match >= 80 else "fail")
+    timing_match_values = [
+      getattr(r, "timing_match_percentage", None)
+      for r in scored_similarity
+      if r.match_percentage is not None
+      and r.match_percentage >= 95.0
+      and getattr(r, "timing_match_percentage", None) is not None
+    ]
+    avg_timing_match = (
+      sum(timing_match_values) / len(timing_match_values)
+      if timing_match_values
+      else None
+    )
+    if avg_timing_match is None:
+      avg_timing_match_display = "&mdash;"
+      avg_timing_match_class = "neutral"
+    else:
+      avg_timing_match_display = f"{avg_timing_match:.1f}%"
+      avg_timing_match_class = "pass" if avg_timing_match >= 90 else ("neutral" if avg_timing_match >= 80 else "fail")
     phase_call_similarity_threshold = float(getattr(suite, "phase_call_similarity_threshold", getattr(suite, "detector_similarity_threshold", 90.0)))
     combined_phase_call_timeline_svg = _build_combined_phase_call_timeline(results, phase_call_similarity_threshold)
 
@@ -1189,6 +1224,9 @@ def generate_report(
                 "test_type": row.test_type.value,
                 "passed": row.passed,
                 "match_percentage": row.match_percentage,
+                "timing_match_percentage": getattr(row, "timing_match_percentage", None),
+                "timing_p95_error_seconds": getattr(row, "timing_p95_error_seconds", None),
+                "timing_max_error_seconds": getattr(row, "timing_max_error_seconds", None),
                 "thrown_out": is_thrown_out,
                 "thrown_out_reason": thrown_out_reason,
                 "num_divergences": row.num_divergences,
@@ -1203,7 +1241,7 @@ def generate_report(
                 "phase_differences": [
                   diff
                   for diff in _normalize_difference_rows(getattr(row, 'phase_differences', []))
-                  if str(diff.get('state', '')).strip() not in {'Yellow', 'Red'}
+                  if _include_phase_difference_detail(diff)
                 ],
                 "clearance_irregularities": _normalize_clearance_rows(getattr(row, 'clearance_irregularities', [])),
                 "operational_differences": _normalize_difference_rows(getattr(row, 'operational_differences', [])),
@@ -1236,6 +1274,8 @@ def generate_report(
         total_count=total_count,
         avg_match_display=avg_match_display,
         avg_match_class=avg_match_class,
+        avg_timing_match_display=avg_timing_match_display,
+        avg_timing_match_class=avg_timing_match_class,
         phase_call_similarity_threshold=phase_call_similarity_threshold,
         combined_phase_call_timeline_svg=combined_phase_call_timeline_svg,
         summary_similarity_rows=summary_similarity_rows,
@@ -1244,7 +1284,7 @@ def generate_report(
         integrity_rows=integrity_rows,
         detail_rows=detail_rows,
         version=version,
-        generated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        generated_at=datetime.now().strftime("%Y-%m-%d"),
     )
 
     output = Path(output_path)

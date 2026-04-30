@@ -71,6 +71,9 @@ class ScenarioResult:
     firmware_version: str
     passed: bool
     match_percentage: Optional[float] = None
+    timing_match_percentage: Optional[float] = None
+    timing_p95_error_seconds: Optional[float] = None
+    timing_max_error_seconds: Optional[float] = None
     num_divergences: int = 0
     conflicts_found: List[dict] = field(default_factory=list)
     runs_completed: int = 0

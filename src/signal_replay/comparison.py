@@ -160,6 +160,9 @@ class ComparisonResult:
     plot_path: Optional[str] = None
     # Timing analysis: stats on time differences between matched event groups
     timing_stats: Optional[Dict] = None
+    timing_match_percentage: Optional[float] = None
+    timing_p95_error_seconds: Optional[float] = None
+    timing_max_error_seconds: Optional[float] = None
     # How much time was trimmed from each sequence during alignment
     alignment_trim_seconds_a: float = 0.0
     alignment_trim_seconds_b: float = 0.0
@@ -208,7 +211,13 @@ class ComparisonResult:
         if self.timing_stats:
             ts = self.timing_stats
             residual = ts.get('alignment_residual', 0.0)
-            lines.append(f"Timing: jitter std={ts['std_diff']:.3f}s, "
+            timing_match = self.timing_match_percentage
+            timing_match_text = (
+                f"Timing match={timing_match:.1f}%, "
+                if timing_match is not None
+                else ""
+            )
+            lines.append(f"Timing: {timing_match_text}"
                          f"max={ts['max_abs_diff']:.3f}s, "
                          f"95th pctl={ts['p95_abs_diff']:.3f}s"
                          + (f" (alignment residual={residual:+.1f}s)" if abs(residual) > 0.05 else ""))
@@ -986,11 +995,19 @@ def _analyze_timing(
             t_b = groups_b[j][0]
             timing_diffs.append(t_a - t_b)
     
+    stats = _summarize_timing_diffs(timing_diffs)
+    if stats is not None:
+        stats['n_total_path_steps'] = len(path)
+    return stats
+
+
+def _summarize_timing_diffs(timing_diffs: List[float]) -> Optional[Dict]:
+    """Summarize raw matched-group timing differences in seconds."""
     if len(timing_diffs) < 3:
         return None
-    
+
     raw_diffs = np.array(timing_diffs)
-    
+
     # The raw diffs include a constant offset from alignment granularity
     # (e.g., alignment trims to the nearest group boundary, leaving ~1s residual).
     # Subtract the median to isolate the actual timing jitter/variation.
@@ -1005,9 +1022,68 @@ def _analyze_timing(
         'max_abs_diff': float(np.max(abs_diffs)),  # Worst-case jitter
         'median_diff': float(np.median(diffs)),  # Should be ~0 after correction
         'p95_abs_diff': float(np.percentile(abs_diffs, 95)),
+        'match_within_0_5s': float((abs_diffs <= 0.5).mean() * 100.0),
         'n_matched_groups': len(timing_diffs),
-        'n_total_path_steps': len(path),
+        'n_total_path_steps': len(timing_diffs),
     }
+
+
+def _analyze_timing_from_chunks(
+    df_a: pd.DataFrame,
+    df_b: pd.DataFrame,
+    chunk_scores: List[ChunkScore],
+    phase_call_chunk_scores: Optional[List[PhaseCallChunkScore]] = None,
+    *,
+    group_tolerance: float = 0.0,
+    clip_sec: float = 60.0,
+) -> Optional[Dict]:
+    """Analyze timing from the same rolling chunks used for the official score."""
+    if not chunk_scores:
+        return None
+
+    phase_lookup = {
+        (round(cs.center_seconds, 6), round(cs.window_seconds, 6)): cs
+        for cs in (phase_call_chunk_scores or [])
+    }
+    timing_diffs: List[float] = []
+    total_path_steps = 0
+
+    for chunk in chunk_scores:
+        phase_chunk = phase_lookup.get((round(chunk.center_seconds, 6), round(chunk.window_seconds, 6)))
+        if phase_chunk is not None and phase_chunk.excluded_from_match:
+            continue
+
+        half_window = chunk.window_seconds / 2.0
+        c_start = max(0.0, chunk.center_seconds - half_window)
+        c_end = chunk.center_seconds + half_window
+
+        ca = df_a[(df_a['time_delta'] >= c_start) & (df_a['time_delta'] < c_end)].copy()
+        cb = df_b[(df_b['time_delta'] >= c_start) & (df_b['time_delta'] < c_end)].copy()
+        if ca.empty or cb.empty:
+            continue
+
+        ca['time_delta'] = ca['time_delta'] - c_start
+        cb['time_delta'] = cb['time_delta'] - c_start
+
+        ga = _group_events_by_timestamp(ca, tolerance=group_tolerance)
+        gb = _group_events_by_timestamp(cb, tolerance=group_tolerance)
+        if len(ga) < 5 or len(gb) < 5:
+            continue
+
+        dtw_r, _, dist_m = _dtw_with_jaccard(ga, gb)
+        total_path_steps += len(dtw_r.warping_path)
+        for i, j in dtw_r.warping_path:
+            t_a = ga[i][0]
+            t_b = gb[j][0]
+            if (t_a >= clip_sec and t_a <= (chunk.window_seconds - clip_sec)
+                    and t_b >= clip_sec and t_b <= (chunk.window_seconds - clip_sec)
+                    and dist_m[i, j] == 0.0):
+                timing_diffs.append(t_a - t_b)
+
+    stats = _summarize_timing_diffs(timing_diffs)
+    if stats is not None:
+        stats['n_total_path_steps'] = total_path_steps
+    return stats
 
 
 def find_alignment_offset(
@@ -2163,6 +2239,9 @@ def compare_runs(
             ),
             divergence_windows=[],
             match_percentage=0.0,
+            timing_match_percentage=None,
+            timing_p95_error_seconds=None,
+            timing_max_error_seconds=None,
             chunk_scores=[],
             phase_call_chunk_scores=[],
             included_chunk_count=0,
@@ -2374,6 +2453,22 @@ def compare_runs(
         groups_a,
         groups_b,
     )
+    if timing_stats is None and match_percentage >= 95.0 and settled_chunk_scores:
+        timing_stats = _analyze_timing_from_chunks(
+            df_a,
+            df_b,
+            settled_chunk_scores,
+            settled_phase_call_chunk_scores,
+            group_tolerance=group_tolerance,
+            clip_sec=60.0,
+        )
+    timing_match_percentage = None
+    timing_p95_error_seconds = None
+    timing_max_error_seconds = None
+    if match_percentage >= 95.0 and timing_stats:
+        timing_match_percentage = timing_stats.get('match_within_0_5s')
+        timing_p95_error_seconds = timing_stats.get('p95_abs_diff')
+        timing_max_error_seconds = timing_stats.get('max_abs_diff')
     
     # ===== TIMING DTW =====
     # DTW on the time-delta sequences (for backward compatibility).
@@ -2409,6 +2504,9 @@ def compare_runs(
         match_percentage=match_percentage,
         alignment_offset=alignment_offset,
         timing_stats=timing_stats,
+        timing_match_percentage=timing_match_percentage,
+        timing_p95_error_seconds=timing_p95_error_seconds,
+        timing_max_error_seconds=timing_max_error_seconds,
         alignment_trim_seconds_a=trim_seconds_a,
         alignment_trim_seconds_b=trim_seconds_b,
         chunk_scores=settled_chunk_scores,
@@ -2864,6 +2962,26 @@ def generate_phase_difference_summary(
     )
 
 
+def is_overlap_clearance_interval_candidate(
+    durations: pd.Series,
+    *,
+    max_median_seconds: float = 6.0,
+    centered_window_seconds: float = 2.0,
+    min_centered_fraction: float = 0.95,
+) -> bool:
+    """Return True when overlap yellow/red durations behave like fixed clearance timing."""
+    duration_values = pd.to_numeric(durations, errors='coerce').dropna().astype(float)
+    if duration_values.empty:
+        return False
+
+    median_seconds = float(duration_values.median())
+    if median_seconds > max_median_seconds:
+        return False
+
+    centered_fraction = float(((duration_values - median_seconds).abs() <= centered_window_seconds).mean())
+    return centered_fraction >= min_centered_fraction
+
+
 def generate_clearance_irregularity_summary(
     timeline_a: pd.DataFrame,
     timeline_b: pd.DataFrame,
@@ -2878,7 +2996,7 @@ def generate_clearance_irregularity_summary(
     """
 
     clearance_classes = {'Yellow', 'Red', 'Overlap Yellow', 'Overlap Red'}
-    overlap_clearance_median_threshold = 6.0
+    overlap_classes = {'Overlap Yellow', 'Overlap Red'}
 
     def _label_factory(event_class: str, event_value: int) -> str:
         if event_class in {'Yellow', 'Red'}:
@@ -2888,26 +3006,57 @@ def generate_clearance_irregularity_summary(
     def _state_factory(event_class: str) -> str:
         return event_class.replace('Overlap ', '')
 
-    def _compute_stats(timeline: pd.DataFrame) -> Dict:
+    def _prepare_filtered(timeline: pd.DataFrame) -> pd.DataFrame:
         filtered = timeline[timeline['EventClass'].isin(clearance_classes)].copy()
         if filtered.empty:
-            return {}
+            return filtered
 
         if 'Duration' not in filtered.columns or filtered['Duration'].isna().all():
             filtered['Duration'] = (filtered['EndTime'] - filtered['StartTime']).dt.total_seconds()
         filtered['Duration'] = pd.to_numeric(filtered['Duration'], errors='coerce')
-        filtered = filtered.dropna(subset=['Duration'])
+        return filtered.dropna(subset=['Duration'])
 
+    filtered_a = _prepare_filtered(timeline_a)
+    filtered_b = _prepare_filtered(timeline_b)
+
+    allowed_overlap_keys = set()
+    overlap_keys = set()
+    for filtered in (filtered_a, filtered_b):
+        if filtered.empty:
+            continue
+        for event_class, event_value in filtered[filtered['EventClass'].isin(overlap_classes)].groupby(['EventClass', 'EventValue'], dropna=False).groups:
+            value_int = int(float(event_value)) if pd.notna(event_value) else 0
+            overlap_keys.add((event_class, value_int))
+
+    for event_class, value_int in overlap_keys:
+        source_durations = []
+        for filtered in (filtered_a, filtered_b):
+            if filtered.empty:
+                continue
+            event_values = pd.to_numeric(filtered['EventValue'], errors='coerce')
+            if value_int == 0:
+                value_mask = event_values.fillna(0) == 0
+            else:
+                value_mask = event_values == value_int
+            durations = filtered[(filtered['EventClass'] == event_class) & value_mask]['Duration']
+            if not durations.empty:
+                source_durations.append(durations)
+        if source_durations and all(is_overlap_clearance_interval_candidate(durations) for durations in source_durations):
+            allowed_overlap_keys.add((event_class, value_int))
+
+    def _compute_stats(filtered: pd.DataFrame) -> Dict:
+        if filtered.empty:
+            return {}
         stats = {}
         for (event_class, event_value), group in filtered.groupby(['EventClass', 'EventValue'], dropna=False):
             if group.empty:
                 continue
             value_int = int(float(event_value)) if pd.notna(event_value) else 0
             key = (event_class, value_int)
+            if event_class in overlap_classes and key not in allowed_overlap_keys:
+                continue
             durations = group['Duration'].astype(float)
             median_seconds = float(durations.median())
-            if event_class in {'Overlap Yellow', 'Overlap Red'} and median_seconds >= overlap_clearance_median_threshold:
-                continue
             signed_devs = durations - median_seconds
             high_mask = signed_devs >= (threshold_seconds - 1e-9)
             low_mask = signed_devs <= -(threshold_seconds - 1e-9)
@@ -2944,8 +3093,8 @@ def generate_clearance_irregularity_summary(
         'anchor_end': None,
     }
 
-    stats_a = _compute_stats(timeline_a)
-    stats_b = _compute_stats(timeline_b)
+    stats_a = _compute_stats(filtered_a)
+    stats_b = _compute_stats(filtered_b)
     all_keys = sorted(set(stats_a.keys()) | set(stats_b.keys()))
 
     results = []

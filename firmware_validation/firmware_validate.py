@@ -41,6 +41,9 @@ from signal_replay.report import generate_report
 COLLECTED_DB_FILENAME = "collected.db"
 BaselineSource = Tuple[str, str]
 COORD_PATTERNS_DIR = Path(__file__).resolve().parent / "coord_patterns"
+SEQUENCE_MATCH_THRESHOLD = 95.0
+TIMING_MATCH_THRESHOLD = 90.0
+TIMING_MATCH_TOLERANCE_SECONDS = 0.5
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -1319,8 +1322,6 @@ def _treat_phase_diff_as_non_clearance_issue(
     diff: Dict[str, object],
     timeline_a: pd.DataFrame,
     timeline_b: pd.DataFrame,
-    *,
-    overlap_clearance_median_threshold: float = 6.0,
 ) -> bool:
     event_class = str(diff.get("event_class", "")).strip()
     if event_class in {"Green", "Overlap Green"}:
@@ -1338,12 +1339,17 @@ def _treat_phase_diff_as_non_clearance_issue(
         event_class,
         int(diff.get("event_value", 0) or 0),
     )
-    medians: List[float] = []
-    if not rows_a.empty:
-        medians.append(float(rows_a["Duration"].median()))
-    if not rows_b.empty:
-        medians.append(float(rows_b["Duration"].median()))
-    return bool(medians) and max(medians) >= overlap_clearance_median_threshold
+    overlap_sources = [
+        rows["Duration"]
+        for rows in (rows_a, rows_b)
+        if not rows.empty
+    ]
+    if not overlap_sources:
+        return False
+    return not all(
+        sr.comparison.is_overlap_clearance_interval_candidate(durations)
+        for durations in overlap_sources
+    )
 
 
 def _select_clearance_issue_spec(
@@ -1383,11 +1389,10 @@ def _select_clearance_issue_spec(
 
     peak_a = _peak(rows_a, label_a)
     peak_b = _peak(rows_b, label_b)
-    peaks = [peak for peak in (peak_a, peak_b) if peak is not None]
-    if not peaks:
+    if peak_b is None:
         return None
 
-    anchor = max(peaks, key=lambda item: abs(float(item["deviation"])))
+    anchor = peak_b
     detail_label = f"{str(row.get('label', '')).strip()} {str(row.get('state', '')).strip()}".strip()
     relation = "above" if float(anchor["deviation"]) >= 0 else "below"
 
@@ -1500,7 +1505,7 @@ def _generate_special_issue_plots(
     programmed_split_device_id = _resolve_coord_split_device_id(scenario_id, coord_split_schedules) if tod_align else None
 
     for row in clearance_irregularities:
-        if int(row.get("irregular_count_a", 0) or 0) <= 0 and int(row.get("irregular_count_b", 0) or 0) <= 0:
+        if int(row.get("irregular_count_b", 0) or 0) <= 0:
             continue
         key = ("clearance", row.get("event_class"), row.get("event_value"))
         if key in seen_keys:
@@ -1640,6 +1645,9 @@ def _compare_one_scenario(args: Tuple) -> dict:
             "scenario_id": scenario_id,
             "passed": False,
             "match_percentage": None,
+            "timing_match_percentage": None,
+            "timing_p95_error_seconds": None,
+            "timing_max_error_seconds": None,
             "num_divergences": 0,
             "summary": "",
             "error": _missing_collected_error(scenario_id, collected_db_path),
@@ -1771,7 +1779,10 @@ def _compare_one_scenario(args: Tuple) -> dict:
             if verbose:
                 print(f"    Timeline generation failed for {scenario_id}: {e}", flush=True)
 
-    passed = (not result.thrown_out) and result.match_percentage >= 95.0
+    timing_match = getattr(result, "timing_match_percentage", None)
+    sequence_passed = result.match_percentage >= SEQUENCE_MATCH_THRESHOLD
+    timing_passed = timing_match is not None and timing_match >= TIMING_MATCH_THRESHOLD
+    passed = (not result.thrown_out) and sequence_passed and timing_passed
     phase_diffs: list = []
     clearance_irregularities: list = []
     operational_diffs: list = []
@@ -1935,6 +1946,15 @@ def _compare_one_scenario(args: Tuple) -> dict:
         "test_type_str": test_type_str,
         "passed": passed,
         "match_percentage": result.match_percentage,
+        "timing_match_percentage": timing_match if sequence_passed else None,
+        "timing_p95_error_seconds": (
+            getattr(result, "timing_p95_error_seconds", None)
+            if sequence_passed else None
+        ),
+        "timing_max_error_seconds": (
+            getattr(result, "timing_max_error_seconds", None)
+            if sequence_passed else None
+        ),
         "num_divergences": len(result.divergence_windows),
         "summary": "\n".join(truncated_lines),
         "plot_paths": plot_paths,
@@ -2200,6 +2220,9 @@ def run_analysis(
                         firmware_version=firmware_version,
                         passed=out["passed"],
                         match_percentage=out["match_percentage"],
+                        timing_match_percentage=out.get("timing_match_percentage"),
+                        timing_p95_error_seconds=out.get("timing_p95_error_seconds"),
+                        timing_max_error_seconds=out.get("timing_max_error_seconds"),
                         num_divergences=out["num_divergences"],
                         error=out.get("error"),
                         notes=out["summary"],

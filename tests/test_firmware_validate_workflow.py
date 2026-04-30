@@ -866,6 +866,82 @@ def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_pat
     assert "Match: thrown out" in out["summary"]
 
 
+def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_path):
+    firmware_validate = _load_firmware_validate_module()
+
+    baseline = pd.DataFrame(
+        [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
+    )
+    collected = pd.DataFrame(
+        [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
+    )
+    empty_timeline = pd.DataFrame(columns=["EventClass", "StartTime", "EndTime"])
+
+    class FakeComparisonResult:
+        def __init__(self):
+            self.chunk_scores = [
+                firmware_validate.sr.ChunkScore(
+                    center_seconds=1350.0,
+                    match_percentage=100.0,
+                    window_seconds=2700.0,
+                )
+            ]
+            self.phase_call_chunk_scores = []
+            self.included_chunk_count = 1
+            self.excluded_chunk_count = 0
+            self.divergence_windows = []
+            self.match_percentage = 100.0
+            self.timing_match_percentage = 89.9
+            self.timing_p95_error_seconds = 0.75
+            self.timing_max_error_seconds = 2.0
+            self.temporal_shift_seconds = 0.0
+            self.thrown_out = False
+            self.thrown_out_reason = ""
+
+        def format_summary(self):
+            return "Match: 100.0%\nTiming: Timing match=89.9%, max=2.000s, 95th pctl=0.750s"
+
+    with (
+        patch.object(firmware_validate, "_load_baseline_events", return_value=baseline),
+        patch.object(firmware_validate, "_load_collected_events_from_duckdb", return_value=collected),
+        patch.object(
+            firmware_validate,
+            "_prepare_analysis_inputs",
+            return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 0)),
+        ),
+        patch("signal_replay.compare_runs", return_value=FakeComparisonResult()),
+        patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
+        patch("signal_replay.render_sparkline_svg", return_value=""),
+    ):
+        out = firmware_validate._compare_one_scenario(
+            (
+                "12035",
+                ("parquet", str(tmp_path / "12035.parquet")),
+                "2.15.1",
+                "SIMILARITY",
+                str(tmp_path / "collected.db"),
+                "2.17.3",
+                str(tmp_path / "plots"),
+                0.0,
+                0.0,
+                5,
+                15,
+                False,
+                "",
+                False,
+                None,
+                None,
+                90.0,
+            )
+        )
+
+    assert out["match_percentage"] == 100.0
+    assert out["timing_match_percentage"] == 89.9
+    assert out["timing_p95_error_seconds"] == 0.75
+    assert out["timing_max_error_seconds"] == 2.0
+    assert out["passed"] is False
+
+
 def test_main_report_only_fast_skips_device_csv_export(tmp_path):
     firmware_validate = _load_firmware_validate_module()
 

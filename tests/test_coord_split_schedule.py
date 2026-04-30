@@ -3,6 +3,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_module():
     path = Path(__file__).resolve().parents[1] / "firmware_validation" / "coord_split_schedule.py"
@@ -16,11 +18,18 @@ def _load_module():
 
 def _rows():
     module = _load_module()
+    path = _fixture_path()
+    return module.build_programmed_splits(path)
+
+
+def _fixture_path():
     path = (
         Path(__file__).resolve().parents[1]
         / "firmware_validation" / "coord_patterns" / "test.json"
     )
-    return module.build_programmed_splits(path)
+    if not path.exists():
+        pytest.skip(f"coord split fixture is not available: {path}")
+    return path
 
 
 def test_skips_free_time_and_clips_to_coord_start():
@@ -53,10 +62,7 @@ def test_convert_all_pattern_files_writes_csv_beside_each_json(tmp_path):
     module = _load_module()
     coord_dir = tmp_path / "coord_patterns"
     coord_dir.mkdir()
-    source = (
-        Path(__file__).resolve().parents[1]
-        / "firmware_validation" / "coord_patterns" / "test.json"
-    )
+    source = _fixture_path()
     (coord_dir / "sample.json").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
 
     results = module.convert_all_pattern_files(coord_dir)

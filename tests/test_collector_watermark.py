@@ -6,11 +6,27 @@ import pytest
 import requests
 from unittest.mock import patch
 
-from signal_replay.collector import DataCollector, check_conflicts
+from signal_replay.collector import DataCollector, _parse_controller_timestamps, check_conflicts
 
 
 def _sample_df(rows):
     return pd.DataFrame(rows, columns=["TimeStamp", "EventTypeID", "Parameter"])
+
+
+def test_controller_timestamps_parse_with_explicit_format():
+    parsed = _parse_controller_timestamps(
+        pd.Series([
+            "05-06-2026 07:25:35.6",
+            "05-06-2026 07:25:36.0",
+            "05-06-2026 07:25:37",
+        ])
+    )
+
+    assert parsed.tolist() == [
+        pd.Timestamp("2026-05-06 07:25:35.600000"),
+        pd.Timestamp("2026-05-06 07:25:36"),
+        pd.Timestamp("2026-05-06 07:25:37"),
+    ]
 
 
 def test_dedup_uses_timestamp_event_parameter_watermark():

@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 from .config import SignalConfig
 
+_CONTROLLER_TIMESTAMP_FORMAT = "%m-%d-%Y %H:%M:%S.%f"
+_CONTROLLER_TIMESTAMP_FORMAT_NO_FRACTION = "%m-%d-%Y %H:%M:%S"
+
 
 def _log_memory(label: str = "") -> None:
     """Log current process RSS memory usage."""
@@ -36,6 +39,37 @@ def _get_sql_template(filename: str) -> str:
     sql_dir = Path(__file__).parent / "sql"
     with open(sql_dir / filename, 'r') as f:
         return f.read()
+
+
+def _parse_controller_timestamps(values: pd.Series) -> pd.Series:
+    """Parse MAXTIME controller timestamps without relying on pandas inference."""
+    raw = values.astype("string")
+    parsed = pd.to_datetime(
+        raw,
+        format=_CONTROLLER_TIMESTAMP_FORMAT,
+        errors="coerce",
+    )
+
+    # Expected controller output includes fractional seconds, normally tenths.
+    # Keep an exact-second fallback for logs that omit the trailing ".0".
+    missing = parsed.isna() & raw.notna()
+    if missing.any():
+        parsed_no_fraction = pd.to_datetime(
+            raw[missing],
+            format=_CONTROLLER_TIMESTAMP_FORMAT_NO_FRACTION,
+            errors="coerce",
+        )
+        parsed.loc[missing] = parsed_no_fraction
+
+    bad = parsed.isna() & raw.notna()
+    if bad.any():
+        samples = raw[bad].head(5).tolist()
+        raise ValueError(
+            "Could not parse controller timestamps with known formats. "
+            f"Sample raw values: {samples}"
+        )
+
+    return parsed
 
 
 @dataclass
@@ -92,19 +126,20 @@ def fetch_output_data(
     df = pd.DataFrame(data)
     del data
     
+    raw_timestamps = df['TimeStamp'].copy()
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            df['TimeStamp'] = pd.to_datetime(df['TimeStamp'])
+            df['TimeStamp'] = _parse_controller_timestamps(raw_timestamps)
         for w in caught:
-            samples = df['TimeStamp'].head(5).tolist()
+            samples = raw_timestamps.head(5).tolist()
             logger.warning(
                 f"Datetime warning from {ip}:{http_port} ({len(df)} events): "
                 f"{w.message}\n"
                 f"  Sample raw values: {samples}"
             )
     except Exception:
-        samples = df['TimeStamp'].head(5).tolist()
+        samples = raw_timestamps.head(5).tolist()
         logger.warning(
             f"Datetime parsing failed for {ip}:{http_port}. "
             f"Sample TimeStamp values: {samples}"

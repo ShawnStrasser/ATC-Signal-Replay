@@ -278,6 +278,23 @@ class DatabaseManager:
                 else:
                     raise
         raise last_err  # type: ignore[misc]
+
+    @staticmethod
+    def _ensure_columns(
+        con: duckdb.DuckDBPyConnection,
+        table_name: str,
+        columns: Dict[str, str],
+    ) -> None:
+        """Add missing columns for pre-release DuckDB schemas."""
+        existing = {
+            row[1]
+            for row in con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+        }
+        for column_name, column_type in columns.items():
+            if column_name not in existing:
+                con.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                )
     
     def _init_database(self) -> None:
         """Initialize database tables if they don't exist."""
@@ -329,6 +346,75 @@ class DatabaseManager:
                     parameter INTEGER
                 )
             """)
+
+            # Detector input reference table used by adaptive latency calibration.
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS input_detector_events (
+                    device_id VARCHAR,
+                    timestamp TIMESTAMP,
+                    event_id INTEGER,
+                    parameter INTEGER
+                )
+            """)
+
+            latency_update_columns = {
+                "run_number": "INTEGER",
+                "update_id": "VARCHAR",
+                "device_id": "VARCHAR",
+                "updated_at": "TIMESTAMP",
+                "window_start": "TIMESTAMP",
+                "window_end": "TIMESTAMP",
+                "device_count": "INTEGER",
+                "sample_count": "INTEGER",
+                "required_min_samples": "INTEGER",
+                "previous_offset_seconds": "DOUBLE",
+                "measured_median_latency_seconds": "DOUBLE",
+                "target_offset_seconds": "DOUBLE",
+                "final_offset_seconds": "DOUBLE",
+                "transition_start": "TIMESTAMP",
+                "transition_end": "TIMESTAMP",
+                "applied": "BOOLEAN",
+                "status": "VARCHAR",
+                "reason": "VARCHAR",
+                "latency_p05_seconds": "DOUBLE",
+                "latency_p25_seconds": "DOUBLE",
+                "latency_p50_seconds": "DOUBLE",
+                "latency_p75_seconds": "DOUBLE",
+                "latency_p95_seconds": "DOUBLE",
+            }
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS latency_offset_updates ("
+                + ", ".join(
+                    f"{column_name} {column_type}"
+                    for column_name, column_type in latency_update_columns.items()
+                )
+                + ")"
+            )
+            self._ensure_columns(con, "latency_offset_updates", latency_update_columns)
+
+            latency_sample_columns = {
+                "run_number": "INTEGER",
+                "update_id": "VARCHAR",
+                "device_id": "VARCHAR",
+                "updated_at": "TIMESTAMP",
+                "source_timestamp": "TIMESTAMP",
+                "collected_timestamp": "TIMESTAMP",
+                "event_id": "INTEGER",
+                "parameter": "INTEGER",
+                "previous_offset_seconds": "DOUBLE",
+                "residual_seconds": "DOUBLE",
+                "measured_latency_seconds": "DOUBLE",
+                "match_delta_seconds": "DOUBLE",
+            }
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS latency_offset_samples ("
+                + ", ".join(
+                    f"{column_name} {column_type}"
+                    for column_name, column_type in latency_sample_columns.items()
+                )
+                + ")"
+            )
+            self._ensure_columns(con, "latency_offset_samples", latency_sample_columns)
 
             con.execute("""
                 CREATE TABLE IF NOT EXISTS simulation_runs (
@@ -554,6 +640,163 @@ class DatabaseManager:
             """)
         finally:
             con.close()
+
+    def insert_input_detector_events(self, df: pd.DataFrame, device_id: str) -> None:
+        """Store source detector input events for adaptive latency calibration."""
+        df = df.copy()
+        if not df.empty:
+            df['device_id'] = device_id
+
+            col_map = {}
+            for col in df.columns:
+                col_lower = col.lower()
+                if col_lower in ('timestamp', 'time_stamp'):
+                    col_map[col] = 'timestamp'
+                elif col_lower in ('event_id', 'eventid', 'eventtypeid'):
+                    col_map[col] = 'event_id'
+                elif col_lower in ('parameter', 'detector'):
+                    col_map[col] = 'parameter'
+
+            df = df.rename(columns=col_map)
+            df = df[['device_id', 'timestamp', 'event_id', 'parameter']]
+
+        con = self._connect_with_retry()
+        try:
+            con.execute("DELETE FROM input_detector_events WHERE device_id = ?", [device_id])
+            if not df.empty:
+                con.register('input_detector_df', df)
+                con.execute("""
+                    INSERT INTO input_detector_events
+                    SELECT * FROM input_detector_df
+                """)
+        finally:
+            con.close()
+
+    def insert_latency_offset_update(
+        self,
+        run_number: int,
+        update,
+        samples: Optional[pd.DataFrame] = None,
+    ) -> None:
+        """Store one adaptive latency offset update attempt and its matched samples."""
+        con = self._connect_with_retry()
+        try:
+            con.execute(
+                """
+                INSERT INTO latency_offset_updates (
+                    run_number,
+                    update_id,
+                    device_id,
+                    updated_at,
+                    window_start,
+                    window_end,
+                    device_count,
+                    sample_count,
+                    required_min_samples,
+                    previous_offset_seconds,
+                    measured_median_latency_seconds,
+                    target_offset_seconds,
+                    final_offset_seconds,
+                    transition_start,
+                    transition_end,
+                    applied,
+                    status,
+                    reason,
+                    latency_p05_seconds,
+                    latency_p25_seconds,
+                    latency_p50_seconds,
+                    latency_p75_seconds,
+                    latency_p95_seconds
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    run_number,
+                    getattr(update, "update_id", None),
+                    getattr(update, "device_id", None),
+                    update.updated_at,
+                    update.window_start,
+                    update.window_end,
+                    update.device_count,
+                    update.sample_count,
+                    update.required_min_samples,
+                    update.previous_offset_seconds,
+                    update.measured_median_latency_seconds,
+                    getattr(update, "target_offset_seconds", update.final_offset_seconds),
+                    update.final_offset_seconds,
+                    getattr(update, "transition_start", None),
+                    getattr(update, "transition_end", None),
+                    update.applied,
+                    update.status,
+                    update.reason,
+                    getattr(update, "latency_p05_seconds", None),
+                    getattr(update, "latency_p25_seconds", None),
+                    getattr(update, "latency_p50_seconds", None),
+                    getattr(update, "latency_p75_seconds", None),
+                    getattr(update, "latency_p95_seconds", None),
+                ],
+            )
+            if samples is not None and not samples.empty:
+                sample_df = samples.copy()
+                sample_df["run_number"] = run_number
+                sample_df["update_id"] = getattr(update, "update_id", None)
+                sample_df["device_id"] = getattr(update, "device_id", None)
+                sample_df["updated_at"] = update.updated_at
+                sample_df["previous_offset_seconds"] = update.previous_offset_seconds
+                sample_df = sample_df.rename(
+                    columns={"processing_latency_seconds": "measured_latency_seconds"}
+                )
+                sample_df = sample_df[
+                    [
+                        "run_number",
+                        "update_id",
+                        "device_id",
+                        "updated_at",
+                        "source_timestamp",
+                        "collected_timestamp",
+                        "event_id",
+                        "parameter",
+                        "previous_offset_seconds",
+                        "residual_seconds",
+                        "measured_latency_seconds",
+                        "match_delta_seconds",
+                    ]
+                ]
+                con.register("latency_samples_df", sample_df)
+                con.execute(
+                    """
+                    INSERT INTO latency_offset_samples (
+                        run_number,
+                        update_id,
+                        device_id,
+                        updated_at,
+                        source_timestamp,
+                        collected_timestamp,
+                        event_id,
+                        parameter,
+                        previous_offset_seconds,
+                        residual_seconds,
+                        measured_latency_seconds,
+                        match_delta_seconds
+                    )
+                    SELECT
+                        run_number,
+                        update_id,
+                        device_id,
+                        updated_at,
+                        source_timestamp,
+                        collected_timestamp,
+                        event_id,
+                        parameter,
+                        previous_offset_seconds,
+                        residual_seconds,
+                        measured_latency_seconds,
+                        match_delta_seconds
+                    FROM latency_samples_df
+                    """
+                )
+        finally:
+            con.close()
     
     def get_events(
         self,
@@ -633,6 +876,31 @@ class DatabaseManager:
         finally:
             con.close()
         return df
+
+    def get_input_detector_events(
+        self,
+        device_ids: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Retrieve source detector input events used for latency calibration."""
+        con = self._connect_with_retry()
+        try:
+            if device_ids:
+                placeholders = ",".join(["?"] * len(device_ids))
+                df = con.execute(
+                    f"""
+                    SELECT * FROM input_detector_events
+                    WHERE device_id IN ({placeholders})
+                    ORDER BY device_id, timestamp, event_id, parameter
+                    """,
+                    device_ids,
+                ).df()
+            else:
+                df = con.execute(
+                    "SELECT * FROM input_detector_events ORDER BY device_id, timestamp, event_id, parameter"
+                ).df()
+        finally:
+            con.close()
+        return df
     
     def clear_run_data(
         self,
@@ -657,12 +925,18 @@ class DatabaseManager:
                 where_sql = " WHERE " + " AND ".join(where_clauses)
                 con.execute(f"DELETE FROM events{where_sql}", params)
                 con.execute(f"DELETE FROM conflicts{where_sql}", params)
+                con.execute(f"DELETE FROM latency_offset_updates{where_sql}", params)
+                con.execute(f"DELETE FROM latency_offset_samples{where_sql}", params)
             elif run_number is not None:
                 con.execute("DELETE FROM events WHERE run_number = ?", [run_number])
                 con.execute("DELETE FROM conflicts WHERE run_number = ?", [run_number])
+                con.execute("DELETE FROM latency_offset_updates WHERE run_number = ?", [run_number])
+                con.execute("DELETE FROM latency_offset_samples WHERE run_number = ?", [run_number])
             else:
                 con.execute("DELETE FROM events")
                 con.execute("DELETE FROM conflicts")
+                con.execute("DELETE FROM latency_offset_updates")
+                con.execute("DELETE FROM latency_offset_samples")
         finally:
             con.close()
 
@@ -677,6 +951,7 @@ class DatabaseManager:
         con = self._connect_with_retry()
         try:
             con.execute(f"DELETE FROM input_events WHERE device_id IN ({placeholders})", device_ids)
+            con.execute(f"DELETE FROM input_detector_events WHERE device_id IN ({placeholders})", device_ids)
         finally:
             con.close()
 
@@ -690,6 +965,8 @@ class DatabaseManager:
         try:
             con.execute(f"DELETE FROM events WHERE device_id IN ({placeholders})", device_ids)
             con.execute(f"DELETE FROM conflicts WHERE device_id IN ({placeholders})", device_ids)
+            con.execute(f"DELETE FROM latency_offset_updates WHERE device_id IN ({placeholders})", device_ids)
+            con.execute(f"DELETE FROM latency_offset_samples WHERE device_id IN ({placeholders})", device_ids)
 
             has_comparison = con.execute("""
                 SELECT COUNT(*) FROM information_schema.tables
@@ -778,6 +1055,7 @@ class DataCollector:
         stop_event: threading.Event,
         conflict_callback: Optional[callable] = None,
         error_event: Optional[threading.Event] = None,
+        after_collect_callback: Optional[callable] = None,
     ) -> None:
         """
         Run continuous collection in a loop until stopped.
@@ -788,6 +1066,7 @@ class DataCollector:
             stop_event: Threading event to stop the loop
             conflict_callback: Optional callback when conflicts found
             error_event: Optional threading event set on fatal collection errors
+            after_collect_callback: Optional callback run after each successful poll
         """
         if self.debug:
             print(f"Starting collection loop for run {run_number}")
@@ -800,6 +1079,8 @@ class DataCollector:
                     conflict_callback=conflict_callback,
                     error_event=error_event,
                 )
+                if after_collect_callback is not None:
+                    after_collect_callback(datetime.now())
             except Exception as exc:
                 print(f"\n*** COLLECTION ERROR: {exc}")
                 print("Stopping data collection for this run.")

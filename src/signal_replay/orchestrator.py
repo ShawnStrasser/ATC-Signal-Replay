@@ -14,6 +14,7 @@ import pandas as pd
 from .config import SimulationConfig, SignalConfig
 from .replay import SignalReplay, create_replays
 from .collector import DatabaseManager, DataCollector, fetch_output_data, check_conflicts, _log_memory
+from .latency import AdaptiveLatencyOffsetManager
 from .comparison import (
     compare_all_runs, 
     format_comparison_summary, 
@@ -140,6 +141,9 @@ class ATCSimulation:
         snmp_retry_backoff_seconds: float = 0.25,
         show_progress_logs: bool = False,
         progress_log_interval_seconds: float = 60.0,
+        replay_latency_offset_lookback_min: Optional[float] = None,
+        replay_latency_offset_update_min: Optional[float] = None,
+        replay_latency_offset_min_samples: Optional[int] = None,
         comparison_thresholds: Optional[ComparisonThresholds] = None,
         output_dir: Optional[Union[str, Path]] = None,
         skip_comparison: bool = False,
@@ -218,6 +222,9 @@ class ATCSimulation:
                 snmp_retry_backoff_seconds=snmp_retry_backoff_seconds,
                 show_progress_logs=show_progress_logs,
                 progress_log_interval_seconds=progress_log_interval_seconds,
+                replay_latency_offset_lookback_min=replay_latency_offset_lookback_min,
+                replay_latency_offset_update_min=replay_latency_offset_update_min,
+                replay_latency_offset_min_samples=replay_latency_offset_min_samples,
             )
 
         if any(sig.tod_align for sig in self.config.signals) and self.config.simulation_speed != 1.0:
@@ -287,10 +294,17 @@ class ATCSimulation:
                 if comparison_events is not None and not comparison_events.empty:
                     # Data is already in the correct format (timestamp, event_id, parameter)
                     self.db.insert_input_events(comparison_events, signal_config.device_id)
+
+                detector_events = replay.get_source_detector_events(event_ids=[82])
+                self.db.insert_input_detector_events(detector_events, signal_config.device_id)
             finally:
                 replay.release_cached_data(keep_activation_feed=False)
     
-    def _run_single_signal(self, signal_config: SignalConfig) -> datetime:
+    def _run_single_signal(
+        self,
+        signal_config: SignalConfig,
+        latency_offset_provider: Optional[AdaptiveLatencyOffsetManager] = None,
+    ) -> datetime:
         """Run replay for a single signal and return start time."""
         replay = SignalReplay(
             signal_config,
@@ -301,6 +315,7 @@ class ATCSimulation:
             show_progress_logs=self.config.show_progress_logs,
             progress_log_interval_seconds=self.config.progress_log_interval_seconds,
             stop_event=self._stop_event,
+            latency_offset_provider=latency_offset_provider,
             debug=self.debug
         )
         try:
@@ -312,7 +327,10 @@ class ATCSimulation:
         """Request cooperative shutdown of collectors and replay workers."""
         self._stop_event.set()
     
-    def _run_all_signals(self) -> Tuple[Dict[str, datetime], List[str]]:
+    def _run_all_signals(
+        self,
+        latency_offset_provider: Optional[AdaptiveLatencyOffsetManager] = None,
+    ) -> Tuple[Dict[str, datetime], List[str]]:
         """
         Run replay for all signals in parallel and return start times.
         
@@ -327,7 +345,7 @@ class ATCSimulation:
         
         with ThreadPoolExecutor(max_workers=len(self.config.signals)) as executor:
             futures = {
-                executor.submit(self._run_single_signal, sig): sig.device_id
+                executor.submit(self._run_single_signal, sig, latency_offset_provider): sig.device_id
                 for sig in self.config.signals
             }
             
@@ -441,6 +459,10 @@ class ATCSimulation:
         else:
             print(f"Estimated duration per run: {duration_str} "
                   f"(computed in {time.time() - t0:.1f}s)")
+
+        adaptive_latency_enabled = bool(self.config.replay_latency_offset_lookback_min)
+        if adaptive_latency_enabled and not tod_mode:
+            raise ValueError("replay_latency_offset_lookback_min requires tod_align=True")
         
         # Build device configs for collector
         # Structure: {device_id: (ip_port, incompatible_pairs, http_port)}
@@ -493,10 +515,26 @@ class ATCSimulation:
             collection_error_event = threading.Event()
             
             # Start data collection in background thread
+            latency_manager = None
+            if adaptive_latency_enabled:
+                latency_manager = AdaptiveLatencyOffsetManager(
+                    db_manager=self.db,
+                    run_number=run_num,
+                    device_ids=[sig.device_id for sig in self.config.signals],
+                    initial_offset_seconds=self.config.signals[0].replay_latency_offset_seconds,
+                    lookback_minutes=float(self.config.replay_latency_offset_lookback_min),
+                    min_samples=self.config.replay_latency_offset_min_samples,
+                    debug=self.debug,
+                )
+
+            collection_kwargs: Dict[str, Any] = {"error_event": collection_error_event}
+            if latency_manager is not None:
+                collection_kwargs["after_collect_callback"] = latency_manager.update_after_poll
+
             collection_thread = threading.Thread(
                 target=collector.run_collection_loop,
                 args=(run_num, datetime.now(), run_stop_event, self._on_conflict_detected),
-                kwargs={"error_event": collection_error_event},
+                kwargs=collection_kwargs,
                 daemon=True
             )
             collection_thread.start()
@@ -504,7 +542,7 @@ class ATCSimulation:
             # Run all signals - this BLOCKS until all replays complete
             # No additional sleep needed since _run_all_signals waits for completion
             try:
-                start_times, failed_signals = self._run_all_signals()
+                start_times, failed_signals = self._run_all_signals(latency_manager)
             except KeyboardInterrupt:
                 self._finish_progress_line()
                 print("Keyboard interrupt received. Stopping active replays...")

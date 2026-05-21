@@ -165,6 +165,13 @@ class BatchRunner:
     def _shared_db_path(self) -> Path:
         return self.run_dir / "collected.db"
 
+    def _adaptive_latency_lookback_min(self) -> Optional[float]:
+        return (
+            self.suite.replay_latency_offset_lookback_min
+            if self.suite.replay_latency_offset_lookback_min is not None
+            else self.suite.replay_latency_offset_update_min
+        )
+
     def _clear_scenario_data(self, db_path: Path, scenario_ids: List[str]) -> None:
         """Delete persisted rows for the provided scenarios from a DuckDB file."""
         if not scenario_ids or not db_path.exists():
@@ -179,8 +186,20 @@ class BatchRunner:
                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
                 ).fetchall()
             }
-            for table in ("events", "conflicts", "comparison_results"):
+            for table in ("events", "conflicts", "comparison_results", "input_detector_events"):
                 if table in tables:
+                    con.execute(
+                        f"DELETE FROM {table} WHERE device_id IN ({placeholders})",
+                        scenario_ids,
+                    )
+            for table in ("latency_offset_updates", "latency_offset_samples"):
+                if table not in tables:
+                    continue
+                columns = {
+                    row[1]
+                    for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()
+                }
+                if "device_id" in columns:
                     con.execute(
                         f"DELETE FROM {table} WHERE device_id IN ({placeholders})",
                         scenario_ids,
@@ -231,6 +250,7 @@ class BatchRunner:
                 cycle_length=scenario.cycle_length,
                 cycle_offset=scenario.cycle_offset,
                 tod_align=scenario.tod_align,
+                replay_latency_offset_seconds=self.suite.replay_latency_offset_seconds,
             )
             object.__setattr__(signal_cfg, "events", scenario.events_source)
             signals.append(signal_cfg)
@@ -252,6 +272,8 @@ class BatchRunner:
             snmp_retry_backoff_seconds=self.suite.snmp_retry_backoff_seconds,
             show_progress_logs=self.suite.show_progress_logs,
             progress_log_interval_seconds=self.suite.progress_log_interval_seconds,
+            replay_latency_offset_lookback_min=self._adaptive_latency_lookback_min(),
+            replay_latency_offset_min_samples=self.suite.replay_latency_offset_min_samples,
             comparison_thresholds=self.suite.comparison_thresholds,
             output_dir=str(self.run_dir / "plots"),
             debug=self.debug,
@@ -296,6 +318,7 @@ class BatchRunner:
             cycle_length=scenario.cycle_length,
             cycle_offset=scenario.cycle_offset,
             tod_align=scenario.tod_align,
+            replay_latency_offset_seconds=self.suite.replay_latency_offset_seconds,
         )
         object.__setattr__(signal_cfg, "events", scenario.events_source)
 
@@ -315,6 +338,8 @@ class BatchRunner:
             snmp_retry_backoff_seconds=self.suite.snmp_retry_backoff_seconds,
             show_progress_logs=self.suite.show_progress_logs,
             progress_log_interval_seconds=self.suite.progress_log_interval_seconds,
+            replay_latency_offset_lookback_min=self._adaptive_latency_lookback_min(),
+            replay_latency_offset_min_samples=self.suite.replay_latency_offset_min_samples,
             comparison_thresholds=self.suite.comparison_thresholds,
             output_dir=str(self.run_dir / "plots"),
             debug=self.debug,

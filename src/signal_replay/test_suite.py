@@ -54,6 +54,9 @@ class FirmwareTestSuite:
     snmp_retry_backoff_seconds: float = 0.25
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
+    replay_latency_offset_lookback_min: Optional[float] = None
+    replay_latency_offset_update_min: Optional[float] = None
+    replay_latency_offset_min_samples: Optional[int] = None
 
     @property
     def detector_similarity_threshold(self) -> float:

@@ -47,3 +47,11 @@ firmware_validation/logs- test/
 dist/
 firmware_validation/logs*
 firmware_validation/coord_patterns/
+
+# Local timing monitor launcher and outputs
+run_system_clock_delta_monitor.bat
+time_delta_*_log.csv
+time_delta_*_chart.png
+time_delta_*_backup.csv
+pc_vs_odot_ntp_offset_pacific.png
+all_clock_offsets_pacific_static*.png

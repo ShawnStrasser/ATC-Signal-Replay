@@ -152,6 +152,10 @@ class SimulationConfig:
         snmp_retry_backoff_seconds: Delay between replay retry attempts
         show_progress_logs: If True, print periodic "Sent x/y events" progress logs
         progress_log_interval_seconds: Interval between replay progress logs
+        replay_latency_offset_lookback_min: If set, recalibrate replay latency after
+            each collector poll using this many minutes of recent sparse event 82 data.
+        replay_latency_offset_min_samples: Optional minimum matched event 82 samples
+            required before applying an adaptive latency update.
     """
     signals: List[SignalConfig]
     events: Union[pd.DataFrame, str, Path, None]
@@ -167,6 +171,9 @@ class SimulationConfig:
     snmp_retry_backoff_seconds: float = 0.25
     show_progress_logs: bool = False
     progress_log_interval_seconds: float = 60.0
+    replay_latency_offset_lookback_min: Optional[float] = None
+    replay_latency_offset_update_min: Optional[float] = None
+    replay_latency_offset_min_samples: Optional[int] = None
     
     def __post_init__(self):
         # Validate signals list
@@ -242,6 +249,41 @@ class SimulationConfig:
                 "progress_log_interval_seconds must be a positive number, "
                 f"got {self.progress_log_interval_seconds}"
             )
+
+        if self.replay_latency_offset_lookback_min is None and self.replay_latency_offset_update_min is not None:
+            self.replay_latency_offset_lookback_min = self.replay_latency_offset_update_min
+
+        if self.replay_latency_offset_lookback_min is not None:
+            if (
+                not isinstance(self.replay_latency_offset_lookback_min, (int, float))
+                or self.replay_latency_offset_lookback_min < 0
+            ):
+                raise ValueError(
+                    "replay_latency_offset_lookback_min must be a non-negative number or None, "
+                    f"got {self.replay_latency_offset_lookback_min}"
+                )
+            if self.replay_latency_offset_lookback_min == 0:
+                self.replay_latency_offset_lookback_min = None
+
+        if self.replay_latency_offset_update_min is not None:
+            if (
+                not isinstance(self.replay_latency_offset_update_min, (int, float))
+                or self.replay_latency_offset_update_min < 0
+            ):
+                raise ValueError(
+                    "replay_latency_offset_update_min must be a non-negative number or None, "
+                    f"got {self.replay_latency_offset_update_min}"
+                )
+
+        if self.replay_latency_offset_min_samples is not None:
+            if (
+                not isinstance(self.replay_latency_offset_min_samples, int)
+                or self.replay_latency_offset_min_samples < 1
+            ):
+                raise ValueError(
+                    "replay_latency_offset_min_samples must be a positive integer or None, "
+                    f"got {self.replay_latency_offset_min_samples}"
+                )
         
         # Validate db_path
         if not isinstance(self.db_path, str):

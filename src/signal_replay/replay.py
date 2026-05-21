@@ -10,7 +10,7 @@ import time
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Union, Optional, Tuple, List, Dict
+from typing import Union, Optional, Tuple, List, Dict, Any
 from importlib import resources
 from jinja2 import Template
 
@@ -48,6 +48,7 @@ class SignalReplay:
         show_progress_logs: bool = False,
         progress_log_interval_seconds: float = 60.0,
         stop_event: Optional[threading.Event] = None,
+        latency_offset_provider: Optional[Any] = None,
         debug: bool = False
     ):
         """
@@ -83,6 +84,7 @@ class SignalReplay:
         self.progress_log_interval_seconds = progress_log_interval_seconds
         self.debug = debug
         self._stop_event = stop_event or threading.Event()
+        self.latency_offset_provider = latency_offset_provider
         
         self.input_data: Optional[pd.DataFrame] = None
         self.activation_feed: Optional[pd.DataFrame] = None
@@ -143,8 +145,10 @@ class SignalReplay:
         if 'DeviceId' not in self.input_data.columns:
             self.input_data['DeviceId'] = self.device_id
 
-        # Advance replay scheduling to compensate for measured detector delivery latency.
-        self._apply_replay_latency_offset()
+        # Static mode shifts timestamps once up front. Adaptive TOD mode keeps
+        # source timestamps intact and subtracts the live offset while scheduling.
+        if self.latency_offset_provider is None:
+            self._apply_replay_latency_offset()
 
         # Apply time-window slicing if specified
         self._apply_time_window()
@@ -378,6 +382,35 @@ class SignalReplay:
             ].copy()
         
         return comparison_df.sort_values('timestamp').reset_index(drop=True)
+
+    def get_source_detector_events(self, event_ids: Optional[List[int]] = None) -> pd.DataFrame:
+        """Load source detector input events for adaptive latency calibration."""
+        if event_ids is None:
+            event_ids = [82]
+
+        events = self.config.events
+        if isinstance(events, pd.DataFrame):
+            detector_df = self._load_comparison_from_dataframe(events)
+        elif isinstance(events, pa.Table):
+            detector_df = self._load_comparison_from_dataframe(events.to_pandas())
+        elif isinstance(events, (str, Path)):
+            detector_df = self._load_comparison_from_path(str(events))
+        else:
+            raise ValueError(f"Unsupported events type: {type(events)}")
+
+        if detector_df.empty:
+            return pd.DataFrame(columns=['timestamp', 'event_id', 'parameter'])
+
+        detector_df = detector_df[detector_df['event_id'].isin(event_ids)].copy()
+        detector_df["parameter"] = pd.to_numeric(detector_df["parameter"], errors="coerce")
+        detector_df = detector_df[detector_df["parameter"] < 65].copy()
+
+        if self.input_buffer_start is not None:
+            detector_df = detector_df[
+                detector_df['timestamp'] >= self.input_buffer_start
+            ].copy()
+
+        return detector_df.sort_values('timestamp').reset_index(drop=True)
     
     def _load_comparison_from_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Load comparison events from a DataFrame."""
@@ -592,7 +625,17 @@ class SignalReplay:
             first_target = None
 
             # Pre-compute shifted timestamps to avoid slow per-row iteration
-            shifted_ts = pd.to_datetime(activation_feed['TimeStamp']) + date_shift
+            if self.latency_offset_provider is not None:
+                self.latency_offset_provider.set_device_date_shift(self.device_id, date_shift)
+
+            base_ts = pd.to_datetime(activation_feed['TimeStamp']) + date_shift
+            if self.latency_offset_provider is None:
+                shifted_ts = base_ts
+            else:
+                shifted_ts = base_ts - pd.to_timedelta(
+                    self.latency_offset_provider.get_offset(self.device_id),
+                    unit='s',
+                )
             mask = shifted_ts >= replay_start
             first_valid_idx = mask.idxmax() if mask.any() else None
 
@@ -624,13 +667,32 @@ class SignalReplay:
                     print(f"[{self.device_id}] Stop requested — halting replay after {sent_count} events", flush=True)
                     break
 
-                target_time = active_shifted.loc[idx].to_pydatetime()
+                if self.latency_offset_provider is None:
+                    target_time = active_shifted.loc[idx].to_pydatetime()
 
-                delay = (target_time - datetime.now()).total_seconds()
-                if delay > 0:
-                    if not await self._sleep_interruptibly(delay):
-                        print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
-                        break
+                    delay = (target_time - datetime.now()).total_seconds()
+                    if delay > 0:
+                        if not await self._sleep_interruptibly(delay):
+                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
+                            break
+                else:
+                    source_target = base_ts.loc[idx]
+                    while True:
+                        if self._stop_event.is_set():
+                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
+                            return
+
+                        live_offset = self.latency_offset_provider.get_offset(self.device_id)
+                        target_time = (
+                            source_target
+                            - pd.to_timedelta(live_offset, unit='s')
+                        ).round('us').to_pydatetime()
+                        delay = (target_time - datetime.now()).total_seconds()
+                        if delay <= 0:
+                            break
+                        if not await self._sleep_interruptibly(min(delay, 1.0)):
+                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
+                            return
 
                 await self._send_command(row, snmp_engine)
                 sent_count += 1

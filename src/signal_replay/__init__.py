@@ -60,10 +60,16 @@ from .test_suite import (
     FirmwareTestSuite,
     ScenarioResult,
 )
+from .latency import (
+    AdaptiveLatencyOffsetManager,
+    compute_latency_min_samples,
+    match_sparse_event82_latency,
+    sparse_detector_events,
+)
 from .batch_runner import BatchRunner, compare_firmware
 from .report import generate_report, load_annotations
 from .ntcip import send_ntcip, reset_all_detectors, async_send_ntcip, async_reset_all_detectors
-from . import collector, comparison, config, ntcip, orchestrator, replay, test_suite, batch_runner, report
+from . import collector, comparison, config, latency, ntcip, orchestrator, replay, test_suite, batch_runner, report
 
 __version__ = "0.2.0"
 __all__ = [
@@ -117,6 +123,10 @@ __all__ = [
     "compare_firmware",
     "generate_report",
     "load_annotations",
+    "AdaptiveLatencyOffsetManager",
+    "compute_latency_min_samples",
+    "match_sparse_event82_latency",
+    "sparse_detector_events",
     # NTCIP / SNMP
     "send_ntcip",
     "reset_all_detectors",

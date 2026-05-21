@@ -319,6 +319,28 @@ def test_build_included_event_periods_merges_overlapping_good_chunks():
     assert periods == [(600.0, 5100.0)]
 
 
+def test_build_included_event_periods_subtracts_excluded_chunk_overlap():
+    periods = build_included_event_periods(
+        [
+            ChunkScore(center_seconds=30.0, match_percentage=98.0, window_seconds=60.0),
+            ChunkScore(center_seconds=50.0, match_percentage=60.0, window_seconds=20.0),
+            ChunkScore(center_seconds=80.0, match_percentage=97.0, window_seconds=60.0),
+        ],
+        [
+            PhaseCallChunkScore(center_seconds=30.0, window_seconds=60.0, similarity_percentage=96.0),
+            PhaseCallChunkScore(
+                center_seconds=50.0,
+                window_seconds=20.0,
+                similarity_percentage=40.0,
+                excluded_from_match=True,
+            ),
+            PhaseCallChunkScore(center_seconds=80.0, window_seconds=60.0, similarity_percentage=94.0),
+        ],
+    )
+
+    assert periods == [(0.0, 40.0), (60.0, 110.0)]
+
+
 def test_clip_timeline_to_relative_periods_splits_rows_at_good_period_edges():
     base_time = datetime(2026, 4, 2, 9, 0, 0)
     timeline = _make_timeline([
@@ -343,6 +365,30 @@ def test_clip_timeline_to_relative_periods_splits_rows_at_good_period_edges():
         base_time + timedelta(seconds=10),
         base_time + timedelta(seconds=18),
     ]
+
+
+def test_clip_timeline_to_relative_periods_uses_analysis_base_timestamp():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline = _make_timeline([
+        {
+            "StartTime": base_time + timedelta(hours=1),
+            "EndTime": base_time + timedelta(hours=1, seconds=20),
+            "Duration": 20.0,
+            "EventClass": "Green",
+            "EventValue": 2,
+        }
+    ])
+
+    clipped = clip_timeline_to_relative_periods(
+        timeline,
+        [(3605.0, 3610.0)],
+        base_timestamp=base_time,
+    )
+
+    assert len(clipped) == 1
+    assert clipped.iloc[0]["Duration"] == 5.0
+    assert clipped.iloc[0]["StartTime"] == base_time + timedelta(hours=1, seconds=5)
+    assert clipped.iloc[0]["EndTime"] == base_time + timedelta(hours=1, seconds=10)
 
 
 def test_filter_divergence_windows_to_periods_keeps_only_good_period_divergences():
@@ -427,6 +473,21 @@ def test_render_sparkline_draws_phase_call_overlay_and_exclusion_legend():
     assert 'Phase-call similarity' in svg
     assert 'Excluded from match average (&lt; 90%)' in svg
     assert 'opacity="0.42"' in svg
+
+
+def test_render_sparkline_places_start_time_label_at_left_edge():
+    svg = render_sparkline_svg(
+        [
+            ChunkScore(
+                center_seconds=(9 * 3600) + (50 * 60) + (45 * 60 / 2),
+                match_percentage=62.7,
+                window_seconds=2700.0,
+            ),
+        ],
+        base_timestamp=datetime(2026, 5, 14, 0, 0, 0),
+    )
+
+    assert '<text x="64.0" y="200" font-size="12" fill="#5f6368" font-family="sans-serif" text-anchor="middle">09:50</text>' in svg
 
 
 def test_create_comparison_gantt_matplotlib_omits_transition_section_text():

@@ -158,7 +158,7 @@ class TestOrchestratorTimingWithMocks:
             simulation_replays=1,
             stop_on_conflict=False,
             db_path=temp_db_path,
-            simulation_speed=1.0
+            simulation_speed=1.0,
         )
         
         # Get expected duration from replay
@@ -168,7 +168,7 @@ class TestOrchestratorTimingWithMocks:
         expected_duration = replay.get_run_duration()
         
         start = time.time()
-        sim = sr.ATCSimulation(sim_config, debug=False)
+        sim = sr.ATCSimulation(sim_config, debug=False, skip_comparison=True)
         results = sim.run()
         actual_duration = time.time() - start
         
@@ -225,7 +225,7 @@ class TestOrchestratorTimingWithMocks:
             simulation_replays=num_runs,
             stop_on_conflict=False,
             db_path=temp_db_path,
-            simulation_speed=1.0
+            simulation_speed=1.0,
         )
         
         # Manually set events on signal config for replay duration calculation
@@ -235,7 +235,7 @@ class TestOrchestratorTimingWithMocks:
         expected_total = expected_per_run * num_runs
         
         start = time.time()
-        sim = sr.ATCSimulation(sim_config, debug=False)
+        sim = sr.ATCSimulation(sim_config, debug=False, skip_comparison=True)
         results = sim.run()
         actual_duration = time.time() - start
         
@@ -564,6 +564,66 @@ class TestSignalReplayTiming:
 
         assert mock_send.call_count == 1
         assert mock_send.call_args.kwargs["timeout"] == 2.0
+
+    @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
+    def test_tod_adaptive_replay_requests_offset_for_device_id(
+        self,
+        mock_send: AsyncMock,
+        mock_ip,
+        mock_port,
+    ):
+        class FakeLatencyProvider:
+            def __init__(self):
+                self.offset_calls = []
+                self.date_shifts = {}
+
+            def set_device_date_shift(self, device_id, date_shift):
+                self.date_shifts[device_id] = date_shift
+
+            def get_offset(self, device_id):
+                self.offset_calls.append(device_id)
+                return 0.0
+
+        provider = FakeLatencyProvider()
+        base_time = datetime.now() - timedelta(seconds=1)
+        events = pd.DataFrame(
+            [
+                {
+                    "timestamp": base_time,
+                    "event_id": 82,
+                    "parameter": 1,
+                    "device_id": "test",
+                },
+                {
+                    "timestamp": base_time + timedelta(milliseconds=100),
+                    "event_id": 81,
+                    "parameter": 1,
+                    "device_id": "test",
+                },
+            ]
+        )
+        config = sr.SignalConfig(
+            device_id="test",
+            ip=mock_ip,
+            udp_port=mock_port,
+            cycle_length=0,
+            incompatible_pairs=[],
+            tod_align=True,
+        )
+        config.events = events
+        replay = sr.SignalReplay(
+            config,
+            simulation_speed=1.0,
+            latency_offset_provider=provider,
+        )
+        replay.simulation_start_time = base_time - timedelta(milliseconds=50)
+
+        asyncio.run(replay._run_async_inner(replay.activation_feed, object()))
+
+        assert provider.date_shifts["test"] == timedelta(0)
+        assert provider.offset_calls
+        assert set(provider.offset_calls) == {"test"}
+        assert mock_send.call_count == len(replay.activation_feed)
 
 
 class TestReplayReliabilityWithMocks:

@@ -1668,6 +1668,32 @@ def _merge_time_periods(periods: List[Tuple[float, float]]) -> List[Tuple[float,
     return merged
 
 
+def _subtract_time_periods(
+    periods: List[Tuple[float, float]],
+    excluded_periods: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Subtract excluded periods from included periods."""
+    remaining = _merge_time_periods(periods)
+    excluded = _merge_time_periods(excluded_periods)
+    if not remaining or not excluded:
+        return remaining
+
+    for excluded_start, excluded_end in excluded:
+        next_remaining: List[Tuple[float, float]] = []
+        for start, end in remaining:
+            if excluded_end <= start or excluded_start >= end:
+                next_remaining.append((start, end))
+                continue
+            if start < excluded_start:
+                next_remaining.append((start, excluded_start))
+            if excluded_end < end:
+                next_remaining.append((excluded_end, end))
+        remaining = next_remaining
+        if not remaining:
+            break
+    return _merge_time_periods(remaining)
+
+
 def build_included_event_periods(
     chunk_scores: List[ChunkScore],
     phase_call_chunk_scores: Optional[List[PhaseCallChunkScore]] = None,
@@ -1675,10 +1701,12 @@ def build_included_event_periods(
     start_offset_seconds: float = 0.0,
     min_start_seconds: float = 0.0,
 ) -> Optional[List[Tuple[float, float]]]:
-    """Return merged inclusive periods for chunks that remain in the match average.
+    """Return merged periods for chunks that remain in the match average.
 
     The returned seconds are relative to the original analysis start for the
     selected run, not the post-alignment trimmed chunk origin.
+    When a phase-call chunk is excluded, its full start/end span is removed
+    from otherwise included windows, including any overlap with good chunks.
     """
     if not chunk_scores:
         return None
@@ -1689,17 +1717,19 @@ def build_included_event_periods(
     )
 
     periods: List[Tuple[float, float]] = []
+    excluded_periods: List[Tuple[float, float]] = []
     for idx, chunk in enumerate(chunk_scores):
-        if use_phase_filter and phase_call_chunk_scores[idx].excluded_from_match:
-            continue
         half_window = chunk.window_seconds / 2.0
         start_seconds = max(min_start_seconds, start_offset_seconds + chunk.center_seconds - half_window)
         end_seconds = start_offset_seconds + chunk.center_seconds + half_window
         if end_seconds < start_seconds:
             continue
+        if use_phase_filter and phase_call_chunk_scores[idx].excluded_from_match:
+            excluded_periods.append((start_seconds, end_seconds))
+            continue
         periods.append((start_seconds, end_seconds))
 
-    return _merge_time_periods(periods)
+    return _subtract_time_periods(periods, excluded_periods)
 
 
 def filter_divergence_windows_to_periods(
@@ -1727,6 +1757,8 @@ def filter_divergence_windows_to_periods(
 def clip_timeline_to_relative_periods(
     timeline: pd.DataFrame,
     periods: Optional[List[Tuple[float, float]]],
+    *,
+    base_timestamp: Optional[datetime] = None,
 ) -> pd.DataFrame:
     """Clip timeline intervals to the inclusive union of allowed relative periods."""
     if timeline.empty or periods is None:
@@ -1735,7 +1767,7 @@ def clip_timeline_to_relative_periods(
         return timeline.iloc[0:0].copy()
 
     clipped_rows: List[Dict[str, Any]] = []
-    base_start = pd.to_datetime(timeline['StartTime']).min()
+    base_start = pd.to_datetime(base_timestamp) if base_timestamp is not None else pd.to_datetime(timeline['StartTime']).min()
     merged_periods = _merge_time_periods(periods)
 
     for _, row in timeline.iterrows():
@@ -1747,7 +1779,7 @@ def clip_timeline_to_relative_periods(
         for period_start, period_end in merged_periods:
             overlap_start = max(rel_start, period_start)
             overlap_end = min(rel_end, period_end)
-            if overlap_end < overlap_start:
+            if overlap_end <= overlap_start:
                 continue
 
             clipped_row = row.to_dict()
@@ -2013,7 +2045,7 @@ def render_sparkline_svg(
         if base_timestamp is not None:
             domain_start_ts = base_timestamp + timedelta(seconds=domain_start)
             domain_end_ts = base_timestamp + timedelta(seconds=domain_end)
-            label_points = [(domain_start, domain_start_ts.strftime('%H:%M'))]
+            label_points = [(0.0, domain_start_ts.strftime('%H:%M'))]
 
             first_aligned_ts = domain_start_ts.replace(second=0, microsecond=0)
             rounded_seconds = int(first_aligned_ts.timestamp())
@@ -2022,7 +2054,7 @@ def render_sparkline_svg(
             while label_ts < domain_end_ts:
                 offset_seconds = (label_ts - domain_start_ts).total_seconds()
                 if offset_seconds > 0:
-                    label_points.append((domain_start + offset_seconds, label_ts.strftime('%H:%M')))
+                    label_points.append((offset_seconds, label_ts.strftime('%H:%M')))
                 label_ts += timedelta(seconds=step_s)
 
             if label_points[-1][0] < domain_span:

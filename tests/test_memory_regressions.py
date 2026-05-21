@@ -230,6 +230,33 @@ def test_database_manager_clear_run_data_can_scope_to_device_ids(temp_db_path):
                 ("S2", 1, pd.Timestamp("2026-01-01 12:00:02"), 1, 1),
             ],
         )
+        con.executemany(
+            """
+            INSERT INTO latency_offset_updates (
+                run_number, update_id, device_id, updated_at, sample_count, applied
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "u1", "S1", pd.Timestamp("2026-01-01 12:00:00"), 4, True),
+                (2, "u2", "S1", pd.Timestamp("2026-01-01 12:00:01"), 4, True),
+                (1, "u3", "S2", pd.Timestamp("2026-01-01 12:00:02"), 4, True),
+            ],
+        )
+        con.executemany(
+            """
+            INSERT INTO latency_offset_samples (
+                run_number, update_id, device_id, updated_at, source_timestamp,
+                collected_timestamp, event_id, parameter
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (1, "u1", "S1", pd.Timestamp("2026-01-01 12:00:00"), pd.Timestamp("2026-01-01 12:00:00"), pd.Timestamp("2026-01-01 12:00:00.3"), 82, 1),
+                (2, "u2", "S1", pd.Timestamp("2026-01-01 12:00:01"), pd.Timestamp("2026-01-01 12:00:01"), pd.Timestamp("2026-01-01 12:00:01.3"), 82, 1),
+                (1, "u3", "S2", pd.Timestamp("2026-01-01 12:00:02"), pd.Timestamp("2026-01-01 12:00:02"), pd.Timestamp("2026-01-01 12:00:02.3"), 82, 1),
+            ],
+        )
     finally:
         con.close()
 
@@ -240,10 +267,18 @@ def test_database_manager_clear_run_data_can_scope_to_device_ids(temp_db_path):
         remaining = con.execute(
             "SELECT device_id, run_number FROM events ORDER BY device_id, run_number"
         ).fetchall()
+        remaining_updates = con.execute(
+            "SELECT device_id, run_number FROM latency_offset_updates ORDER BY device_id, run_number"
+        ).fetchall()
+        remaining_samples = con.execute(
+            "SELECT device_id, run_number FROM latency_offset_samples ORDER BY device_id, run_number"
+        ).fetchall()
     finally:
         con.close()
 
     assert remaining == [("S1", 2), ("S2", 1)]
+    assert remaining_updates == [("S1", 2), ("S2", 1)]
+    assert remaining_samples == [("S1", 2), ("S2", 1)]
 
 
 def test_database_manager_rejects_old_events_schema(temp_db_path):

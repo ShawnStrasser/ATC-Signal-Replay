@@ -16,7 +16,7 @@
   #v(0.55in)
   #text(size: 15pt, weight: "bold")[#title]
   #v(0.42in)
-  #text(size: 11pt, weight: "bold")[Shawn Strasser, P.E.] \
+  #text(size: 11pt, weight: "bold")[Shawn Strasser, P.E., M.S.] \
   Traffic Signal Operations Engineer \
   Oregon Department of Transportation \
   ORCID: #link("https://orcid.org/0009-0004-5468-7669")[0009-0004-5468-7669] \
@@ -28,7 +28,7 @@
 
 #align(center)[#text(size: 12pt, weight: "bold")[Structured Abstract]]
 #v(0.18in)
-*Objectives.* Manual controller testing cannot reproduce a day of interacting vehicle, pedestrian, coordination, and preemption activity. This study evaluates whether recorded high-resolution field events can be replayed to test controllers and their output sequences automatically aligned and compared to identify operational differences.
+*Objectives.* This study evaluates whether recorded high-resolution field events from live traffic signal controllers can be replayed to test controllers and their output sequences automatically aligned and compared to identify operational differences.
 
 *Methods.* An open-source Python package converts high-resolution logs to National Transportation Communications for Intelligent Transportation Systems Protocol (NTCIP) calls and replays them to test controllers. Output events are grouped into sets of near-simultaneous events and aligned using dynamic time warping with Jaccard distance between event sets. It also checks clearances and incompatible phases and overlaps. Approximately 23 hours of events from each of 25 production configurations were replayed to controller emulators. Separate runs tested repeatability, known timing changes, and practical use for software-version acceptance.
 
@@ -36,7 +36,7 @@
 
 *Novelty.* The study combines replay of full-day events experienced by live field controllers with automatic alignment of operational-output sequences across numerous production timing configurations.
 
-*Practical Applications.* The open-source workflow expands acceptance testing beyond manual input toggling. Agencies can replay signal activity across many configurations, identify unexpected differences before field deployment, reproduce field failures, and test software or timing corrections against the same inputs. The Oregon Department of Transportation (ODOT) now uses the workflow for software-version acceptance.
+*Practical Applications.* The open-source workflow expands acceptance testing beyond manual input toggling. Agencies can replay signal activity across many configurations, identify unexpected differences before field deployment, reproduce field failures, and test software or timing corrections against the same inputs. The author now uses the workflow for software-version acceptance testing at the Oregon Department of Transportation (ODOT).
 #pagebreak()
 
 = Introduction
@@ -194,7 +194,7 @@ No new operation-impacting software defect was confirmed in MAXTIME version 2.18
 
 = Discussion
 
-ODOT now uses the method for controller-software acceptance. Its value is added test coverage: approximately 23 hours of interacting inputs are replayed across multiple production configurations while the software checks millions of output events. The repeatability results show that ordinary run-to-run variation is low enough for deliberate timing changes and software differences to remain visible.
+The author now uses the method for controller-software acceptance at ODOT. Its value is added test coverage: approximately 23 hours of interacting inputs are replayed across multiple production configurations while the software checks millions of output events. The repeatability results show that ordinary run-to-run variation is low enough for deliberate timing changes and software differences to remain visible.
 
 Field logs also capture combinations that are difficult to anticipate: simultaneous vehicle and pedestrian calls, time-of-day plan changes, coordination transitions, and preemption during actual traffic operation. A rare failure or flash event can be saved as a targeted replay, used to reproduce a reported problem, and then run again to test a vendor correction or timing workaround.
 
@@ -214,11 +214,11 @@ The method expands test coverage beyond manually selected inputs by replaying ac
 The results establish the feasibility of the underlying field-replay and event-alignment approach.
 = Acknowledgments
 
-The author thanks Chris Primm, State Traffic Operations Engineer, Oregon Department of Transportation, for reviewing the results and contributing ideas for testing.
+The author thanks Chris Primm, State Traffic Operations Engineer, Oregon Department of Transportation, for contributing ideas to the testing approach. The views expressed are those of the author and do not necessarily represent the views or policies of the Oregon Department of Transportation.
 
 = Code and Data Availability
 
-Signal-Replay is an open-source Python package. The study used repository version 0.2.0 from #link("https://github.com/ShawnStrasser/ATC-Signal-Replay")[GitHub]; version 0.1.0 is distributed through #link("https://pypi.org/project/signal-replay/")[PyPI]. The repository includes replay and comparison code, tests, documentation, and offline examples.
+The study used Signal-Replay version 0.2.0, an open-source Python package available from #link("https://github.com/ShawnStrasser/ATC-Signal-Replay")[GitHub] and #link("https://pypi.org/project/signal-replay/")[PyPI]. The repository includes replay and comparison code, tests, documentation, and offline examples.
 
 The repository includes a self-contained comparison-stage example for configuration 13008: saved MAXTIME 2.15.1 and 2.18.1 output events, comparison settings, expected results, and a reproduction script. Running the example regenerates the HTML report and verifies 98.6 percent sequence match and 96.6 percent timing match without controller hardware, firmware, or configuration databases. It reproduces comparison and report generation only; the original controller replay still requires controller/emulator software, configuration databases, and agency test infrastructure.
 = Generative AI Disclosure

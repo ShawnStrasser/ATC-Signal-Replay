@@ -1,0 +1,16 @@
+{
+  "scenario_id": "13008",
+  "baseline_version": "2.15.1",
+  "candidate_version": "2.18.1",
+  "status": "PASS",
+  "sequence_match_percent": 98.6,
+  "timing_match_percent": 96.6,
+  "comparison": {
+    "sequence_alert_threshold": 0.05,
+    "timing_alert_threshold": 0.02,
+    "pass_threshold_percent": 95.0,
+    "phase_call_reliability_percent": 85.0,
+    "group_tolerance_seconds": 0.25,
+    "analysis_start_time": "09:10"
+  }
+}

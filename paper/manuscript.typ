@@ -227,7 +227,10 @@ The author thanks Chris Primm, State Traffic Operations Engineer, Oregon Departm
 
 Signal-Replay is an open-source Python package available at #link("https://github.com/ShawnStrasser/ATC-Signal-Replay")[github.com/ShawnStrasser/ATC-Signal-Replay]. It includes replay and comparison code, tests, documentation, and an offline example. The final submission should cite release v0.2.0 or the exact public commit. A comparison-only data bundle can include replay inputs, collected outputs, parameters, and expected results without controller firmware or proprietary configuration databases.
 
+The repository now includes a self-contained saved-output example for configuration 13008. After cloning, a reviewer can regenerate and verify its HTML comparison report without controller hardware, firmware, or configuration databases. Reproducing the original controller replay still requires controller/emulator software, configuration databases, and agency test infrastructure.
 = Generative AI Disclosure
+
+
 
 Generative artificial intelligence tools, including Claude Code and OpenAI Codex, were used to assist with software development and review, data-analysis workflows, figure preparation, manuscript review, and document formatting. The author reviewed and tested the software, verified the cited sources and reported results, and accepts responsibility for the research methods, findings, interpretations, and final manuscript.
 #bibliography("references.bib", title: [References])

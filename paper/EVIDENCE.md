@@ -15,7 +15,7 @@
 | Automated clearance review detected a truncated overlap yellow during preemption | presentation slides 7 and 10; `short-overlap-yellow.png`; parameter report | The detected 3.0-second yellow was below ODOT's 3.5-second review threshold and the 4.0-second median for that signal phase; it motivated the overlap clearance-setting test. |
 | Virtual conflict monitor found no incompatible outputs | `src/signal_replay/collector.py:154-246`; `sql/load_conflict_events.sql`; `conflict_pairs.json`; three stored `conflicts` tables | 863 defined incompatible pairs across 21 configurations; zero stored conflicts in all campaigns. This is a software screen, not certified cabinet monitoring. |
 | Parallel replay reduces staff operation | `src/signal_replay/orchestrator.py:330-366`; README; author operational account | Signals run concurrently on available emulator targets; week-long automated execution is not a formal labor study. |
-| Software is open source | Git history; `CITATION.cff`; `README.md`; `examples/offline_comparison/` | Current local `main` is ahead of public GitHub. Cite a pushed release or exact final commit. |
+| Software and one comparison-stage example are public | Git history; `CITATION.cff`; `README.md`; `examples/offline_comparison/`; `paper/reproducibility/13008/` | The 13008 example commits both output streams, expected metrics, and a script that regenerates the HTML report; controller replay remains outside the public reproduction boundary. |
 
 ## Focused literature comparison
 
@@ -46,4 +46,4 @@ Do not claim novelty for automated controller testing, NTCIP testing, controller
 
 ## Reproduction boundary
 
-The stored databases and export script can support independent reproduction of the comparison and reporting stage. Reproducing event replay requires controller/emulator software, configuration databases, and agency infrastructure. The paper must keep that distinction explicit.
+The committed 13008 example independently reproduces one comparison and HTML report from saved output events. Reproducing the original event replay still requires controller/emulator software, configuration databases, and agency infrastructure. The paper keeps that distinction explicit.

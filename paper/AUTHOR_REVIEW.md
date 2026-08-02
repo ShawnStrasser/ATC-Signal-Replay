@@ -53,7 +53,7 @@ The author must still:
 
 ## Repository release
 
-Publish the source, tests, documentation, offline example, paper source/figures, and analysis scripts. After approval, publish a comparison-only bundle containing replay inputs, collected outputs, parameters, and expected results. Exclude controller firmware and proprietary `.bin` configurations. No deidentification is required based on the author's direction.
+The public repository now includes the source, tests, documentation, offline synthetic example, and a verified 13008 comparison-stage example with saved output events and expected results. A broader multi-configuration bundle remains optional. Exclude controller firmware and proprietary `.bin` configurations. No deidentification is required based on the author's direction.
 
 ## Build and validation
 

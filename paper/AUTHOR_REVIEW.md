@@ -3,39 +3,55 @@
 ## Current recommendation
 
 - **Title:** *Feasibility of Field-Derived High-Resolution Event Replay for Traffic-Signal Controller Testing*
-- **Research question:** Can high-resolution field events be replayed to test controllers and the resulting output sequences compared automatically for operational differences?
-- **Answer:** Yes. Separate unchanged campaigns averaged 99.6% sequence match and 97.7% timing match, while the method retained software and timing divergences.
-- **Contribution:** An open-source workflow that replaces much manual input toggling with full-day, parallel testing of production configurations; DTW alignment; clearance, pedestrian, preemption, and transition diagnostics; and a software-based virtual conflict monitor.
-- **Novelty:** The reviewed literature did not identify prior work combining long-duration field-derived input replay with complete output-trace alignment across numerous production configurations.
+- **Research question:** Can real high-resolution events experienced by live field controllers be replayed to test controllers and the resulting outputs compared automatically for operational differences?
+- **Answer:** Yes. Independent unchanged campaigns averaged 99.6% sequence match and 97.7% timing match, demonstrating that the outputs were deterministic enough for automatic alignment. Known timing changes and a confirmed preemption bug fix remained visible.
+- **Contribution:** An open-source workflow that substantially enhances manual testing with full-day, parallel testing of production configurations; DTW alignment; clearance, pedestrian, preemption, and transition checks; and a virtual conflict monitor.
+- **Novelty:** The reviewed literature did not identify prior work combining replay of full-day events actually experienced by live field controllers with complete output-sequence alignment across numerous production configurations.
+- **Operational use:** ODOT now uses the workflow for controller-software acceptance.
 - **Submission option:** Presentation and Publication, if the paper is not published or under review elsewhere.
 
 ## Verified findings
 
-- 25 field logs contain 7,296,218 records and 574.998 configuration-hours, approximately 23 hours per signal. Each campaign contains 627,240 replay commands.
-- All 11 unchanged configurations passed across separate version 2.18.1 campaigns: 99.6% mean sequence match (99.1--100.0%) and 97.7% mean timing match (90.6--99.7%).
-- Eleven of 14 configurations with applicable trailing-overlap edits were flagged; none of the 11 unchanged configurations was flagged.
-- Version 2.15.1 versus 2.18.1 produced 19 aggregate passes and six review cases. Configuration 12036 likely failed because peer-to-peer operation was not configured correctly in the test environment.
-- Detailed diagnostics confirmed the version 2.18.1 rail-preemption exit fix at 13008, a faster short-way transition at 2B049, a possible state-reporting issue at 2B049, and consistent expected dynamic red-clear extension at 13008.
+- The 25 field logs contain 7,296,218 records: approximately 23 hours per controller, or 575 hours summed across all controllers. Each campaign contains 627,240 replay commands.
+- All 11 unchanged configurations passed across independent MAXTIME 2.18.1 campaigns: 99.6% mean sequence match (99.1--100.0%) and 97.7% mean timing match (90.6--99.7%).
+- Eleven of 14 configurations with applicable overlap clearance-setting changes were flagged; none of the 11 unchanged configurations was flagged.
+- MAXTIME 2.15.1 versus 2.18.1 produced 19 aggregate passes and six review cases. Configuration 12036 likely failed because peer-to-peer operation was not configured correctly in the test environment.
+- At 13008, the comparison confirmed that MAXTIME 2.18.1 corrected a bug that could leave the custom ODOT Preempt 6 function active after its input ended.
+- At 2B049, the aligned traces showed different short-way transition logic, but no operational difference was apparent. The trace also raised a possible transition-state reporting question.
+- The clearance check detected a 3.0-second overlap yellow during preemption, below ODOT's 3.5-second review threshold and the 4.0-second median for that signal phase.
 - The virtual conflict monitor evaluated 863 incompatible pairs across 21 configurations. The stored conflict tables contain zero conflicts in all three campaigns.
-- The exact DTW method is recorded in the manuscript: timestamp-grouped event sets, Jaccard local cost, monotone DTW, 45-minute windows advanced every 40 minutes, 60-second edge clips, and separate timing and phase-call reliability checks.
-- NTCIP 1202 provides the portable replay-input boundary. Other controller families still require an output adapter and event-code mapping.
+- Sequence DTW uses ordered event-group content, not timestamps, for its local cost. Timestamps define simultaneous groups and initial alignment; timing is scored separately after sequence alignment.
+- The adaptive latency calibration periodically matches scheduled isolated detector-on inputs to controller-recorded detector-on events and updates each controller's replay offset to account for workstation/controller clock drift.
+- NTCIP 1202 provides the controller-brand-neutral replay-input boundary. The current event-log collector reads MAXTIME logs and can be extended to other controller types.
 
 ## Author decisions required
 
-1. Confirm that the 14 changed/11 unchanged intervention grouping is the intended description. Transaction histories support it, but “trailing settings added to all overlaps” could be read as applying to all 25 configurations.
-2. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
-3. Approve the case-study figures and the new `example_report.png` for publication.
-4. Confirm any required ODOT disclaimer or institutional approval.
-5. Choose the submission option and approve the generative-AI disclosure.
-6. Decide whether to publish the comparison-only dataset.
+1. Select the preferred Figure 2 explanation: panel **2a** (ordered groups), **2b** (timeline), or **2c** (alignment table). The other two should then be removed.
+2. Confirm that the 14 changed/11 unchanged intervention grouping is the intended description. Transaction histories support it, but the detailed edits are not yet marked author-verified in the intervention manifest.
+3. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
+4. Approve the case-study figures, captions, ODOT operational-use statement, and overlap/preemption interpretations.
+5. Confirm any required ODOT disclaimer or institutional approval.
+6. Choose the submission option and approve the generative-AI disclosure.
+7. Decide whether to publish the comparison-only dataset and whether to tag software release `v0.2.0`.
 
 ## Remaining substantive gaps
 
 - Five release-threshold review cases remain incompletely classified.
-- The planned parameter-sensitivity reruns have not been completed. This is a useful robustness improvement, but the same-software repeatability and intervention results already provide direct validation.
-- A final public software citation is needed: push the work and tag `v0.2.0`, or cite the exact final commit.
+- The planned one-factor parameter-sensitivity reruns have not been completed. This would improve the robustness evidence but is not necessary to establish feasibility.
+- A final public software citation is needed: push and tag `v0.2.0`, or cite the exact final public commit.
 
-No additional figure is required. If one more strong figure is available, the most useful would be the 13008 phase 4 dynamic red-clear example showing that the report flagged an irregular interval and both versions handled the configured extension consistently.
+No additional image is required. After the Figure 2 choice, the manuscript should become shorter.
+
+## TRB submission checklist actions
+
+The official two-page `2027-TRB-Annual-Meeting-Paper-Submission-Checklist.pdf` was reviewed on 2026-08-01. The manuscript satisfies the checkable document requirements: complete paper, transportation relevance, title-page fields, separate structured abstract with the five required headings, PDF, US Letter, one-inch margins, Times New Roman at 10 pt or larger, single column and spacing, page and line numbering, embedded tables/figures, no appendix, and author-year citations.
+
+The author must still:
+
+- Enter the same single author and author order in Editorial Manager.
+- Paste the identical structured abstract, including all five headings, into Editorial Manager.
+- Select the submission option and topic/category in Editorial Manager.
+- Complete final author and ODOT approval.
 
 ## Repository release
 
@@ -45,10 +61,12 @@ Publish the source, tests, documentation, offline example, paper source/figures,
 
 - Build: `typst compile paper/manuscript.typ paper/generated/trb-paper.pdf`
 - PDF: `paper/generated/trb-paper.pdf`
-- Page count: **10 pages**.
-- Abstract: approximately 253 words, below the 300-word limit.
-- All 10 pages rendered at 850 x 1100 pixels with no detected clipping or page-boundary contact.
-- Quantitative output validation passes, including the 25-row release/intervention counts and the 99.6%/97.7% repeatability means.
+- Page count: **12 pages**, including all three temporary Figure 2 alternatives.
+- Structured abstract: **296 words**.
+- PDF page size: 612 x 792 points (US Letter); no right-margin overflow was detected.
+- Extracted manuscript, table, workflow, and alignment-figure text is Times New Roman at 10 pt or larger. Natural mathematical subscripts are smaller.
+- The Experimental Design section and Table 2 now begin together on page 8; the table no longer splits across pages.
+- Quantitative output validation passes, including the 25-row release/intervention counts, 99.6%/97.7% repeatability means, and zero stored virtual conflicts.
 - Maintained package tests from the package update: **134 passed, 42 skipped**.
 
-The manuscript is close to submission-ready. The main research gap is the unresolved disposition of five release review cases; the remaining work is primarily author approval and public-release preparation.
+The manuscript is close to submission-ready but still requires the author decisions above.

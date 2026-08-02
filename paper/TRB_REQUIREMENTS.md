@@ -15,8 +15,25 @@ The title page must contain the title, author names, job titles, affiliations, e
 
 References use unnumbered Chicago author-date citations, alphabetized by first author. Use `(Author Year)` in text, include only cited sources, use hanging indentation, and include DOI links when available. Do not use superscript or numbered citations.
 
-TRB requires disclosure of generative-AI use at submission and, where appropriate, in the manuscript. The author remains responsible for checking every source, result, and statement. This project used OpenAI Codex for repository inspection, analysis-script drafting, figure generation, and manuscript drafting; the author must approve or revise the final disclosure.
+TRB requires disclosure of generative-AI use at submission and, where appropriate, in the manuscript. The author remains responsible for checking every source, result, and statement. This project used Claude Code and OpenAI Codex for software development and review, data-analysis workflows, figure preparation, manuscript review, and document formatting; the author must approve the final disclosure.
 
 The two submission options are Presentation-Only and Presentation and Publication. Presentation and Publication permits possible transfer to the Transportation Research Record and may be selected only when the paper is not published or under review elsewhere. Presentation-Only is appropriate if the author does not want TRR consideration or if the work is already published/under review. Accepted authors may later choose to post the full paper or a shortened title-page-plus-structured-abstract PDF in the online program.
 
 The current Editorial Manager page says the 2027 site is under development and not to use it for live submission. The official event page lists the meeting as January 10–14, 2027 and says submission is open July 1 through August 1. Verify the exact closing time in Editorial Manager immediately before submission.
+
+## 2027 checklist audit
+
+The official two-page `2027-TRB-Annual-Meeting-Paper-Submission-Checklist.pdf`, downloaded by the author, was reviewed on 2026-08-01. It confirms the requirements above and emphasizes that failure may result in desk rejection.
+
+Current manuscript checks:
+
+- Complete 12-page research paper, below the 20-page maximum.
+- Title page includes the paper title, single author, job title, affiliation, email address, and total page count.
+- Structured abstract is alone on page 2, contains the five headings in the required order, defines NTCIP on first use, and is 296 words.
+- PDF is US Letter with one-inch margins, one column, single spacing, Times New Roman at 10 pt or larger, line numbers restarting on every page, and bottom-centered page numbers.
+- Tables use 10-point Times New Roman and are embedded near their first citation. The Experimental Design table is not split across pages.
+- Figures are embedded near their first citation. Figure 2 temporarily contains three alternatives for author selection.
+- No appendix or supplemental-material section is included.
+- In-text citations use author-year form and the bibliography uses Chicago Author-Date style.
+
+Editorial Manager actions cannot be completed in the manuscript: enter the same author information, paste the identical structured abstract with all five headings, select the submission option and topic/category, and complete final author approval.

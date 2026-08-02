@@ -26,13 +26,12 @@
 
 ## Author decisions required
 
-1. Select the preferred Figure 2 explanation: panel **2a** (ordered groups), **2b** (timeline), or **2c** (alignment table). The other two should then be removed.
-2. Confirm that the 14 changed/11 unchanged intervention grouping is the intended description. Transaction histories support it, but the detailed edits are not yet marked author-verified in the intervention manifest.
-3. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
-4. Approve the case-study figures, captions, ODOT operational-use statement, and overlap/preemption interpretations.
-5. Confirm any required ODOT disclaimer or institutional approval.
-6. Choose the submission option and approve the generative-AI disclosure.
-7. Decide whether to publish the comparison-only dataset and whether to tag software release `v0.2.0`.
+1. Confirm that the 14 changed/11 unchanged intervention grouping is the intended description. Transaction histories support it, but the detailed edits are not yet marked author-verified in the intervention manifest.
+2. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
+3. Approve the case-study figures, captions, ODOT operational-use statement, and overlap/preemption interpretations.
+4. Confirm any required ODOT disclaimer or institutional approval.
+5. Choose the submission option and approve the generative-AI disclosure.
+6. Decide whether to publish the comparison-only dataset and whether to tag software release `v0.2.0`.
 
 ## Remaining substantive gaps
 
@@ -40,7 +39,7 @@
 - The planned one-factor parameter-sensitivity reruns have not been completed. This would improve the robustness evidence but is not necessary to establish feasibility.
 - A final public software citation is needed: push and tag `v0.2.0`, or cite the exact final public commit.
 
-No additional image is required. After the Figure 2 choice, the manuscript should become shorter.
+No additional image is required. Figure 2 now uses the selected timeline explanation.
 
 ## TRB submission checklist actions
 
@@ -61,11 +60,11 @@ Publish the source, tests, documentation, offline example, paper source/figures,
 
 - Build: `typst compile paper/manuscript.typ paper/generated/trb-paper.pdf`
 - PDF: `paper/generated/trb-paper.pdf`
-- Page count: **12 pages**, including all three temporary Figure 2 alternatives.
+- Page count: **11 pages**.
 - Structured abstract: **296 words**.
 - PDF page size: 612 x 792 points (US Letter); no right-margin overflow was detected.
 - Extracted manuscript, table, workflow, and alignment-figure text is Times New Roman at 10 pt or larger. Natural mathematical subscripts are smaller.
-- The Experimental Design section and Table 2 now begin together on page 8; the table no longer splits across pages.
+- The Experimental Design section and Table 2 begin together; the table does not split across pages.
 - Quantitative output validation passes, including the 25-row release/intervention counts, 99.6%/97.7% repeatability means, and zero stored virtual conflicts.
 - Maintained package tests from the package update: **134 passed, 42 skipped**.
 

@@ -13,7 +13,7 @@ Use three short paragraphs only: scripted automated controller tests; controller
 Describe the 23-hour field logs, event-to-NTCIP conversion, time-of-day replay, emulator accommodations, parallel batches, latency compensation, and event-log collector boundary. Figure 1 is the workflow; Table 1 maps vehicle, pedestrian, and preempt events.
 
 ## 4. Output alignment and automated checks
-Give the Jaccard and DTW equations, 45-minute/40-minute windowing, sequence/timing thresholds, and phase-call reliability screen. Explain clearance, pedestrian, preemption, and transition diagnostics. Give the virtual conflict monitor prominent treatment: 863 incompatible pairs across 21 configurations and zero stored conflicts. Figure 2 temporarily presents three alignment explanations for author selection; Figure 3 is `example_report.png`.
+Give the Jaccard and DTW equations, 45-minute/40-minute windowing, sequence/timing thresholds, and phase-call reliability screen. Explain clearance, pedestrian, preemption, and transition diagnostics. Give the virtual conflict monitor prominent treatment: 863 incompatible pairs across 21 configurations and zero stored conflicts. Figure 2 uses the selected timeline explanation of sequence alignment; Figure 3 is `example_report.png`.
 
 ## 5. Experimental design
 Define the 2.15.1-to-2.18.1 release comparison and the same-software overlap clearance-setting intervention. Table 2 contains only the essential design information.

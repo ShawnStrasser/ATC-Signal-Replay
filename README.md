@@ -21,6 +21,24 @@ Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian, and
 py -m pip install -e .
 ```
 
+## Paper reproducibility
+
+The paper includes a self-contained saved-output example for configuration
+13008. It reproduces comparison and HTML report generation without a
+controller, emulator, firmware, or private configuration database. The 16 MB
+committed CSV includes both the 2.15.1 baseline output and saved 2.18.1 output.
+
+```powershell
+py -m pip install -e . duckdb
+py paper/reproducibility/13008/reproduce_report.py
+```
+
+The command writes and verifies a self-contained HTML report. See
+[`paper/reproducibility/13008`](paper/reproducibility/13008/README.md) for the
+included data and the boundary between report reproduction and controller replay.
+
+
+
 ## Quick Start: Conflict Detection
 
 Replay events to a controller and monitor for phase conflicts:

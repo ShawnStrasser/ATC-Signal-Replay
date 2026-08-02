@@ -55,3 +55,4 @@ time_delta_*_chart.png
 time_delta_*_backup.csv
 pc_vs_odot_ntp_offset_pacific.png
 all_clock_offsets_pacific_static*.png
+firmware_validation/settings.json

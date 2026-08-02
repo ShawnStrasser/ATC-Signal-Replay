@@ -1,0 +1,5 @@
+﻿{
+  "software_release": {"configurations": 25, "passed": 19, "candidate_differences": 6, "average_sequence_match_percent": 96.2, "average_timing_match_percent": 93.8},
+  "parameter_intervention": {"changed_configurations": 14, "changed_flagged": 11, "changed_passed": 3, "unchanged_configurations": 11, "unchanged_flagged": 0, "unchanged_passed": 11},
+  "comparison_thresholds": {"sequence_match_percent": 95.0, "timing_match_percent": 90.0, "timing_tolerance_seconds": 0.5, "phase_call_reliability_percent": 85.0}
+}

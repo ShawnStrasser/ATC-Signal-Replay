@@ -1,0 +1,26 @@
+﻿scenario_id,parameter_changed,changed_parameter_names,changed_overlap_numbers,change_transaction_time,expected_comparison_group,author_verified
+01066,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+03013,false,"","","",unchanged,false
+05018,false,"","","",unchanged,false
+08042,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+08404,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+08411,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+12035,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+12036,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","5;6","2026-06-09 to 2026-06-15",changed,false
+12059,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+13008,false,"","","",unchanged,false
+13010,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2B009,false,"","","",unchanged,false
+2B045,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2B049,false,"","","",unchanged,false
+2B052,false,"","","",unchanged,false
+2B054,false,"","","",unchanged,false
+2B085,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2B094,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2B337,false,"","","",unchanged,false
+2B339,false,"","","",unchanged,false
+2B349,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2B530,false,"","","",unchanged,false
+2C009,false,"","","",unchanged,false
+2C042,true,"overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false
+2C043,true,"overlapAuxNewTrailYellow;overlapAuxNewRedRevert","multiple","2026-06-09 to 2026-06-15",changed,false

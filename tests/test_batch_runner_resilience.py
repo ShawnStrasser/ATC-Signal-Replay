@@ -154,6 +154,34 @@ def test_similarity_batch_passes_adaptive_latency_settings_to_simulation(tmp_pat
     runner.logger.handlers.clear()
 
 
+def test_similarity_batch_raises_when_simulation_reports_collection_error(tmp_path):
+    suite = _build_suite(tmp_path)
+    runner = sr.BatchRunner(suite, debug=False)
+
+    class FakeSimulation:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self):
+            return {"collection_error": True}
+
+    with patch.object(sr.batch_runner, "ATCSimulation", FakeSimulation):
+        try:
+            runner._run_similarity_batch(
+                suite.batches[0],
+                ["S1"],
+                db_loader_callback=lambda *_args: True,
+            )
+        except RuntimeError as exc:
+            assert "Data collection failed during similarity batch batch_1" in str(exc)
+        else:
+            raise AssertionError("Expected collection error to fail the batch")
+
+    for handler in runner.logger.handlers:
+        handler.close()
+    runner.logger.handlers.clear()
+
+
 def test_conflict_scenario_passes_suite_replay_latency_to_signal_config(tmp_path):
     suite = _build_suite(tmp_path)
     suite.scenarios[0].test_type = sr.TestType.CONFLICT
@@ -176,6 +204,35 @@ def test_conflict_scenario_passes_suite_replay_latency_to_signal_config(tmp_path
         )
 
     assert captured["signals"][0].replay_latency_offset_seconds == 1.55
+
+    for handler in runner.logger.handlers:
+        handler.close()
+    runner.logger.handlers.clear()
+
+
+def test_conflict_scenario_raises_when_simulation_reports_collection_error(tmp_path):
+    suite = _build_suite(tmp_path)
+    suite.scenarios[0].test_type = sr.TestType.CONFLICT
+    runner = sr.BatchRunner(suite, debug=False)
+
+    class FakeSimulation:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self):
+            return {"collection_error": True}
+
+    with patch.object(sr.batch_runner, "ATCSimulation", FakeSimulation):
+        try:
+            runner._run_conflict_scenario(
+                suite.batches[0],
+                "S1",
+                db_loader_callback=lambda *_args: True,
+            )
+        except RuntimeError as exc:
+            assert "Data collection failed during conflict scenario S1" in str(exc)
+        else:
+            raise AssertionError("Expected collection error to fail the scenario")
 
     for handler in runner.logger.handlers:
         handler.close()

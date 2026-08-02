@@ -39,6 +39,9 @@ def test_build_suite_uses_root_logs_for_replay_and_fallback_baseline_label(tmp_p
         "controller_targets": ["127.0.0.1:9701"],
         "firmware_version": "2.17.3",
         "baseline_version": "2.15.1",
+        "replay_latency_offset_seconds": 1.55,
+        "replay_latency_offset_lookback_min": 10.0,
+        "replay_latency_offset_min_samples": 24,
         "results_dir": "results",
         "comparison": {},
     }
@@ -48,6 +51,9 @@ def test_build_suite_uses_root_logs_for_replay_and_fallback_baseline_label(tmp_p
 
     assert suite.baseline_version == "2.15.1 (source logs)"
     assert suite.scenarios[0].events_source == str(root_log)
+    assert suite.replay_latency_offset_seconds == 1.55
+    assert suite.replay_latency_offset_lookback_min == 10.0
+    assert suite.replay_latency_offset_min_samples == 24
 
 
 def test_build_suite_zeroes_reported_settle_when_manual_start_replaces_it(tmp_path):
@@ -1643,32 +1649,10 @@ def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conf
     assert any(caption.startswith("Ped 8 Service: largest local mismatch window") for caption in plot_captions)
 
 
-def test_select_clearance_issue_spec_remains_median_based():
+def test_select_clearance_issue_spec_anchors_current_version_irregularity():
     firmware_validate = _load_firmware_validate_module()
 
     timeline_a = _build_issue_timeline(
-        [
-            {
-                "EventClass": "Yellow",
-                "EventValue": 4,
-                "StartTime": "2026-01-01 09:00:00",
-                "EndTime": "2026-01-01 09:00:05",
-            },
-            {
-                "EventClass": "Yellow",
-                "EventValue": 4,
-                "StartTime": "2026-01-01 09:10:00",
-                "EndTime": "2026-01-01 09:10:05",
-            },
-            {
-                "EventClass": "Yellow",
-                "EventValue": 4,
-                "StartTime": "2026-01-01 09:20:00",
-                "EndTime": "2026-01-01 09:20:09",
-            },
-        ]
-    )
-    timeline_b = _build_issue_timeline(
         [
             {
                 "EventClass": "Yellow",
@@ -1690,6 +1674,28 @@ def test_select_clearance_issue_spec_remains_median_based():
             },
         ]
     )
+    timeline_b = _build_issue_timeline(
+        [
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:00:00",
+                "EndTime": "2026-01-01 09:00:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:10:00",
+                "EndTime": "2026-01-01 09:10:05",
+            },
+            {
+                "EventClass": "Yellow",
+                "EventValue": 4,
+                "StartTime": "2026-01-01 09:20:00",
+                "EndTime": "2026-01-01 09:20:09",
+            },
+        ]
+    )
 
     issue_spec = firmware_validate._select_clearance_issue_spec(
         scenario_id="S1",
@@ -1698,6 +1704,7 @@ def test_select_clearance_issue_spec_remains_median_based():
             "state": "Yellow",
             "event_class": "Yellow",
             "event_value": 4,
+            "irregular_count_b": 1,
         },
         timeline_a=timeline_a,
         timeline_b=timeline_b,
@@ -1708,4 +1715,4 @@ def test_select_clearance_issue_spec_remains_median_based():
     assert issue_spec is not None
     assert issue_spec["start"] == pd.Timestamp("2026-01-01 09:20:00")
     assert issue_spec["end"] == pd.Timestamp("2026-01-01 09:20:09")
-    assert "2.15.1: 9.00s vs median 5.00s" in issue_spec["caption"]
+    assert "2.17.3: 9.00s vs median 5.00s" in issue_spec["caption"]

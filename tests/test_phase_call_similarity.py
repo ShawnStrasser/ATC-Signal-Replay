@@ -20,7 +20,7 @@ from signal_replay.comparison import (
     is_overlap_clearance_interval_candidate,
     render_sparkline_svg,
 )
-from signal_replay.report import generate_report
+from signal_replay.report import _flag_clearance_irregularity, _normalize_clearance_rows, generate_report
 from signal_replay.test_suite import (
     FirmwareTestSuite,
     ScenarioResult,
@@ -341,7 +341,7 @@ def test_build_included_event_periods_subtracts_excluded_chunk_overlap():
     assert periods == [(0.0, 40.0), (60.0, 110.0)]
 
 
-def test_clip_timeline_to_relative_periods_splits_rows_at_good_period_edges():
+def test_clip_timeline_to_relative_periods_keeps_rows_whole_when_overlapping_any_period():
     base_time = datetime(2026, 4, 2, 9, 0, 0)
     timeline = _make_timeline([
         {
@@ -355,16 +355,27 @@ def test_clip_timeline_to_relative_periods_splits_rows_at_good_period_edges():
 
     clipped = clip_timeline_to_relative_periods(timeline, [(5.0, 10.0), (12.0, 18.0)])
 
-    assert len(clipped) == 2
-    assert clipped["Duration"].tolist() == [5.0, 6.0]
-    assert clipped["StartTime"].tolist() == [
-        base_time + timedelta(seconds=5),
-        base_time + timedelta(seconds=12),
-    ]
-    assert clipped["EndTime"].tolist() == [
-        base_time + timedelta(seconds=10),
-        base_time + timedelta(seconds=18),
-    ]
+    assert len(clipped) == 1
+    assert clipped["Duration"].tolist() == [20.0]
+    assert clipped["StartTime"].tolist() == [base_time]
+    assert clipped["EndTime"].tolist() == [base_time + timedelta(seconds=20)]
+
+
+def test_clip_timeline_to_relative_periods_drops_rows_outside_all_periods():
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(seconds=4),
+            "Duration": 4.0,
+            "EventClass": "Green",
+            "EventValue": 2,
+        }
+    ])
+
+    clipped = clip_timeline_to_relative_periods(timeline, [(10.0, 20.0)])
+
+    assert clipped.empty
 
 
 def test_clip_timeline_to_relative_periods_uses_analysis_base_timestamp():
@@ -386,9 +397,9 @@ def test_clip_timeline_to_relative_periods_uses_analysis_base_timestamp():
     )
 
     assert len(clipped) == 1
-    assert clipped.iloc[0]["Duration"] == 5.0
-    assert clipped.iloc[0]["StartTime"] == base_time + timedelta(hours=1, seconds=5)
-    assert clipped.iloc[0]["EndTime"] == base_time + timedelta(hours=1, seconds=10)
+    assert clipped.iloc[0]["Duration"] == 20.0
+    assert clipped.iloc[0]["StartTime"] == base_time + timedelta(hours=1)
+    assert clipped.iloc[0]["EndTime"] == base_time + timedelta(hours=1, seconds=20)
 
 
 def test_filter_divergence_windows_to_periods_keeps_only_good_period_divergences():
@@ -678,6 +689,74 @@ def test_create_multi_divergence_plots_passes_programmed_splits_through(monkeypa
 
     assert len(paths) == 1
     assert captured["programmed_split_timeline"] is programmed_split_timeline
+
+
+def test_create_multi_divergence_plots_skips_divergences_without_min_context(monkeypatch, tmp_path):
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    timeline_a = _make_timeline([
+        {
+            "StartTime": base_time,
+            "EndTime": base_time + timedelta(minutes=10),
+            "EventClass": "Green",
+            "EventValue": 2,
+        },
+    ])
+    timeline_b = timeline_a.copy()
+    captured = []
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(sr.comparison, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+
+    result = sr.ComparisonResult(
+        device_id="2C043",
+        run_a="Original",
+        run_b="Replay",
+        sequence_dtw=sr.DTWResult(0.0, 0.0, [], 1, 1),
+        timing_dtw=sr.DTWResult(0.0, 0.0, [], 1, 1),
+        divergence_windows=[
+            sr.DivergenceWindow(
+                start_index_a=0,
+                end_index_a=0,
+                start_index_b=0,
+                end_index_b=0,
+                start_time_delta_a=330.0,
+                end_time_delta_a=340.0,
+                start_time_delta_b=330.0,
+                end_time_delta_b=340.0,
+                original_start_seconds_a=330.0,
+                original_end_seconds_a=340.0,
+                original_start_seconds_b=330.0,
+                original_end_seconds_b=340.0,
+            )
+        ],
+        match_percentage=100.0,
+    )
+
+    paths = sr.create_multi_divergence_plots(
+        timeline_a=timeline_a,
+        timeline_b=timeline_b,
+        comparison_result=result,
+        output_dir=tmp_path,
+        min_context_minutes=5.0,
+    )
+
+    assert paths == []
+    assert captured == []
+
+
+def test_report_clearance_rows_skip_new_version_zero_irregularities():
+    row = {
+        "label": "Ph 6",
+        "state": "Red",
+        "irregular_count_a": 1,
+        "irregular_count_b": 0,
+    }
+
+    assert _normalize_clearance_rows([row]) == []
+    assert _flag_clearance_irregularity(row) is None
 
 
 def test_phase_and_operational_summaries_are_split_by_event_class():

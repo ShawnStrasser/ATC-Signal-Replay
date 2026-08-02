@@ -158,6 +158,8 @@ def _normalize_clearance_rows(rows: List[dict]) -> List[Dict[str, Any]]:
         row["avg_deviation_b"] = _signed_clearance_avg_deviation(row, "b")
         row["sample_count_a"] = _as_int(row.get("sample_count_a"))
         row["sample_count_b"] = _as_int(row.get("sample_count_b"))
+        if row["irregular_count_b"] <= 0:
+            continue
         normalized.append(row)
     return normalized
 
@@ -258,7 +260,7 @@ def _flag_clearance_irregularity(row: Dict[str, Any]) -> Optional[Dict[str, Any]
     detail_label = f"{label} {state}".strip()
     count_a = _as_int(row.get("irregular_count_a"))
     count_b = _as_int(row.get("irregular_count_b"))
-    if count_a <= 0 and count_b <= 0:
+    if count_b <= 0:
         return None
 
     avg_deviation_a = _signed_clearance_avg_deviation(row, "a")
@@ -724,6 +726,10 @@ a:hover { text-decoration: underline; }
 </div>
 
 <div class="container">
+
+<div class="section-copy" style="max-width:none; margin:0 0 16px; padding:10px 14px; background:#f8f9fa; border-left:4px solid #80868b; border-radius:4px; font-size:13px;">
+  <strong>Chart note:</strong> bars drawn with a diamond hatch and dimmed fill represent intervals flagged invalid (missing or unreliable raw data) rather than blank gaps. They are shown for context but are excluded from similarity scoring and difference statistics; comparison windows that overlap invalid data are not flagged as divergences.
+</div>
 
 <!-- ===== Summary tiles ===== -->
 <div class="summary-grid">

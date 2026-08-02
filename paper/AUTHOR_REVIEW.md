@@ -36,7 +36,6 @@
 ## Remaining substantive gaps
 
 - Five release-threshold review cases remain incompletely classified.
-- The planned one-factor parameter-sensitivity reruns have not been completed. This would improve the robustness evidence but is not necessary to establish feasibility.
 - A final public software citation is needed: push and tag `v0.2.0`, or cite the exact final public commit.
 
 No additional image is required. Figure 2 now uses the selected timeline explanation.

@@ -72,7 +72,7 @@ def db_summary(path: Path, label: str) -> dict:
     con = duckdb.connect(str(path), read_only=True)
     tables = {row[0] for row in con.execute("show tables").fetchall()}
     out: dict[str, object] = {"label": label, "database": str(path), "sha256": sha256(path), "tables": ",".join(sorted(tables))}
-    for table in ["events", "input_events", "input_detector_events", "latency_offset_samples", "latency_offset_updates"]:
+    for table in ["events", "input_events", "input_detector_events", "latency_offset_samples", "latency_offset_updates", "conflicts"]:
         if table in tables:
             out[f"{table}_count"] = int(con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
         else:

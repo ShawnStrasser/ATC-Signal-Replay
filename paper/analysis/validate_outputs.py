@@ -13,6 +13,7 @@ def main() -> None:
         raise SystemExit("Missing generated outputs: " + ", ".join(missing))
     software = pd.read_csv(RESULTS / "software_release_results.csv")
     parameter = pd.read_csv(RESULTS / "parameter_intervention_results.csv")
+    datasets = pd.read_csv(RESULTS / "dataset_summary.csv")
     checks = {
         "software_rows": len(software) == 25,
         "software_passes": int((software.status == "PASS").sum()) == 19,
@@ -24,6 +25,7 @@ def main() -> None:
         "parameter_unchanged_flagged": int(parameter.loc[parameter.expected_comparison_group == "unchanged", "automatically_flagged"].sum()) == 0,
         "unchanged_sequence_mean": round(float(parameter.loc[parameter.expected_comparison_group == "unchanged", "sequence_match_percent"].mean()), 1) == 99.6,
         "unchanged_timing_mean": round(float(parameter.loc[parameter.expected_comparison_group == "unchanged", "timing_match_percent"].mean()), 1) == 97.7,
+        "all_campaign_conflicts_zero": int(datasets["conflicts_count"].sum()) == 0,
     }
     print(json.dumps(checks, indent=2))
     if not all(checks.values()):

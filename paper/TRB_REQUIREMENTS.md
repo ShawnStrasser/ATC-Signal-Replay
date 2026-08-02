@@ -1,4 +1,4 @@
-﻿# TRB 2027 requirements verified 2026-08-01
+# TRB 2027 requirements verified 2026-08-01
 
 Official sources reviewed:
 
@@ -9,9 +9,9 @@ Official sources reviewed:
 - [2027 Editorial Manager](https://www.editorialmanager.com/trbam/default.aspx)
 - [2027 Annual Meeting page](https://www.nationalacademies.org/events/887)
 
-The current author instructions require a PDF manuscript no longer than 20 pages, including title page, structured abstract, text, acknowledgments, references, figures, and tables. Editorial Manager's cover page is excluded from that count. The manuscript must be US Letter (8.5 x 11 in), use one-inch margins, Times New Roman at 10 pt or larger, single spacing, and one column. Line numbers are required and must restart at 1 on every page; page numbers are centered at the bottom. Tables and figures are embedded near the relevant text. Appendices and supplemental material are not permitted.
+The current author instructions require a PDF manuscript no longer than 20 pages, including title page, structured abstract, text, acknowledgments, references, figures, and tables. Editorial Manager's cover page is excluded from that count. The manuscript must be US Letter (8.5 x 11 in), use one-inch margins, Times New Roman at 10 pt or larger, single spacing, and one column. Line numbers are required on the manuscript and must restart at 1 on every page; page numbers are centered at the bottom. The line numbers may look visually intrusive, but they are an explicit desk-review requirement and should remain in the submission PDF. Tables and figures are embedded near the relevant text. Appendices and supplemental material are not permitted.
 
-The title page must contain the title, author names, job titles, affiliations, e-mail addresses, and total page count; ORCID is optional but encouraged. The title uses headline-style capitalization. A structured abstract appears on its own page immediately after the title page, with no other content, is at most 300 words, and uses these bold headings in this order: Objectives, Methods, Findings, Novelty, Practical Applications. It cannot contain figures, tables, equations, or undefined acronyms.
+The title page must contain the title, author names, job titles, affiliations, e-mail addresses, and total page count; ORCID is optional but encouraged. The title uses headline-style capitalization. The submission option or topical category is selected in Editorial Manager and is not listed among required title-page elements; it should not be printed on the title page. A structured abstract appears on its own page immediately after the title page, with no other content, is at most 300 words, and uses these bold headings in this order: Objectives, Methods, Findings, Novelty, Practical Applications. It cannot contain figures, tables, equations, or undefined acronyms.
 
 References use unnumbered Chicago author-date citations, alphabetized by first author. Use `(Author Year)` in text, include only cited sources, use hanging indentation, and include DOI links when available. Do not use superscript or numbered citations.
 

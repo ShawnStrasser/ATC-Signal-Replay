@@ -1,40 +1,45 @@
-﻿# Paper outline
+# Paper outline
 
 ## Title page
-Purpose: identify the study and satisfy TRB metadata requirements. Main claim: the paper evaluates a manufacturer-neutral replay-and-comparison method. Evidence: repository version history and experiment records. Missing: author names, titles, affiliations, e-mails, ORCIDs, acknowledgments, final page count.
+Purpose: provide only the TRB-required title and author information. Content: *Feasibility of Field-Derived High-Resolution Event Replay for Traffic-Signal Controller Testing*; Shawn Strasser, P.E.; job title, ODOT affiliation, email, and total page count. Do not print a submission category. ORCID is optional and omitted.
 
 ## Structured abstract
-Purpose: state the transportation problem, method, findings, cautious novelty, and practical use in the required headings. Evidence: the two 25-configuration comparisons and stored report summaries. Figure/table: none. Missing: author confirmation of wording and submission category.
+Purpose: answer the feasibility question in the five required headings. Main result: unchanged same-software campaigns averaged 99.6% sequence and 97.7% timing match; known changes were flagged without flags in unchanged configurations. No figure/table. Missing: final author approval of wording.
 
 ## 1. Introduction
-Purpose: motivate regression risk when signal software or timing parameters change and define the research question. Claim: field-derived replay can test behavior under operationally realistic inputs. Evidence: 25 approximately 23-hour field logs and three replay campaigns. Cite Li et al., Idaho report, Tung, and controller-testing literature.
+Purpose: explain why manual/scripted testing cannot reproduce a day of realistic field complexity. Main claim: high-resolution field logs can be treated as executable controller tests. Evidence: 25 approximately 23-hour traces and three replay campaigns. Define the two-part feasibility condition: repeatable alignment plus retained divergences.
 
-## 2. Related work
-Purpose: distinguish scripted controller tests, HIL/SIL/emulator testing, high-resolution logging, and sequence alignment from this combined evaluation. Claim: the contribution is the combination and scale, not a first claim for any component. Evidence: literature comparison in EVIDENCE.md. Figure/table: none.
+## 2. Prior work and research gap
+Purpose: directly distinguish the work from Ahmed/Li scripted testing, Tung NTCIP testing, Stevanovic logger/HILS evaluation, and Wang controller-in-the-loop work. Main claim: novelty lies in the combination of field-derived long-duration inputs and whole-output-trace regression, not any component. Table 1 summarizes the closest work. Missing: none beyond final reference proofreading.
 
-## 3. Field-event replay and comparison method
-Purpose: define input selection, NTCIP objects, latency compensation, output collection, event grouping, validity filtering, sequence and timing scores, and qualification thresholds. Claim: the method turns a long operational trace into repeatable behavioral comparisons. Evidence: `src/signal_replay`, `firmware_validation/firmware_validate.py`, committed tests, and `paper_config.toml`. Figure 1 workflow; Figure 2 illustrative alignment.
+## 3. Field-derived replay method
+Purpose: make the experiment understandable without the repository. Describe 9 a.m.--8 a.m. capture, event filtering, repeated-state imputation, eight-bit detector grouping, preempt Boolean calls, NTCIP objects, emulator preparation, time-of-day scheduling, latency compensation, output collection, and portability boundary. Figure 1 workflow; Table 2 input mapping. Evidence: replay SQL/Python, NTCIP module, stored databases, presentation.
 
-## 4. Experimental design
-Purpose: document 25 configurations, field-log duration, controller/emulator environment, two comparisons, and intervention manifest. Claim: the design separates release change from same-software timing intervention. Table 1 scope; Table 2 thresholds. Missing: author confirmation of detailed parameter transactions.
+## 4. Dynamic time warping comparison
+Purpose: explain and justify the actual math. Define timestamp event sets, Jaccard local distance, cumulative DTW recurrence, monotone path, 45-minute/40-minute rolling scoring, 60-second edge clip, sequence score, timing score, and phase-call reliability filter. Figure 2 alignment; Table 3 parameters. Evidence: `comparison.py` and archived report windows.
 
-## 5. Software-release results
-Purpose: report 2.15.1 versus 2.18.1 without treating failures as confirmed defects. Claim: 19/25 passed; six are candidate behavioral differences. Table 3 all configurations; Figure 3 scores. Evidence: archived report and extracted CSV.
+## 5. Experimental evaluation
+Purpose: separate the release screen from the controlled same-software intervention. Table 4 defines version 2.15.1 versus 2.18.1 and 2.18.1 versus parameter-modified 2.18.1. Missing: author confirmation of the 14/11 interpretation.
 
-## 6. Parameter-intervention results
-Purpose: test a known positive control with 2.18.1 unchanged versus modified trailing-overlap parameters. Claim: 11/14 changed configurations were flagged, while 11/11 unchanged configurations passed; three changed configurations passed and are exposure-sensitive cases, not automatic false negatives. Table 4; Figure 4.
+## 6. Results
+Order the evidence by strength:
 
-## 7. Discussion and practical use
-Purpose: interpret screening value, portability, and review workflow. Claim: the method is manufacturer-neutral at the NTCIP input boundary but adapters remain necessary for output logs. Evidence: code interfaces and results. Discuss triage, not certification.
+1. Repeatability: all 11 unchanged configurations passed; 99.6% mean sequence and 97.7% mean timing match.
+2. Parameter intervention: 11/14 applicable changes flagged and 0/11 unchanged flagged; Figure 3 and Table 5.
+3. Short-overlap-yellow case study: Figure 4.
+4. Software release: 19/25 pass; six review candidates; Table 6 and Figure 5.
+5. Rail-preemption bug fix and transition-state case studies: Figures 6 and 7.
+
+Missing: configuration IDs/timestamps for the three presentation figures and final classification of six release candidates.
+
+## 7. Discussion
+Purpose: explain why field replay is richer than manual testing, how incident traces can reproduce bugs and validate fixes, why a baseline is an executable oracle, why flags require engineering judgment, and how field realism trades off against controlled coverage. Explain that NTCIP makes the input boundary portable while output adapters remain product-specific.
 
 ## 8. Limitations
-Purpose: state emulator dependence, one agency/data source, one controller family adapter, archived-report reproduction rather than new replay, unrun sensitivity reruns, manual intervention verification, and unexplained software-release candidates. No appendix or supplement.
+Purpose: state one product family/emulator, one agency/day, emulator-specific configuration accommodations, exposure limitations, engineering rather than optimized thresholds, unrun sensitivity analysis, incomplete candidate classification, and replay-versus-offline-reproduction boundary.
 
 ## 9. Conclusions
-Purpose: answer the research question with the strongest defensible conclusion and identify next validation steps.
+Purpose: answer yes, with numerical evidence. State that DTW aligned most controller output while preserving operational divergences. Emphasize regression screening, timing-change evaluation, and targeted bug replication—not automatic certification.
 
-## Acknowledgments / Code and data availability / Generative-AI disclosure
-Purpose: document support, public package commit, candidate comparison dataset, and TRB-required AI disclosure. Missing: author-approved language and approvals.
-
-## References
-Purpose: Chicago author-date sources only; verify each DOI/URL against the original publication.
+## Acknowledgments, availability, AI disclosure, references
+Purpose: record agency context, open-source package and candidate data bundle, exact TRB AI disclosure, and 8 verified focused references. Missing: final acknowledgments/disclaimer, public release/commit citation, and author approval.

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import json
 from pathlib import Path
 import pandas as pd
@@ -22,6 +22,8 @@ def main() -> None:
         "parameter_unchanged": int((parameter.expected_comparison_group == "unchanged").sum()) == 11,
         "parameter_changed_flagged": int(parameter.loc[parameter.expected_comparison_group == "changed", "automatically_flagged"].sum()) == 11,
         "parameter_unchanged_flagged": int(parameter.loc[parameter.expected_comparison_group == "unchanged", "automatically_flagged"].sum()) == 0,
+        "unchanged_sequence_mean": round(float(parameter.loc[parameter.expected_comparison_group == "unchanged", "sequence_match_percent"].mean()), 1) == 99.6,
+        "unchanged_timing_mean": round(float(parameter.loc[parameter.expected_comparison_group == "unchanged", "timing_match_percent"].mean()), 1) == 97.7,
     }
     print(json.dumps(checks, indent=2))
     if not all(checks.values()):

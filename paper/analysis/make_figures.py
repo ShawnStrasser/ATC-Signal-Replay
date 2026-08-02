@@ -45,7 +45,7 @@ ax.grid(axis="y", alpha=.2); fig.tight_layout()
 fig.savefig(FIGURES / "parameter-intervention-summary.pdf", bbox_inches="tight"); plt.close(fig)
 
 # Simplified timeline view of sequence alignment and separate timing comparison.
-fig, ax = plt.subplots(figsize=(7.2, 3.2))
+fig, ax = plt.subplots(figsize=(7.2, 3.0))
 match_color = "#2f6f9f"
 extra_color = "#b04a4a"
 ref_y = 2.05
@@ -55,7 +55,7 @@ cand_times = [0.2, 4.4, 8.5]
 labels = ["Phase 2 green", "Phase 2 yellow", "Phase 2 red"]
 
 ax.set_xlim(-0.6, 9.2)
-ax.set_ylim(-0.85, 2.85)
+ax.set_ylim(-0.85, 2.75)
 ax.set_yticks([ref_y, cand_y], ["Reference", "Candidate"])
 ax.set_xlabel("Elapsed replay time (s)")
 ax.spines[["left", "right", "top"]].set_visible(False)
@@ -76,8 +76,7 @@ ax.text(extra_time, cand_y - .39, "Phase 6 call\n(additional)", ha="center", va=
 for ref_t, cand_t in zip(ref_times, cand_times):
     ax.plot([ref_t, cand_t], [ref_y - .27, cand_y + .27], color="#778899", linestyle="--", linewidth=1)
 
-ax.text(4.3, 2.72, "DTW aligns event groups by content; timestamps are compared after alignment.", ha="center", va="top", fontsize=11)
-fig.tight_layout()
+fig.tight_layout(pad=0.6)
 fig.savefig(FIGURES / "alignment-example.pdf", bbox_inches="tight")
 plt.close(fig)
 

@@ -10,7 +10,7 @@
 #show math.equation: set par.line(numbering: none)
 #set bibliography(style: "chicago-author-date")
 
-#let title = [Feasibility of Field-Derived High-Resolution Event Replay for Traffic-Signal Controller Testing]
+#let title = [Automated Traffic-Signal Controller Testing by Replaying Real-World High-Resolution Field Events]
 
 #align(center)[
   #v(0.55in)

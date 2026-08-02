@@ -2,7 +2,7 @@
 
 ## Current recommendation
 
-- **Title:** *Feasibility of Field-Derived High-Resolution Event Replay for Traffic-Signal Controller Testing*
+- **Title:** *Automated Traffic-Signal Controller Testing by Replaying Real-World High-Resolution Field Events*
 - **Research question:** Can real high-resolution events experienced by live field controllers be replayed to test controllers and the resulting outputs compared automatically for operational differences?
 - **Answer:** Yes. Independent unchanged campaigns averaged 99.6% sequence match and 97.7% timing match, demonstrating that the outputs were deterministic enough for automatic alignment. Known timing changes and a confirmed preemption bug fix remained visible.
 - **Contribution:** An open-source workflow that substantially enhances manual testing with full-day, parallel testing of production configurations; DTW alignment; clearance, pedestrian, preemption, and transition checks; and a virtual conflict monitor.

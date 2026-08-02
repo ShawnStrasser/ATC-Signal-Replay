@@ -1754,46 +1754,58 @@ def filter_divergence_windows_to_periods(
     return filtered
 
 
+def timeline_overlaps_interval(
+    timeline: Optional[pd.DataFrame],
+    start: datetime,
+    end: datetime,
+) -> bool:
+    """Return True when any row in timeline overlaps the [start, end] interval."""
+    if timeline is None or timeline.empty:
+        return False
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    if end_ts < start_ts:
+        start_ts, end_ts = end_ts, start_ts
+
+    row_start = pd.to_datetime(timeline['StartTime'])
+    row_end = pd.to_datetime(timeline['EndTime'])
+    return bool(((row_start < end_ts) & (row_end > start_ts)).any())
+
+
 def clip_timeline_to_relative_periods(
     timeline: pd.DataFrame,
     periods: Optional[List[Tuple[float, float]]],
     *,
     base_timestamp: Optional[datetime] = None,
 ) -> pd.DataFrame:
-    """Clip timeline intervals to the inclusive union of allowed relative periods."""
+    """Keep timeline intervals that overlap the allowed relative periods.
+
+    Rows are kept whole (never truncated) when they overlap an included
+    period. Slicing a row's Start/End down to the period boundary would
+    fabricate an artificially short duration for a signal-state interval
+    that merely started or ended near an excluded chunk edge, even though
+    the controller actually held that state for its full recorded duration.
+    """
     if timeline.empty or periods is None:
         return timeline.copy()
     if not periods:
         return timeline.iloc[0:0].copy()
 
-    clipped_rows: List[Dict[str, Any]] = []
     base_start = pd.to_datetime(base_timestamp) if base_timestamp is not None else pd.to_datetime(timeline['StartTime']).min()
     merged_periods = _merge_time_periods(periods)
 
-    for _, row in timeline.iterrows():
-        row_start = pd.to_datetime(row['StartTime'])
-        row_end = pd.to_datetime(row['EndTime'])
-        rel_start = (row_start - base_start).total_seconds()
-        rel_end = (row_end - base_start).total_seconds()
+    rel_start = (pd.to_datetime(timeline['StartTime']) - base_start).dt.total_seconds()
+    rel_end = (pd.to_datetime(timeline['EndTime']) - base_start).dt.total_seconds()
 
-        for period_start, period_end in merged_periods:
-            overlap_start = max(rel_start, period_start)
-            overlap_end = min(rel_end, period_end)
-            if overlap_end <= overlap_start:
-                continue
+    keep_mask = pd.Series(False, index=timeline.index)
+    for period_start, period_end in merged_periods:
+        keep_mask |= (rel_start < period_end) & (rel_end > period_start)
 
-            clipped_row = row.to_dict()
-            clipped_row['StartTime'] = base_start + pd.Timedelta(seconds=overlap_start)
-            clipped_row['EndTime'] = base_start + pd.Timedelta(seconds=overlap_end)
-            duration_seconds = max(0.0, overlap_end - overlap_start)
-            if 'Duration' in timeline.columns:
-                clipped_row['Duration'] = duration_seconds
-            clipped_rows.append(clipped_row)
-
-    if not clipped_rows:
+    if not keep_mask.any():
         return timeline.iloc[0:0].copy()
 
-    return pd.DataFrame(clipped_rows, columns=timeline.columns)
+    return timeline[keep_mask].copy()
 
 
 def render_sparkline_svg(
@@ -2869,7 +2881,7 @@ def generate_timeline(
             {
                 'name': 'has_data', 
                 'params': {
-                    'no_data_min': 1,           # Min minutes of data required per bin
+                    'no_data_min': 5,           # Min minutes of data required per bin
                     'min_data_points': 1        # Min events required per sub-bin
                 }
             },
@@ -2904,6 +2916,57 @@ def generate_timeline(
         timeline.loc[timeline['EndTime'] > data_end, 'EndTime'] = data_end
     
     return timeline
+
+
+def cross_invalidate_timelines(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    bin_minutes: int = 15,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Mark timeline intervals invalid unless both timelines have has_data coverage.
+
+    ATSPM marks each interval IsValid based on each device's own has_data bins
+    independently.  That means one device can have valid intervals in a window
+    where the other has none, producing a misleading comparison where one side
+    appears blank.  This function enforces symmetric validity: an interval in
+    either timeline is only kept valid when the corresponding bin is covered by
+    *both* devices.
+
+    Args:
+        timeline_a: Timeline DataFrame from generate_timeline (needs IsValid col).
+        timeline_b: Timeline DataFrame from generate_timeline (needs IsValid col).
+        bin_minutes: Bin size used by ATSPM (must match the bin_size param, default 15).
+
+    Returns:
+        (timeline_a, timeline_b) with IsValid updated — intervals are only ever
+        set to False, never promoted to True.
+    """
+    if timeline_a.empty or timeline_b.empty:
+        return timeline_a, timeline_b
+    if 'IsValid' not in timeline_a.columns or 'IsValid' not in timeline_b.columns:
+        return timeline_a, timeline_b
+
+    freq = f'{bin_minutes}min'
+
+    def _valid_bins(tl: pd.DataFrame) -> set:
+        valid = tl[tl['IsValid'].fillna(False).astype(bool)]
+        if valid.empty:
+            return set()
+        starts = pd.to_datetime(valid['StartTime']).dt.floor(freq)
+        ends   = pd.to_datetime(valid['EndTime']).dt.floor(freq)
+        return set(starts) | set(ends)
+
+    both_valid = _valid_bins(timeline_a) & _valid_bins(timeline_b)
+
+    def _apply(tl: pd.DataFrame) -> pd.DataFrame:
+        tl = tl.copy()
+        start_bins = pd.to_datetime(tl['StartTime']).dt.floor(freq)
+        end_bins   = pd.to_datetime(tl['EndTime']).dt.floor(freq)
+        covered = start_bins.isin(both_valid) & end_bins.isin(both_valid)
+        tl.loc[~covered, 'IsValid'] = False
+        return tl
+
+    return _apply(timeline_a), _apply(timeline_b)
 
 
 # =============================================================================
@@ -3622,19 +3685,35 @@ def create_comparison_gantt_matplotlib(
                 )
             )
     
-    # Plot bars using broken_barh
+    # Plot bars using broken_barh. Rows flagged IsValid=False (missing/unreliable
+    # data, excluded from the comparison analysis) are drawn with a hatch overlay
+    # and dimmed fill so they remain visible instead of leaving a misleading blank
+    # gap, while still standing out as not part of the scored comparison.
     bar_height = 0.72
+    has_invalid_column = 'IsValid' in combined_df.columns
     for _, event in combined_df.iterrows():
         y_pos = row_to_y.get(event['RowLabel'], 0)
         color = event['Color']
-        ax.broken_barh(
-            [(event['RelStart'], event['Duration'])],
-            (y_pos - bar_height/2, bar_height),
-            facecolors=color,
-            edgecolors='black',
-            linewidth=0.5,
-            zorder=2.0,
-        )
+        is_valid = bool(event['IsValid']) if has_invalid_column and pd.notna(event.get('IsValid')) else True
+        if is_valid:
+            ax.broken_barh(
+                [(event['RelStart'], event['Duration'])],
+                (y_pos - bar_height/2, bar_height),
+                facecolors=color,
+                edgecolors='black',
+                linewidth=0.5,
+                zorder=2.0,
+            )
+        else:
+            ax.broken_barh(
+                [(event['RelStart'], event['Duration'])],
+                (y_pos - bar_height/2, bar_height),
+                facecolors=to_rgba(color, 0.35),
+                edgecolors='#555555',
+                linewidth=0.6,
+                hatch='xx',
+                zorder=2.0,
+            )
 
     for rel_start, duration, y_start, y_height, overlay_edge in overlay_specs:
         ax.broken_barh(
@@ -3776,8 +3855,15 @@ def create_multi_divergence_plots(
     time_offset_b: float = 0.0,
     align_by_time_delta: bool = True,
     programmed_split_timeline: Optional[pd.DataFrame] = None,
+    min_context_minutes: float = 0.0,
+    invalid_timeline_a: Optional[pd.DataFrame] = None,
+    invalid_timeline_b: Optional[pd.DataFrame] = None,
 ) -> List[str]:
     """Create up to max_plots divergence-focused Gantt charts.
+
+    Candidate divergence windows that overlap an invalid (missing/unreliable
+    data) interval on either side are skipped, since such a mismatch reflects
+    a data collection gap rather than an actual firmware behavior difference.
 
     Returns list of generated file paths.
     """
@@ -3792,12 +3878,31 @@ def create_multi_divergence_plots(
     if not divergences:
         return []
 
+    min_context_seconds = max(0.0, min_context_minutes * 60.0)
+    max_time_a = (timeline_a['EndTime'].max() - base_start_a).total_seconds()
+    base_start_b = timeline_b['StartTime'].min()
+    max_time_b = (timeline_b['EndTime'].max() - base_start_b).total_seconds()
+    overlap_duration_seconds = min(max_time_a, max_time_b)
+
     selected: List[DivergenceWindow] = []
     for divergence in sorted(divergences, key=lambda d: d.original_start_seconds_a):
+        if min_context_seconds > 0.0:
+            if divergence.original_start_seconds_a < min_context_seconds:
+                continue
+            if overlap_duration_seconds - divergence.original_end_seconds_a < min_context_seconds:
+                continue
         if any(
             abs(divergence.original_start_seconds_a - existing.original_start_seconds_a) < 10.0 * 60.0
             for existing in selected
         ):
+            continue
+        divergence_start_a = base_start_a + timedelta(seconds=divergence.original_start_seconds_a)
+        divergence_end_a = base_start_a + timedelta(seconds=divergence.original_end_seconds_a)
+        if timeline_overlaps_interval(invalid_timeline_a, divergence_start_a, divergence_end_a):
+            continue
+        divergence_start_b = base_start_b + timedelta(seconds=divergence.original_start_seconds_b)
+        divergence_end_b = base_start_b + timedelta(seconds=divergence.original_end_seconds_b)
+        if timeline_overlaps_interval(invalid_timeline_b, divergence_start_b, divergence_end_b):
             continue
         selected.append(divergence)
         if len(selected) >= max_plots:
@@ -3992,7 +4097,8 @@ def compare_and_visualize(
             print("Generating timelines with atspm...")
             timeline_a = generate_timeline(df_a, device_id=device_id)
             timeline_b = generate_timeline(df_b, device_id=device_id)
-            
+            timeline_a, timeline_b = cross_invalidate_timelines(timeline_a, timeline_b)
+
             if timeline_a.empty or timeline_b.empty:
                 warnings.warn("No timeline events generated. Check that data contains phase/overlap events.")
             else:

@@ -82,6 +82,78 @@ def test_clearance_issue_plots_skip_old_version_only_irregularities(tmp_path, mo
     assert captured == []
 
 
+def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, monkeypatch):
+    fv = _load_firmware_validate_module()
+    base_time = datetime(2026, 4, 2, 9, 0, 0)
+    captured = []
+
+    def fake_create_comparison_gantt_matplotlib(**kwargs):
+        captured.append(kwargs)
+        return plt.figure()
+
+    monkeypatch.setattr(fv.sr, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+
+    timeline_a = pd.DataFrame(
+        [
+            {
+                "StartTime": base_time,
+                "EndTime": base_time + timedelta(seconds=4),
+                "Duration": 4.0,
+                "EventClass": "Red",
+                "EventValue": 4,
+            },
+            {
+                "StartTime": base_time + timedelta(minutes=6),
+                "EndTime": base_time + timedelta(minutes=6, seconds=4),
+                "Duration": 4.0,
+                "EventClass": "Red",
+                "EventValue": 4,
+            },
+            {
+                "StartTime": base_time + timedelta(minutes=11, seconds=30),
+                "EndTime": base_time + timedelta(minutes=11, seconds=34),
+                "Duration": 4.0,
+                "EventClass": "Red",
+                "EventValue": 4,
+            },
+        ]
+    )
+    timeline_b = timeline_a.copy()
+    timeline_b.loc[2, "EndTime"] = base_time + timedelta(minutes=11, seconds=40)
+    timeline_b.loc[2, "Duration"] = 10.0
+
+    plot_paths, captions = fv._generate_special_issue_plots(
+        scenario_id="2C043",
+        timeline_a=timeline_a,
+        timeline_b=timeline_b,
+        aligned_timeline_a=timeline_a,
+        aligned_timeline_b=timeline_b,
+        phase_differences=[],
+        clearance_irregularities=[
+            {
+                "label": "Ph 4",
+                "state": "Red",
+                "event_class": "Red",
+                "event_value": 4,
+                "irregular_count_a": 0,
+                "irregular_count_b": 1,
+            }
+        ],
+        operational_diffs=[],
+        plots_dir=str(tmp_path),
+        label_a="2.15.1",
+        label_b="2.17.3",
+        window_minutes=5.0,
+        time_offset_b=0.0,
+        align_by_time_delta=False,
+        min_context_minutes=5.0,
+    )
+
+    assert plot_paths == []
+    assert captions == []
+    assert captured == []
+
+
 def test_clearance_issue_plots_anchor_new_version_irregularity(tmp_path, monkeypatch):
     fv = _load_firmware_validate_module()
     captured = []

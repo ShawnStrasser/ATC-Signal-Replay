@@ -37,6 +37,7 @@ from .comparison import (
     format_comparison_summary,
     load_events,
     generate_timeline,
+    cross_invalidate_timelines,
     generate_phase_difference_summary,
     generate_clearance_irregularity_summary,
     generate_operational_difference_summary,
@@ -51,6 +52,7 @@ from .comparison import (
     build_included_event_periods,
     filter_divergence_windows_to_periods,
     clip_timeline_to_relative_periods,
+    timeline_overlaps_interval,
     render_sparkline_svg,
 )
 from .test_suite import (
@@ -104,6 +106,7 @@ __all__ = [
     "compare_and_visualize",
     "format_comparison_summary",
     "generate_timeline",
+    "cross_invalidate_timelines",
     "generate_phase_difference_summary",
     "generate_clearance_irregularity_summary",
     "generate_operational_difference_summary",
@@ -112,6 +115,7 @@ __all__ = [
     "build_included_event_periods",
     "filter_divergence_windows_to_periods",
     "clip_timeline_to_relative_periods",
+    "timeline_overlaps_interval",
     "render_sparkline_svg",
     # Firmware validation
     "TestType",

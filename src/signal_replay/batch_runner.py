@@ -46,6 +46,12 @@ def _serialize_result(result: ScenarioResult) -> dict:
     return data
 
 
+def _raise_if_simulation_collection_failed(result: object, batch_label: str) -> None:
+    """Fail the batch if the simulation reported a fatal collection error."""
+    if isinstance(result, dict) and result.get("collection_error"):
+        raise RuntimeError(f"Data collection failed during {batch_label}")
+
+
 def _comparison_worker(args: Tuple[dict, str, str, str, str, float]) -> dict:
     scenario_data, baseline_db, new_db, baseline_version, firmware_version, trim_edges_minutes = args
     scenario_id = scenario_data["scenario_id"]
@@ -282,7 +288,11 @@ class BatchRunner:
         self._active_simulation = sim
         try:
             self.logger.info(f"Starting similarity batch {batch.batch_id} with {len(similarity_ids)} scenarios")
-            sim.run()
+            result = sim.run()
+            _raise_if_simulation_collection_failed(
+                result,
+                f"similarity batch {batch.batch_id}",
+            )
             self.logger.info(f"Completed similarity batch {batch.batch_id}")
         finally:
             self._active_simulation = None
@@ -348,7 +358,11 @@ class BatchRunner:
         self._active_simulation = sim
         try:
             self.logger.info(f"Starting conflict scenario {scenario_id}")
-            sim.run()
+            result = sim.run()
+            _raise_if_simulation_collection_failed(
+                result,
+                f"conflict scenario {scenario_id}",
+            )
             self.logger.info(f"Completed conflict scenario {scenario_id}")
         finally:
             self._active_simulation = None

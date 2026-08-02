@@ -44,6 +44,7 @@ COORD_PATTERNS_DIR = Path(__file__).resolve().parent / "coord_patterns"
 SEQUENCE_MATCH_THRESHOLD = 95.0
 TIMING_MATCH_THRESHOLD = 90.0
 TIMING_MATCH_TOLERANCE_SECONDS = 0.5
+MIN_REPORT_ISSUE_CONTEXT_MINUTES = 5.0
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -382,6 +383,12 @@ def build_suite(
         analysis_settle_minutes=effective_settle_minutes,
         analysis_start_time=analysis_start_time,
         analysis_end_time=analysis_end_time,
+        replay_latency_offset_seconds=settings.get("replay_latency_offset_seconds", sr.DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS),
+        replay_latency_offset_lookback_min=settings.get(
+            "replay_latency_offset_lookback_min",
+            settings.get("replay_latency_offset_update_min"),
+        ),
+        replay_latency_offset_min_samples=settings.get("replay_latency_offset_min_samples"),
     )
 
     return suite, file_map
@@ -1053,7 +1060,18 @@ def _prepare_settled_overlap_timelines(
     *,
     settle_minutes: float,
     tod_align: bool,
+    clip_to_overlap: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the settle trim (and, for non-TOD scenarios, the A/B clock alignment).
+
+    clip_to_overlap additionally restricts both sides to the time range where
+    *both* have rows (by each side's own max EndTime). That's appropriate when
+    pairing up events for A-vs-B duration comparisons, but wrong when simply
+    checking "is there any invalid data here" — one side (e.g. a clean
+    baseline) legitimately having little/no invalid data, and thus an early
+    max EndTime, would otherwise truncate away real invalid rows on the other
+    side. Callers doing that kind of existence check should pass False.
+    """
     left = timeline_a.copy()
     right = timeline_b.copy()
 
@@ -1082,7 +1100,7 @@ def _prepare_settled_overlap_timelines(
             else:
                 right = right[right["StartTime"] >= start_b + settle_td].copy()
 
-    if not left.empty and not right.empty:
+    if clip_to_overlap and not left.empty and not right.empty:
         overlap_end = min(left["EndTime"].max(), right["EndTime"].max())
         left = left[left["StartTime"] <= overlap_end].copy()
         right = right[right["StartTime"] <= overlap_end].copy()
@@ -1361,6 +1379,9 @@ def _select_clearance_issue_spec(
     label_a: str,
     label_b: str,
 ) -> Optional[Dict[str, object]]:
+    if "irregular_count_b" in row and int(row.get("irregular_count_b", 0) or 0) <= 0:
+        return None
+
     rows_a = _normalize_issue_timeline_rows(
         timeline_a,
         str(row.get("event_class", "")),
@@ -1420,6 +1441,46 @@ def _select_clearance_issue_spec(
         "end": anchor["end"],
         "score": abs(float(anchor["deviation"])),
     }
+
+
+def _timeline_context_bounds(
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    if timeline_a.empty or timeline_b.empty:
+        return None
+
+    start = max(pd.Timestamp(timeline_a["StartTime"].min()), pd.Timestamp(timeline_b["StartTime"].min()))
+    end = min(pd.Timestamp(timeline_a["EndTime"].max()), pd.Timestamp(timeline_b["EndTime"].max()))
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return None
+    return start, end
+
+
+def _issue_has_timeline_context(
+    spec: Dict[str, object],
+    timeline_a: pd.DataFrame,
+    timeline_b: pd.DataFrame,
+    *,
+    min_context_minutes: float,
+) -> bool:
+    if min_context_minutes <= 0:
+        return True
+
+    bounds = _timeline_context_bounds(timeline_a, timeline_b)
+    if bounds is None:
+        return False
+
+    context = pd.Timedelta(minutes=min_context_minutes)
+    issue_start = pd.Timestamp(spec["start"])
+    issue_end = pd.Timestamp(spec.get("end", issue_start))
+    if pd.isna(issue_start) or pd.isna(issue_end):
+        return False
+    if issue_end < issue_start:
+        issue_start, issue_end = issue_end, issue_start
+
+    data_start, data_end = bounds
+    return issue_start - data_start >= context and data_end - issue_end >= context
 
 
 def _is_distinct_issue_window(
@@ -1493,8 +1554,16 @@ def _generate_special_issue_plots(
     time_offset_b: float,
     align_by_time_delta: bool,
     tod_align: bool = False,
+    min_context_minutes: float = 0.0,
+    invalid_timeline_a: Optional[pd.DataFrame] = None,
+    invalid_timeline_b: Optional[pd.DataFrame] = None,
 ) -> Tuple[List[str], List[str]]:
-    """Create labeled charts for the worst flagged clearance and operational issues."""
+    """Create labeled charts for the worst flagged clearance and operational issues.
+
+    Candidate windows that overlap an invalid (missing/unreliable data) interval
+    on either side are skipped, since such a mismatch reflects a data collection
+    gap rather than an actual firmware behavior difference.
+    """
     if timeline_a.empty or timeline_b.empty:
         return [], []
 
@@ -1521,6 +1590,19 @@ def _generate_special_issue_plots(
         )
         if issue_spec is None:
             continue
+        if sr.timeline_overlaps_interval(
+            invalid_timeline_a, issue_spec["start"], issue_spec["end"]
+        ) or sr.timeline_overlaps_interval(
+            invalid_timeline_b, issue_spec["start"], issue_spec["end"]
+        ):
+            continue
+        if not _issue_has_timeline_context(
+            issue_spec,
+            aligned_timeline_a,
+            aligned_timeline_b,
+            min_context_minutes=min_context_minutes,
+        ):
+            continue
         issue_specs.append(issue_spec)
 
     phase_state_diffs = [
@@ -1543,6 +1625,19 @@ def _generate_special_issue_plots(
         non_clearance_candidates_by_group.setdefault(group_key, [])
         for issue_window in ranked_issue_windows:
             event_class = str(diff.get("event_class", "")).strip()
+            if sr.timeline_overlaps_interval(
+                invalid_timeline_a, issue_window["start"], issue_window["end"]
+            ) or sr.timeline_overlaps_interval(
+                invalid_timeline_b, issue_window["start"], issue_window["end"]
+            ):
+                continue
+            if not _issue_has_timeline_context(
+                issue_window,
+                aligned_timeline_a,
+                aligned_timeline_b,
+                min_context_minutes=min_context_minutes,
+            ):
+                continue
             non_clearance_candidates_by_group[group_key].append(
                 {
                     "caption": _format_operational_issue_caption(
@@ -1565,6 +1660,8 @@ def _generate_special_issue_plots(
     selected_so_far = list(issue_specs)
     ranked_groups = []
     for specs in non_clearance_candidates_by_group.values():
+        if not specs:
+            continue
         specs.sort(key=_issue_spec_sort_key)
         ranked_groups.append(specs)
 
@@ -1730,6 +1827,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     timeline_a = timeline_b = None
     valid_timeline_a = valid_timeline_b = None
     invalid_timeline_a = invalid_timeline_b = None
+    tl_a_invalid = tl_b_invalid = None
     analysis_diagnostics = []
     chart_time_offset_b = 0.0
     chart_align_by_time_delta = not tod_align
@@ -1754,6 +1852,19 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 _devnull.close()
             timeline_a = _remove_ignored_timeline_events(timeline_a)
             timeline_b = _remove_ignored_timeline_events(timeline_b)
+            rows_before_chunk_clip_a = len(timeline_a)
+            rows_before_chunk_clip_b = len(timeline_b)
+            timeline_a = sr.clip_timeline_to_relative_periods(
+                timeline_a,
+                result.included_event_periods_a,
+                base_timestamp=start_time_a,
+            )
+            timeline_b = sr.clip_timeline_to_relative_periods(
+                timeline_b,
+                result.included_event_periods_b,
+                base_timestamp=start_time_b,
+            )
+            timeline_a, timeline_b = sr.cross_invalidate_timelines(timeline_a, timeline_b)
             valid_timeline_a, invalid_timeline_a = _split_timeline_by_validity(timeline_a)
             valid_timeline_b, invalid_timeline_b = _split_timeline_by_validity(timeline_b)
             if tod_align or valid_timeline_a.empty or valid_timeline_b.empty:
@@ -1762,6 +1873,10 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 chart_time_offset_b = sr.compute_timeline_offset(valid_timeline_a, valid_timeline_b)
             analysis_diagnostics.append(
                 "Timeline rows after removing input-only classes: "
+                f"original={rows_before_chunk_clip_a}, new={rows_before_chunk_clip_b}"
+            )
+            analysis_diagnostics.append(
+                "Timeline rows after phase-call chunk filtering: "
                 f"original={len(timeline_a)}, new={len(timeline_b)}"
             )
             analysis_diagnostics.append(
@@ -1831,6 +1946,26 @@ def _compare_one_scenario(args: Tuple) -> dict:
             operational_diffs = sr.generate_operational_difference_summary(tl_a_settled, tl_b_settled, tolerance_seconds=0.2)
             timeline_difference_analysis_available = True
 
+            tl_a_invalid, tl_b_invalid = _prepare_settled_overlap_timelines(
+                invalid_timeline_a,
+                invalid_timeline_b,
+                settle_minutes=compare_settle_minutes,
+                tod_align=tod_align,
+            )
+            # Unclipped (no A/B overlap-range trim) version for the "does invalid
+            # data touch this window at all" checks used to discard divergences.
+            # Using tl_a_invalid/tl_b_invalid there would be wrong: if one side
+            # (e.g. a clean baseline) has little invalid data ending early, its
+            # short EndTime range would truncate away real invalid rows on the
+            # other side that fall later in the day.
+            invalid_context_a, invalid_context_b = _prepare_settled_overlap_timelines(
+                invalid_timeline_a,
+                invalid_timeline_b,
+                settle_minutes=compare_settle_minutes,
+                tod_align=tod_align,
+                clip_to_overlap=False,
+            )
+
             try:
                 _devnull2 = open(os.devnull, "w") if not verbose else None
                 _ctx2 = contextlib.redirect_stdout(_devnull2) if _devnull2 else contextlib.nullcontext()
@@ -1847,10 +1982,12 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
                     issue_plot_paths, issue_plot_captions = _generate_special_issue_plots(
                         scenario_id=scenario_id,
-                        timeline_a=valid_timeline_a,
-                        timeline_b=valid_timeline_b,
+                        timeline_a=timeline_a,
+                        timeline_b=timeline_b,
                         aligned_timeline_a=tl_a_settled,
                         aligned_timeline_b=tl_b_settled,
+                        invalid_timeline_a=invalid_context_a,
+                        invalid_timeline_b=invalid_context_b,
                         phase_differences=phase_diffs,
                         clearance_irregularities=clearance_irregularities,
                         operational_diffs=operational_diffs,
@@ -1861,12 +1998,13 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         time_offset_b=chart_time_offset_b,
                         align_by_time_delta=chart_align_by_time_delta,
                         tod_align=tod_align,
+                        min_context_minutes=MIN_REPORT_ISSUE_CONTEXT_MINUTES,
                     )
 
                     remaining_divergence_plots = max(0, max_plots - len(issue_plot_paths))
                     divergence_paths = sr.create_multi_divergence_plots(
-                        timeline_a=valid_timeline_a,
-                        timeline_b=valid_timeline_b,
+                        timeline_a=timeline_a,
+                        timeline_b=timeline_b,
                         comparison_result=result,
                         output_dir=plots_dir_str,
                         label_a=baseline_label,
@@ -1876,6 +2014,9 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         time_offset_b=chart_time_offset_b,
                         align_by_time_delta=chart_align_by_time_delta,
                         programmed_split_timeline=programmed_split_timeline,
+                        min_context_minutes=MIN_REPORT_ISSUE_CONTEXT_MINUTES,
+                        invalid_timeline_a=invalid_timeline_a,
+                        invalid_timeline_b=invalid_timeline_b,
                     ) if remaining_divergence_plots > 0 else []
 
                 plot_paths = issue_plot_paths + divergence_paths
@@ -1896,14 +2037,8 @@ def _compare_one_scenario(args: Tuple) -> dict:
                 import traceback as _tb
                 _tb.print_exc()
 
-    if test_type == sr.TestType.SIMILARITY and invalid_timeline_a is not None and invalid_timeline_b is not None:
+    if test_type == sr.TestType.SIMILARITY and tl_a_invalid is not None and tl_b_invalid is not None:
         try:
-            tl_a_invalid, tl_b_invalid = _prepare_settled_overlap_timelines(
-                invalid_timeline_a,
-                invalid_timeline_b,
-                settle_minutes=compare_settle_minutes,
-                tod_align=tod_align,
-            )
             if not tl_a_invalid.empty or not tl_b_invalid.empty:
                 invalid_clearance_irregularities = sr.generate_clearance_irregularity_summary(
                     tl_a_invalid,

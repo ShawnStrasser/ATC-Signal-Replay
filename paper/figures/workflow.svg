@@ -1,11 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="180" viewBox="0 0 900 180">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="225" viewBox="0 0 900 225">
 <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#40566d"/></marker></defs>
-<style>text{font-family:Arial,sans-serif;font-size:14px;fill:#203040}.box{fill:#eef3f7;stroke:#40566d;stroke-width:1.5}.arrow{stroke:#40566d;stroke-width:2;marker-end:url(#a)}.small{font-size:11px}</style>
-<rect class="box" x="20" y="55" width="130" height="70" rx="8"/><text x="85" y="84" text-anchor="middle">Field event</text><text x="85" y="103" text-anchor="middle">log</text>
+<style>text{font-family:'Times New Roman',serif;font-size:20px;fill:#203040}.box{fill:#eef3f7;stroke:#40566d;stroke-width:1.5}.arrow{stroke:#40566d;stroke-width:2;marker-end:url(#a)}.small{font-size:20px}</style>
+<rect class="box" x="20" y="55" width="130" height="70" rx="8"/><text x="85" y="84" text-anchor="middle">Live controller</text><text x="85" y="103" text-anchor="middle">event log</text>
 <rect class="box" x="190" y="55" width="145" height="70" rx="8"/><text x="262" y="84" text-anchor="middle">NTCIP input</text><text x="262" y="103" text-anchor="middle">replay</text>
 <rect class="box" x="375" y="55" width="145" height="70" rx="8"/><text x="447" y="84" text-anchor="middle">Controller or</text><text x="447" y="103" text-anchor="middle">emulator</text>
-<rect class="box" x="560" y="55" width="140" height="70" rx="8"/><text x="630" y="84" text-anchor="middle">Event-log</text><text x="630" y="103" text-anchor="middle">adapter</text>
+<rect class="box" x="560" y="55" width="140" height="70" rx="8"/><text x="630" y="84" text-anchor="middle">Event log</text><text x="630" y="103" text-anchor="middle">Collector*</text>
 <rect class="box" x="740" y="55" width="140" height="70" rx="8"/><text x="810" y="84" text-anchor="middle">Alignment,</text><text x="810" y="103" text-anchor="middle">review, report</text>
 <path class="arrow" d="M150 90 H190"/><path class="arrow" d="M335 90 H375"/><path class="arrow" d="M520 90 H560"/><path class="arrow" d="M700 90 H740"/>
-<text class="small" x="450" y="28" text-anchor="middle">Portable NTCIP replay inputs; current implementation uses a MAXTIME output adapter</text>
+<text class="small" x="450" y="28" text-anchor="middle">Detector, pedestrian, and preempt inputs use NTCIP 1202 objects</text>
+<text class="small" x="450" y="168" text-anchor="middle">*The current collector reads MAXTIME event logs.</text><text class="small" x="450" y="191" text-anchor="middle">It can be extended to other controller types.</text>
 </svg>

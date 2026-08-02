@@ -1,45 +1,33 @@
 # Paper outline
 
-## Title page
-Purpose: provide only the TRB-required title and author information. Content: *Feasibility of Field-Derived High-Resolution Event Replay for Traffic-Signal Controller Testing*; Shawn Strasser, P.E.; job title, ODOT affiliation, email, and total page count. Do not print a submission category. ORCID is optional and omitted.
-
-## Structured abstract
-Purpose: answer the feasibility question in the five required headings. Main result: unchanged same-software campaigns averaged 99.6% sequence and 97.7% timing match; known changes were flagged without flags in unchanged configurations. No figure/table. Missing: final author approval of wording.
+## Title page and structured abstract
+Use the verified single-author information. Do not print a submission category or ORCID. The structured abstract answers the feasibility question with the repeatability, intervention, release, and zero-conflict findings.
 
 ## 1. Introduction
-Purpose: explain why manual/scripted testing cannot reproduce a day of realistic field complexity. Main claim: high-resolution field logs can be treated as executable controller tests. Evidence: 25 approximately 23-hour traces and three replay campaigns. Define the two-part feasibility condition: repeatable alignment plus retained divergences.
+State the practical problem immediately: staff cannot manually toggle a full day of interacting inputs across 25 production timing configurations. Present field operation as a reusable test script. Define feasibility as repeatable alignment plus retained operational divergences.
 
-## 2. Prior work and research gap
-Purpose: directly distinguish the work from Ahmed/Li scripted testing, Tung NTCIP testing, Stevanovic logger/HILS evaluation, and Wang controller-in-the-loop work. Main claim: novelty lies in the combination of field-derived long-duration inputs and whole-output-trace regression, not any component. Table 1 summarizes the closest work. Missing: none beyond final reference proofreading.
+## 2. Related work
+Use three short paragraphs only: scripted automated controller tests; controller/emulator and high-resolution logging studies; DTW and the remaining field-replay gap. Avoid general traffic-signal background.
 
-## 3. Field-derived replay method
-Purpose: make the experiment understandable without the repository. Describe 9 a.m.--8 a.m. capture, event filtering, repeated-state imputation, eight-bit detector grouping, preempt Boolean calls, NTCIP objects, emulator preparation, time-of-day scheduling, latency compensation, output collection, and portability boundary. Figure 1 workflow; Table 2 input mapping. Evidence: replay SQL/Python, NTCIP module, stored databases, presentation.
+## 3. Replay and test architecture
+Describe the 23-hour field logs, event-to-NTCIP conversion, time-of-day replay, emulator accommodations, parallel batches, latency compensation, and product-adapter boundary. Figure 1 is the workflow; Table 1 maps vehicle, pedestrian, and preempt events.
 
-## 4. Dynamic time warping comparison
-Purpose: explain and justify the actual math. Define timestamp event sets, Jaccard local distance, cumulative DTW recurrence, monotone path, 45-minute/40-minute rolling scoring, 60-second edge clip, sequence score, timing score, and phase-call reliability filter. Figure 2 alignment; Table 3 parameters. Evidence: `comparison.py` and archived report windows.
+## 4. Output alignment and automated checks
+Give the Jaccard and DTW equations, 45-minute/40-minute windowing, sequence/timing thresholds, and phase-call reliability screen. Explain clearance, pedestrian, preemption, and transition diagnostics. Give the virtual conflict monitor prominent treatment: 863 incompatible pairs across 21 configurations and zero stored conflicts. Figure 2 explains alignment; Figure 3 is `example_report.png`.
 
-## 5. Experimental evaluation
-Purpose: separate the release screen from the controlled same-software intervention. Table 4 defines version 2.15.1 versus 2.18.1 and 2.18.1 versus parameter-modified 2.18.1. Missing: author confirmation of the 14/11 interpretation.
+## 5. Experimental design
+Define the 2.15.1-to-2.18.1 release comparison and the same-software trailing-overlap intervention. Table 2 contains only the essential design information.
 
 ## 6. Results
-Order the evidence by strength:
+Lead with the 11 unchanged configurations (99.6% sequence, 97.7% timing), then the 11/14 changed and 0/11 unchanged intervention detection table. Use the short-overlap-yellow case as the timing-change example. Do not use the former parameter-intervention or software-release aggregate charts.
 
-1. Repeatability: all 11 unchanged configurations passed; 99.6% mean sequence and 97.7% mean timing match.
-2. Parameter intervention: 11/14 applicable changes flagged and 0/11 unchanged flagged; Figure 3 and Table 5.
-3. Short-overlap-yellow case study: Figure 4.
-4. Software release: 19/25 pass; six review candidates; Table 6 and Figure 5.
-5. Rail-preemption bug fix and transition-state case studies: Figures 6 and 7.
-
-Missing: configuration IDs/timestamps for the three presentation figures and final classification of six release candidates.
+Summarize the release as 19 aggregate passes and six review cases. Identify 12036 as likely peer-to-peer test-environment failure. Emphasize that passed configurations still produced useful diagnostics: 13008 rail-preemption bug fix, 2B049 faster transition and possible transition-state issue, and 13008 expected dynamic red-clear extension. Use the preempt and transition figures.
 
 ## 7. Discussion
-Purpose: explain why field replay is richer than manual testing, how incident traces can reproduce bugs and validate fixes, why a baseline is an executable oracle, why flags require engineering judgment, and how field realism trades off against controlled coverage. Explain that NTCIP makes the input boundary portable while output adapters remain product-specific.
+Sell the operational significance without hype: comprehensive full-day inputs, concurrent production configurations, automated review of millions of events, incident replay, and focused staff review. Explain baseline approval and NTCIP adaptability.
 
-## 8. Limitations
-Purpose: state one product family/emulator, one agency/day, emulator-specific configuration accommodations, exposure limitations, engineering rather than optimized thresholds, unrun sensitivity analysis, incomplete candidate classification, and replay-versus-offline-reproduction boundary.
+## 8. Limitations and conclusions
+State the one-platform emulator limitation, field-exposure limitation, likely 12036 environment issue, five incompletely classified review cases, engineering thresholds, and comparison-only reproducibility. Conclude that the method is feasible and materially expands acceptance-test coverage.
 
-## 9. Conclusions
-Purpose: answer yes, with numerical evidence. State that DTW aligned most controller output while preserving operational divergences. Emphasize regression screening, timing-change evaluation, and targeted bug replication—not automatic certification.
-
-## Acknowledgments, availability, AI disclosure, references
-Purpose: record agency context, open-source package and candidate data bundle, exact TRB AI disclosure, and 8 verified focused references. Missing: final acknowledgments/disclaimer, public release/commit citation, and author approval.
+## Acknowledgments and availability
+Thank Chris Primm for reviewing results and contributing testing ideas. Cite the open-source package after `v0.2.0` or a final commit is public. Include the required AI disclosure.

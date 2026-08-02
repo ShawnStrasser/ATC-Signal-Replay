@@ -37,3 +37,5 @@ Current manuscript checks:
 - In-text citations use author-year form and the bibliography uses Chicago Author-Date style.
 
 Editorial Manager actions cannot be completed in the manuscript: enter the same author information, paste the identical structured abstract with all five headings, select the submission option and topic/category, and complete final author approval.
+
+Final re-audit on 2026-08-02 used the exact downloaded two-page checklist and the compiled PDF after the final title change. The PDF has 11 US Letter pages; the title page contains Shawn Strasser, P.E., M.S., job title, ODOT affiliation, email, ORCID, and total page count; page 2 contains only the 285-word structured abstract and required headings; Times New Roman regular, italic, and bold fonts are embedded; and line/page numbering is present on every page. No manuscript-side checklist exception was found.

@@ -44,80 +44,41 @@ ax.legend(handles=[Line2D([0],[0],marker='o',color='w',markerfacecolor='#b04a4a'
 ax.grid(axis="y", alpha=.2); fig.tight_layout()
 fig.savefig(FIGURES / "parameter-intervention-summary.pdf", bbox_inches="tight"); plt.close(fig)
 
-# Three candidate explanations of sequence alignment for author selection.
-from matplotlib.patches import FancyBboxPatch
-
-fig, axes = plt.subplots(3, 1, figsize=(7.2, 8.4), gridspec_kw={"height_ratios": [1.0, 1.0, 1.25]})
+# Simplified timeline view of sequence alignment and separate timing comparison.
+fig, ax = plt.subplots(figsize=(7.2, 3.2))
 match_color = "#2f6f9f"
 extra_color = "#b04a4a"
-neutral_color = "#eef3f7"
+ref_y = 2.05
+cand_y = 0.95
+ref_times = [0.0, 4.0, 8.0]
+cand_times = [0.2, 4.4, 8.5]
+labels = ["Phase 2 green", "Phase 2 yellow", "Phase 2 red"]
 
-# (a) Order-only view: the information used by the DTW sequence cost.
-ax = axes[0]
-ax.set_xlim(0, 10); ax.set_ylim(0, 3); ax.axis("off")
-ref_items = [(1.5, "Phase 2 green +\nOverlap A green"), (5.0, "Phase 2 yellow"), (8.5, "Phase 2 red")]
-cand_items = [(1.2, "Phase 2 green +\nOverlap A green"), (4.0, "Phase 2 yellow"), (6.2, "Phase 6 call\n(candidate only)"), (8.8, "Phase 2 red")]
-def draw_box(axis, x, y, label, color):
-    box = FancyBboxPatch((x - 0.85, y - 0.32), 1.7, 0.64, boxstyle="round,pad=0.05", facecolor=neutral_color if color == match_color else "#f9e7e7", edgecolor=color, linewidth=1.4)
-    axis.add_patch(box)
-    axis.text(x, y, label, ha="center", va="center", fontsize=11)
-for x, label in ref_items:
-    draw_box(ax, x, 2.1, label, match_color)
-for x, label in cand_items:
-    draw_box(ax, x, 0.8, label, extra_color if "candidate only" in label else match_color)
-for xr, xc in zip([1.5, 5.0, 8.5], [1.2, 4.0, 8.8]):
-    ax.plot([xr, xc], [1.76, 1.14], color="#778899", linestyle="--", linewidth=1)
-ax.text(0.05, 2.1, "Reference", ha="right", va="center", fontsize=11, weight="bold")
-ax.text(0.05, 0.8, "Candidate", ha="right", va="center", fontsize=11, weight="bold")
-ax.set_title("(a) Ordered event groups used for the sequence comparison", loc="left", fontsize=12, weight="bold")
-ax.text(5, 0.05, "DTW aligns matching event groups; the additional phase call remains flagged.", ha="center", fontsize=11)
-
-# (b) Timeline view: the same matches with timestamps restored.
-ax = axes[1]
-ax.set_xlim(-0.6, 9.2); ax.set_ylim(0, 3)
-ax.set_yticks([2.05, 0.85], ["Reference", "Candidate"])
+ax.set_xlim(-0.6, 9.2)
+ax.set_ylim(-0.85, 2.85)
+ax.set_yticks([ref_y, cand_y], ["Reference", "Candidate"])
 ax.set_xlabel("Elapsed replay time (s)")
 ax.spines[["left", "right", "top"]].set_visible(False)
+ax.spines["bottom"].set_position(("data", -0.55))
 ax.grid(axis="x", alpha=.18)
-ref_times = [0.0, 4.0, 8.0]
-labels = ["Phase 2 green", "Phase 2 yellow", "Phase 2 red"]
+
 for t, label in zip(ref_times, labels):
-    ax.vlines(t, 1.72, 2.38, color=match_color, lw=2)
-    ax.text(t, 2.48, label, ha="center", fontsize=11)
-for t, label in zip([0.2, 4.4, 8.5], labels):
-    ax.vlines(t, 0.52, 1.18, color=match_color, lw=2)
-    ax.text(t, 0.37, label, ha="center", va="top", fontsize=11)
-ax.vlines(6.1, 0.52, 1.18, color=extra_color, lw=2)
-ax.text(6.1, 0.37, "Phase 6 call\nadditional", ha="center", va="top", fontsize=11, color=extra_color)
-for a, b in zip(ref_times, [0.2, 4.4, 8.5]):
-    ax.plot([a, b], [1.72, 1.18], color="#778899", linestyle="--", linewidth=1)
-ax.set_title("(b) Timing comparison after the event groups are aligned", loc="left", fontsize=12, weight="bold")
+    ax.vlines(t, ref_y - .27, ref_y + .27, color=match_color, lw=2)
+    ax.text(t, ref_y + .39, label, ha="center", va="bottom", fontsize=11)
+for t, label in zip(cand_times, labels):
+    ax.vlines(t, cand_y - .27, cand_y + .27, color=match_color, lw=2)
+    ax.text(t, cand_y - .39, label, ha="center", va="top", fontsize=11)
 
-# (c) Table view: explicit sequence and timing results.
-ax = axes[2]
-ax.axis("off")
-rows = [
-    ["1", "Phase 2 green + Overlap A green\n0.0 s", "Phase 2 green + Overlap A green\n0.2 s", "Sequence match; 0.2-s shift"],
-    ["2", "Phase 2 yellow\n4.0 s", "Phase 2 yellow\n4.4 s", "Sequence match; 0.4-s shift"],
-    ["—", "—", "Phase 6 call\n6.1 s", "Additional candidate event"],
-    ["3", "Phase 2 red\n8.0 s", "Phase 2 red\n8.5 s", "Sequence match; 0.5-s shift"],
-]
-table = ax.table(cellText=rows, colLabels=["Aligned order", "Reference group", "Candidate group", "Result"], cellLoc="left", colLoc="left", loc="center", colWidths=[.13, .27, .27, .33])
-table.auto_set_font_size(False)
-table.set_fontsize(11)
-table.scale(1, 1.65)
-for (row, col), cell in table.get_celld().items():
-    cell.set_edgecolor("#8796a5")
-    cell.set_linewidth(.6)
-    if row == 0:
-        cell.set_facecolor("#dfe8ef")
-        cell.set_text_props(weight="bold")
-    elif row == 3:
-        cell.set_facecolor("#f9e7e7")
-ax.set_title("(c) Alignment table separating sequence and timing findings", loc="left", fontsize=12, weight="bold", pad=6)
+extra_time = 6.1
+ax.vlines(extra_time, cand_y - .27, cand_y + .27, color=extra_color, lw=2)
+ax.text(extra_time, cand_y - .39, "Phase 6 call\n(additional)", ha="center", va="top", fontsize=11, color=extra_color)
 
-fig.tight_layout(h_pad=1.0)
-fig.savefig(FIGURES / "alignment-options.pdf", bbox_inches="tight")
+for ref_t, cand_t in zip(ref_times, cand_times):
+    ax.plot([ref_t, cand_t], [ref_y - .27, cand_y + .27], color="#778899", linestyle="--", linewidth=1)
+
+ax.text(4.3, 2.72, "DTW aligns event groups by content; timestamps are compared after alignment.", ha="center", va="top", fontsize=11)
+fig.tight_layout()
+fig.savefig(FIGURES / "alignment-example.pdf", bbox_inches="tight")
 plt.close(fig)
 
 workflow = '''<svg xmlns="http://www.w3.org/2000/svg" width="900" height="225" viewBox="0 0 900 225">

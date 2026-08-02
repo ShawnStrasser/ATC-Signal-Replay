@@ -21,7 +21,7 @@ Analysis reads directly from that DuckDB file. If you explicitly want one
 Parquet file per device under `results/<firmware_version>/logs/`, use the
 archive/export path after the run.
 
-For the normal behavior, use `py firmware_validate.py --report-only`.
+For the normal behavior, first copy `settings.example.json` to `settings.json` and edit the paths, controller targets, and run labels. The live `settings.json` is intentionally ignored by Git because it contains run-specific values.\n\nUse `py firmware_validate.py --report-only` for the normal report-only flow.
 That keeps the original report-only flow, including refreshing
 `results/<firmware_version>/device_events/*.csv` before rebuilding the HTML.
 

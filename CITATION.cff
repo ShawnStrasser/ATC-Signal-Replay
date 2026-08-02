@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use Signal-Replay, please cite the software release and the associated TRB paper when available."
+title: "Signal-Replay"
+version: "0.2.0"
+type: software
+abstract: "Python tools for replaying high-resolution traffic-signal controller events and comparing controller behavior across software and configuration changes."
+authors:
+  - family-names: Strasser
+    given-names: Shawn
+license: MIT
+repository-code: "https://github.com/ShawnStrasser/ATC-Signal-Replay"
+url: "https://github.com/ShawnStrasser/ATC-Signal-Replay"

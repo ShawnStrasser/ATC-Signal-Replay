@@ -1,8 +1,8 @@
 # Signal-Replay (beta release)
 
-Replay historical traffic signal events to test ATC controllers for **bug replication**, **software validation**, and **behavior comparison**.
+Replay historical traffic signal events to test traffic-signal controllers for **bug replication**, **software validation**, **configuration validation**, and **behavior comparison**.
 
-Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian and preempt inputs via NTCIP/SNMP, collects output events from controllers, monitors for phase conflicts, and uses Dynamic Time Warping (DTW) to compare controller behavior across runs. It can send calls to any controller but data collection currently only works with MAXTIME controllers, open an issue or submit pull request to add other controllers.
+Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian, and preempt inputs via NTCIP/SNMP, collects output events from controllers, monitors for phase conflicts, and compares controller behavior across runs. The comparison can identify differences caused by a software release, a timing-parameter change, or a replay/collection problem. Input replay uses standard NTCIP 1202 v3 detector objects in principle; the current output collector is MAXTIME-specific.
 
 ## Features
 
@@ -18,7 +18,7 @@ Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian and 
 ## Installation
 
 ```bash
-pip install signal-replay
+py -m pip install -e .
 ```
 
 ## Quick Start: Conflict Detection
@@ -574,15 +574,15 @@ The study sweeps detector counts (1–40) and device counts (1–10) to quantify
 
 - **Sending actuations**: Any NTCIP 1202 v3 controller (uses standard detector actuation OIDs for vehicle, pedestrian, and preempt detectors)
 - **Collecting output logs**: MAXTIME controllers via HTTP XML endpoint (`/v1/asclog/xml/full`). Other controller types can be added by implementing a new collection method.
-- **Loading input logs**: CSV, Parquet, MAXTIME SQLite `.db` files
+- **Loading input logs**: CSV, Parquet, MAXTIME SQLite `.db` files\n\nThe portability boundary is deliberate: NTCIP makes the input side reusable, while each controller family needs an output-log adapter and event-code mapping before the same comparison can be applied.
 
 ---
 
-## Experimental: Firmware Validation
+## Experimental: Behavioral Validation
 
 > **⚠️ Work in Progress** — The firmware validation workflow is functional but still under active development. APIs and configuration formats may change.
 
-The firmware validation system extends Signal-Replay to automate **A/B testing of controller firmware versions**. It replays the same set of scenarios against a baseline firmware and a new firmware, then compares outputs to detect behavioral regressions.
+The validation system extends Signal-Replay to automate A/B testing of controller behavior. The two runs may use different firmware releases, different timing parameters with the same firmware, or both. The same field-derived input traces are replayed and the resulting high-resolution output events are compared.
 
 ### Concepts
 
@@ -639,7 +639,7 @@ baseline_checkpoint = runner.run()
 # ... flash new firmware onto controllers ...
 
 # Run new firmware
-suite.firmware_version = "2.16.0"
+suite.firmware_version = "candidate"
 runner_new = sr.BatchRunner(suite, debug=True)
 new_checkpoint = runner_new.run()
 

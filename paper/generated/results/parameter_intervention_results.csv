@@ -1,0 +1,26 @@
+scenario_id,parameter_changed,changed_parameter_names,changed_overlap_numbers,change_transaction_time,expected_comparison_group,author_verified,sequence_match_percent,timing_match_percent,status,timing_available,automatically_flagged
+01066,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,83.3,,FAIL,False,True
+03013,false,,,,unchanged,false,100.0,90.6,PASS,True,False
+05018,false,,,,unchanged,false,99.4,99.2,PASS,True,False
+08042,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,66.4,,FAIL,False,True
+08404,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,73.5,,FAIL,False,True
+08411,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,100.0,97.8,PASS,True,False
+12035,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,37.8,,FAIL,False,True
+12036,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,5;6,2026-06-09 to 2026-06-15,changed,false,71.3,,FAIL,False,True
+12059,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,81.0,,FAIL,False,True
+13008,false,,,,unchanged,false,99.5,98.4,PASS,True,False
+13010,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,51.0,,FAIL,False,True
+2B009,false,,,,unchanged,false,99.1,95.6,PASS,True,False
+2B045,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,99.3,99.3,PASS,True,False
+2B049,false,,,,unchanged,false,99.4,95.5,PASS,True,False
+2B052,false,,,,unchanged,false,99.5,99.2,PASS,True,False
+2B054,false,,,,unchanged,false,100.0,99.0,PASS,True,False
+2B085,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,63.9,,FAIL,False,True
+2B094,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,54.2,,FAIL,False,True
+2B337,false,,,,unchanged,false,100.0,99.7,PASS,True,False
+2B339,false,,,,unchanged,false,99.6,99.7,PASS,True,False
+2B349,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,60.2,,FAIL,False,True
+2B530,false,,,,unchanged,false,99.9,98.3,PASS,True,False
+2C009,false,,,,unchanged,false,99.6,99.3,PASS,True,False
+2C042,true,overlapAuxNewTrailYellow;overlapAuxNewTrailRed;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,64.6,,FAIL,False,True
+2C043,true,overlapAuxNewTrailYellow;overlapAuxNewRedRevert,multiple,2026-06-09 to 2026-06-15,changed,false,99.9,99.3,PASS,True,False

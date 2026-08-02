@@ -1,0 +1,10 @@
+factor,value,software_candidate_failures,parameter_changed_flagged,parameter_unchanged_flagged,status,note
+grouping_tolerance_seconds,0.1,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+grouping_tolerance_seconds,0.25,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+grouping_tolerance_seconds,0.5,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+phase_call_reliability_percent,80.0,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+phase_call_reliability_percent,85.0,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+phase_call_reliability_percent,90.0,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+timing_tolerance_seconds,0.25,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+timing_tolerance_seconds,0.5,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.
+timing_tolerance_seconds,1.0,not_run,not_run,not_run,not_run_from_archived_reports,Requires rerunning comparison engine; archived HTML summaries do not contain parameter-sensitivity variants.

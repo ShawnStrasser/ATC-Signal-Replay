@@ -1,0 +1,262 @@
+{
+  "generated_utc": "2026-08-02T02:54:19.593509+00:00",
+  "python": "3.13.14",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "source_commit": "1f25f36",
+  "source_summary": {
+    "files": 25,
+    "rows": 7296218,
+    "duration_hours_sum": 574.998,
+    "rows_by_scenario": [
+      {
+        "scenario": "01066",
+        "rows": 387842,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "03013",
+        "rows": 176017,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:58.500000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "05018",
+        "rows": 318140,
+        "start": "2026-02-16T09:00:00.200000",
+        "end": "2026-02-17T07:59:59.800000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "08042",
+        "rows": 183445,
+        "start": "2026-02-16T09:00:00.100000",
+        "end": "2026-02-17T07:59:59.600000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "08404",
+        "rows": 198196,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:59.800000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "08411",
+        "rows": 114539,
+        "start": "2026-02-16T09:00:01.800000",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 22.999
+      },
+      {
+        "scenario": "12035",
+        "rows": 238860,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:59.500000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "12036",
+        "rows": 182473,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:59.800000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "12059",
+        "rows": 232367,
+        "start": "2026-02-16T09:00:00.800000",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "13008",
+        "rows": 213372,
+        "start": "2026-02-16T09:00:00.100000",
+        "end": "2026-02-17T07:59:59.400000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "13010",
+        "rows": 213866,
+        "start": "2026-02-16T09:00:00.600000",
+        "end": "2026-02-17T07:59:59.300000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B009",
+        "rows": 528299,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B045",
+        "rows": 323267,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B049",
+        "rows": 444344,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B052",
+        "rows": 369568,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B054",
+        "rows": 241472,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B085",
+        "rows": 402310,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:59.800000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B094",
+        "rows": 343506,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B337",
+        "rows": 150190,
+        "start": "2026-02-16T09:00:01.200000",
+        "end": "2026-02-17T07:59:59.600000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B339",
+        "rows": 347865,
+        "start": "2026-02-16T09:00:02",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 22.999
+      },
+      {
+        "scenario": "2B349",
+        "rows": 389441,
+        "start": "2026-02-16T09:00:00.100000",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2B530",
+        "rows": 392734,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T07:59:59.300000",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2C009",
+        "rows": 460984,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2C042",
+        "rows": 181608,
+        "start": "2026-02-16T09:00:00.400000",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      },
+      {
+        "scenario": "2C043",
+        "rows": 261513,
+        "start": "2026-02-16T09:00:00",
+        "end": "2026-02-17T08:00:00",
+        "duration_hours": 23.0
+      }
+    ]
+  },
+  "database_summaries": [
+    {
+      "label": "2.15.1",
+      "database": "\\\\scdata2\\signalshar\\Data_Analysis\\Python\\ATC-Signal-Replay\\firmware_validation\\results\\2.15.1\\collected.db",
+      "sha256": "c356e0d91a565938d7c8036001c116a7e6afe9015b9c261449dbe04fef21fc29",
+      "tables": "conflicts,events,input_events,simulation_runs",
+      "events_count": 7574994,
+      "input_events_count": 627240,
+      "input_detector_events_count": 0,
+      "latency_offset_samples_count": 0,
+      "latency_offset_updates_count": 0,
+      "event_devices": 25,
+      "event_start": "2026-04-16T08:30:05.400000",
+      "event_end": "2026-04-21T08:00:43",
+      "event_duration_hours": 119.51,
+      "input_start": "2026-02-16T09:00:01.400000",
+      "input_end": "2026-02-17T08:00:00",
+      "run_count": 1,
+      "run_statuses": "completed:1"
+    },
+    {
+      "label": "2.18.1",
+      "database": "\\\\scdata2\\signalshar\\Data_Analysis\\Python\\ATC-Signal-Replay\\firmware_validation\\results\\2.18.1\\collected.db",
+      "sha256": "4dc81bf7949dd050dc1838dafe106d1769b5e0c1fe275ba9a5c735744d1e7005",
+      "tables": "conflicts,events,input_detector_events,input_events,latency_offset_samples,latency_offset_updates,simulation_runs",
+      "events_count": 8019167,
+      "input_events_count": 627240,
+      "input_detector_events_count": 1985416,
+      "latency_offset_samples_count": 707458,
+      "latency_offset_updates_count": 6577,
+      "event_devices": 25,
+      "event_start": "2026-05-26T08:32:18.900000",
+      "event_end": "2026-06-02T08:00:23.400000",
+      "event_duration_hours": 167.468,
+      "input_start": "2026-02-16T09:00:01.400000",
+      "input_end": "2026-02-17T08:00:00",
+      "run_count": 1,
+      "run_statuses": "completed:1"
+    },
+    {
+      "label": "2.18.1_parameter_modified",
+      "database": "\\\\scdata2\\signalshar\\Data_Analysis\\Python\\ATC-Signal-Replay\\firmware_validation\\results\\2.18.1_trailing\\collected.db",
+      "sha256": "029540cb6929549a495212d529fe5c55c44a2b61ad7042f9c17ec79f539e09d3",
+      "tables": "conflicts,events,input_detector_events,input_events,latency_offset_samples,latency_offset_updates,simulation_runs",
+      "events_count": 7993042,
+      "input_events_count": 627240,
+      "input_detector_events_count": 1985416,
+      "latency_offset_samples_count": 704291,
+      "latency_offset_updates_count": 6552,
+      "event_devices": 25,
+      "event_start": "2026-06-10T08:33:47.200000",
+      "event_end": "2026-06-16T08:00:23.400000",
+      "event_duration_hours": 143.443,
+      "input_start": "2026-02-16T09:00:01.400000",
+      "input_end": "2026-02-17T08:00:00",
+      "run_count": 1,
+      "run_statuses": "completed:1"
+    }
+  ],
+  "software_report_summary": {
+    "report": "\\\\scdata2\\signalshar\\Data_Analysis\\Python\\ATC-Signal-Replay\\firmware_validation\\results\\2.18.1\\report.html",
+    "generated": "Generated 2026-06-02",
+    "scenarios_passed": "19/25",
+    "avg_sequence_match": "96.2",
+    "avg_timing_match": "93.8"
+  },
+  "parameter_report_summary": {
+    "report": "\\\\scdata2\\signalshar\\Data_Analysis\\Python\\ATC-Signal-Replay\\firmware_validation\\results\\2.18.1_trailing\\report.html",
+    "generated": "Generated 2026-07-02",
+    "scenarios_passed": "14/25",
+    "avg_sequence_match": "84.1",
+    "avg_timing_match": "97.9"
+  },
+  "comparison_method": "Archived HTML report rows cross-checked against stored DuckDB counts; no controller replay is performed by this script."
+}

@@ -1,0 +1,27 @@
+﻿[paths]
+source_logs = "../../firmware_validation/logs"
+database_2_15_1 = "../../firmware_validation/results/2.15.1/collected.db"
+database_2_18_1 = "../../firmware_validation/results/2.18.1/collected.db"
+database_2_18_1_parameter_modified = "../../firmware_validation/results/2.18.1_trailing/collected.db"
+report_2_18_1 = "../../firmware_validation/results/2.18.1/report.html"
+report_2_18_1_parameter_modified = "../../firmware_validation/results/2.18.1_trailing/report.html"
+
+[experiments]
+software_label = "2.15.1 to 2.18.1"
+parameter_label = "2.18.1 to 2.18.1 with trailing-overlap changes"
+configuration_count = 25
+
+[comparison]
+event_ids = [1, 7, 9, 11, 21, 22, 23, 32, 33, 55, 56, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 105, 106, 107, 111, 112, 113, 114, 115, 118, 119]
+phase_call_event_ids = [61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72]
+analysis_start = "2026-05-01T00:00:00"
+grouping_tolerance_seconds = 0.25
+rolling_window_seconds = 300
+rolling_step_seconds = 60
+sequence_threshold_percent = 95.0
+timing_threshold_percent = 90.0
+timing_tolerance_seconds = 0.5
+phase_call_reliability_percent = 85.0
+
+[source]
+source_commit = "1f25f36"

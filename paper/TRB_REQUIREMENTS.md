@@ -29,7 +29,7 @@ Current manuscript checks:
 
 - Complete 11-page research paper, below the 20-page maximum.
 - Title page includes the paper title, single author, job title, affiliation, email address, and total page count.
-- Structured abstract is alone on page 2, contains the five headings in the required order, defines NTCIP on first use, and is 296 words.
+- Structured abstract is alone on page 2, contains the five headings in the required order, defines NTCIP on first use, and is 291 words.
 - PDF is US Letter with one-inch margins, one column, single spacing, Times New Roman at 10 pt or larger, line numbers restarting on every page, and bottom-centered page numbers.
 - Tables use 10-point Times New Roman and are embedded near their first citation. The Experimental Design table is not split across pages.
 - Figures are embedded near their first citation. Figure 2 uses the selected timeline explanation of DTW event alignment.

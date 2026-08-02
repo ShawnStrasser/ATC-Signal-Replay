@@ -6,7 +6,7 @@
 - **Research question:** Can real high-resolution events experienced by live field controllers be replayed to test controllers and the resulting outputs compared automatically for operational differences?
 - **Answer:** Yes. Independent unchanged campaigns averaged 99.6% sequence match and 97.7% timing match, demonstrating that the outputs were deterministic enough for automatic alignment. Known timing changes and a confirmed preemption bug fix remained visible.
 - **Contribution:** An open-source workflow that substantially enhances manual testing with full-day, parallel testing of production configurations; DTW alignment; clearance, pedestrian, preemption, and transition checks; and a virtual conflict monitor.
-- **Novelty:** The reviewed literature did not identify prior work combining replay of full-day events actually experienced by live field controllers with complete output-sequence alignment across numerous production configurations.
+- **Novelty:** The reviewed literature did not identify prior work combining replay of full-day events actually experienced by live field controllers with full-day operational-output event alignment across numerous production configurations.
 - **Operational use:** ODOT now uses the workflow for controller-software acceptance.
 - **Submission option:** Presentation and Publication, if the paper is not published or under review elsewhere.
 
@@ -26,12 +26,13 @@
 
 ## Author decisions required
 
-1. Confirm that the 14 changed/11 unchanged intervention grouping is the intended description. Transaction histories support it, but the detailed edits are not yet marked author-verified in the intervention manifest.
-2. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
-3. Approve the case-study figures, captions, ODOT operational-use statement, and overlap/preemption interpretations.
-4. Confirm any required ODOT disclaimer or institutional approval.
-5. Choose the submission option and approve the generative-AI disclosure.
-6. Decide whether to publish the comparison-only dataset and whether to tag software release `v0.2.0`.
+1. If possible, classify the five release review cases remaining after the likely 12036 environment issue. They can be reported as unexplained if no stronger evidence is available.
+2. Approve the case-study figures, captions, ODOT operational-use statement, and overlap/preemption interpretations.
+3. Confirm any required ODOT disclaimer or institutional approval.
+4. Choose the submission option and approve the generative-AI disclosure.
+5. Decide whether to publish the comparison-only dataset and whether to tag software release `v0.2.0`.
+
+The author has confirmed the 14 changed/11 unchanged grouping. The manifest records that confirmation separately from the detailed transaction-history interpretation, which has not been individually author-verified.
 
 ## Remaining substantive gaps
 
@@ -60,11 +61,11 @@ The public repository now includes the source, tests, documentation, offline syn
 - Build: `typst compile paper/manuscript.typ paper/generated/trb-paper.pdf`
 - PDF: `paper/generated/trb-paper.pdf`
 - Page count: **11 pages**.
-- Structured abstract: **296 words**.
+- Structured abstract: **291 words**.
 - PDF page size: 612 x 792 points (US Letter); no right-margin overflow was detected.
 - Extracted manuscript, table, workflow, and alignment-figure text is Times New Roman at 10 pt or larger. Natural mathematical subscripts are smaller.
 - The Experimental Design section and Table 2 begin together; the table does not split across pages.
 - Quantitative output validation passes, including the 25-row release/intervention counts, 99.6%/97.7% repeatability means, and zero stored virtual conflicts.
 - Maintained package tests from the package update: **134 passed, 42 skipped**.
 
-The manuscript is close to submission-ready but still requires the author decisions above.
+Independent reviews of publication readiness, external sources, and prose found no remaining scientific or novelty blocker after the corrections documented above. The manuscript is technically ready for submission, pending the author's final visual/factual approval, submission selections, AI-disclosure approval, and any required ODOT approval. The five incompletely classified release cases remain disclosed as review cases and do not invalidate the feasibility finding.

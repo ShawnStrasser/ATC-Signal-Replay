@@ -22,10 +22,11 @@
 | Study | Input source | Test environment | Output evaluation | Version comparison | Main distinction |
 |---|---|---|---|---|---|
 | Li et al. (2008), DOI 10.1016/j.trc.2007.10.001 | Authored functional scripts | Controller automated-test tool and interface hardware | Predefined expected responses | Controller/firmware testing context, not full trace regression | Closest prior system; this study replaces manually authored long-form input/expected-output definitions with field-derived inputs and a baseline output trace. |
-| Ahmed et al. (2010), FHWA-ID-10-180 | XML scripts specify activation, timing, and response | NEMA TS1/TS2 controllers, CID, NTCIP variants | Automated response verification and stored results | Specific firmware/device support discussed | Establishes automated suitcase replacement and NTCIP challenges; does not replay long field histories or align complete output traces. |
+| Ahmed et al. (2010), FHWA-ID-10-180 | XML scripts specify activation, timing, and response | NEMA TS1/TS2 controllers, CID, NTCIP variants | Automated response verification and stored results | Specific firmware/device support discussed | Establishes automated suitcase replacement and NTCIP challenges; does not replay long field histories or align full-day operational-output event traces. |
 | Tung (2012; 2015) | Authored NTCIP/conformance tests | Multiple controller devices | Functional/conformance outcomes | Testing across device implementations | Strong precedent for NTCIP automation and portability; different test source and output comparison. |
 | Stevanovic, Klanac, and Radivojevic (2017) | Microsimulation-generated activity | Six vendors in hardware-in-the-loop | Logger and performance-measure consistency | No field-derived release regression identified | Supports event normalization and platform limitations. |
 | Wang, Tian, and Yang (2021) | Microsimulation-generated detector activity | Hardware-, software-, and emulator-in-the-loop via virtual CID | Queue, delay, trajectories | Environment comparison | Supports NTCIP controller interfaces and emulator limitations; not direct whole-event regression. |
+| Hurwitz et al. (2026), FHWA-OR-RD-26-08 | Microsimulation-generated activity | Controller-in-the-loop testing across 15 models | Corridor performance under timing changes | Timing alternatives, not software regression | Closest recent ODOT work; it uses simulation inputs and performance measures rather than live-field replay and operational-output trace alignment. |
 | Sakoe and Chiba (1978) | Numeric sequences | General sequence alignment | Minimum-cost monotone path | Not applicable | Mathematical foundation for DTW recurrence. |
 | Sturdevant et al. (2012) | High-resolution signal events | Controller event logger vocabulary | Event definitions at tenth-second resolution | Not applicable | Defines the operational event-data substrate; not a testing method. |
 
@@ -33,7 +34,7 @@
 
 The evidence supports this cautious statement:
 
-> Prior work automated scripted controller-function tests and evaluated controller hardware, software, emulators, and high-resolution logging. The reviewed literature did not identify a study that converted long-duration live field input histories into reusable controller tests and automatically aligned complete controller-output event traces across numerous production configurations for software and timing-parameter regression.
+> Prior work automated scripted controller-function tests and evaluated controller hardware, software, emulators, and high-resolution logging. The reviewed literature did not identify a study that converted long-duration live field input histories into reusable controller tests and automatically aligned full-day operational-output event traces across numerous production configurations for software and timing-parameter regression.
 
 Do not claim novelty for automated controller testing, NTCIP testing, controller emulation, high-resolution logging, DTW, or firmware testing individually.
 

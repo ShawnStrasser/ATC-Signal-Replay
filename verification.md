@@ -7,7 +7,7 @@ Corrections and requirements update: 2026-08-02
 
 ## Overall result
 
-I independently checked all nine entries in `paper/references.bib` against the original publisher, government-repository, institutional, or standards source. I found no fabricated source, DOI, report number, author group, or title.
+I independently checked all ten entries in `paper/references.bib` against the original publisher, government-repository, institutional, or standards source. I found no fabricated source, DOI, report number, author group, or title.
 
 The sources are genuine and the principal related-work claims are supported. Two attribution issues found during review have been corrected in the manuscript:
 
@@ -42,7 +42,7 @@ Page numbers below are PDF page numbers where a PDF is linked. For reports with 
 
 ### 1. Li et al. (2008) — `li2008`
 
-**Bibliography identity.** The [ScienceDirect record](https://www.sciencedirect.com/science/article/abs/pii/S0968090X07000812) and [University of Idaho record](https://verso.uidaho.edu/esploro/outputs/journalArticle/Design-of-traffic-controller-automated-testing/996630838201851) identify *Design of traffic controller automated testing tool* by Zhen Li, Ahmed Abdel-Rahim, Brian Johnson, and Michael Kyte, published in *Transportation Research Part C: Emerging Technologies*, volume 16, issue 3, pages 277–293, in 2008. The DOI resolves as `https://doi.org/10.1016/j.trc.2007.10.001`. These match the bibliography except for ordinary author-name formatting (`Ahmed-Abdel-Rahim` in the BibTeX entry versus `Ahmed Abdel-Rahim` in the source records).
+**Bibliography identity.** The [ScienceDirect record](https://www.sciencedirect.com/science/article/abs/pii/S0968090X07000812) and [University of Idaho record](https://verso.uidaho.edu/esploro/outputs/journalArticle/Design-of-traffic-controller-automated-testing/996630838201851) identify *Design of traffic controller automated testing tool* by Zhen Li, Ahmed Abdel-Rahim, Brian Johnson, and Michael Kyte, published in *Transportation Research Part C: Emerging Technologies*, volume 16, issue 3, pages 277–293, in 2008. The DOI resolves as `https://doi.org/10.1016/j.trc.2007.10.001`. These match the corrected bibliography entry for Ahmed Abdel-Rahim.
 
 **How to see the relevant text.**
 
@@ -95,7 +95,7 @@ Page numbers below are PDF page numbers where a PDF is linked. For reports with 
 5. On PDF page 12, read **Table 2: Results and Products**. It says testing was performed on five different models of NTCIP-compliant ASC from various manufacturers.
 6. On PDF page 13, read **V. Conclusion**. It explicitly calls the developed NTCIP-based system manufacturer/vendor independent.
 
-**Claim assessment.** Supported. This is the source that most directly supports the manuscript’s claim that Tung extended NTCIP-based automated testing across controller devices. It still describes functional/automated tests, not full-day field-log replay or automatic alignment of complete output traces.
+**Claim assessment.** Supported. This is the source that most directly supports the manuscript’s claim that Tung extended NTCIP-based automated testing across controller devices. It still describes functional/automated tests, not full-day field-log replay or automatic alignment of operational-output event traces.
 
 ### 5. Wang, Tian, and Yang (2021) — `wang2021`
 
@@ -168,9 +168,12 @@ Page numbers below are PDF page numbers where a PDF is linked. For reports with 
 
 **Claim assessment.** Supported. NTCIP 1202 directly supports the manuscript’s statement that vehicle, pedestrian, and preempt input states can be represented through NTCIP objects and remotely controlled. The standard does not, by itself, verify that MAXTIME or any particular vendor implements every object correctly; that is an implementation/evaluation claim made elsewhere in the manuscript.
 
+### 10. Hurwitz et al. (2026) — `hurwitz2026`
+
+**Verdict: Supported.** The official [ROSA P record](https://rosap.ntl.bts.gov/view/dot/89526) identifies *Signal Controller in the Loop Simulation* by David Hurwitz, Hisham Jashami, Logan Scott-Deeter, Syed Baqir Ul Husnain, and Xiugang Li, published in March 2026 as reports FHWA-OR-RD-26-08 and SPR 861. It reports controller-in-the-loop evaluation of timing changes across 15 microsimulation models. The manuscript uses it as a direct contrast: simulation-generated inputs and corridor performance measures versus events recorded during live field operation and operational-output trace comparison.
 ## Claims not established by the bibliography alone
 
-These are not fabricated citations, but they are claims that require the paper’s own evidence, code, data, or a documented literature-search method rather than the nine external sources:
+These are not fabricated citations, but they are claims that require the paper’s own evidence, code, data, or a documented literature-search method rather than the ten external sources:
 
 - The 25 configurations, 23-hour traces, event counts, DTW scores, thresholds, 11/14 detections, and zero conflicts are empirical claims about this project. They should be checked against the repository evidence identified in `paper/EVIDENCE.md`.
 - The MAXTIME version numbers, rail-preemption bug fix, overlap-clearance findings, and ODOT operational-use statement are project-specific claims, not claims established by the cited literature.
@@ -182,7 +185,8 @@ These are not fabricated citations, but they are claims that require the paper�
 The repository paper was updated in response to this verification:
 
 - The related-work paragraph now attributes `CIDScript` to Li et al. (2008) and XML scripts to Ahmed et al. (2010).
-- The Tung discussion now distinguishes the 2012 single-controller work from the 2015 evaluation of 20 NTCIP-based programs on five compliant controller models.
+- The Tung discussion now distinguishes the 2012 single-controller work from the 2015 evaluation of 20 NTCIP-based programs on five compliant controller models; the 2012 title, institution, and report number are corrected.
+- The 2026 ODOT controller-in-the-loop report is added as a current contrast to live-field replay.
 - The Li, Wang, and Sakoe and Chiba article titles now use Chicago sentence case.
 - Ahmed Abdel-Rahim's name is entered consistently with the source record.
 - The NTCIP entry now uses the official title *Object Definitions for Actuated Signal Controllers (ASC) Interface*.

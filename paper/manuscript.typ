@@ -19,6 +19,7 @@
   #text(size: 11pt, weight: "bold")[Shawn Strasser, P.E.] \
   Traffic Signal Operations Engineer \
   Oregon Department of Transportation \
+  ORCID: #link("https://orcid.org/0009-0004-5468-7669")[0009-0004-5468-7669] \
   shawn.strasser12\@gmail.com
   #v(0.45in)
   #text(size: 10pt)[Total manuscript pages: #context counter(page).final().first()]
@@ -27,15 +28,15 @@
 
 #align(center)[#text(size: 12pt, weight: "bold")[Structured Abstract]]
 #v(0.18in)
-*Objectives.* Manual controller testing cannot reproduce everything a signal controller experiences over a day, including interacting vehicle, pedestrian, coordination, and preemption activity. This study evaluates whether recorded high-resolution field events can be replayed to test controllers and their output sequences automatically aligned and compared to identify operational differences.
+*Objectives.* Manual controller testing cannot reproduce a day of interacting vehicle, pedestrian, coordination, and preemption activity. This study evaluates whether recorded high-resolution field events can be replayed to test controllers and their output sequences automatically aligned and compared to identify operational differences.
 
-*Methods.* An open-source Python package converts high-resolution logs to National Transportation Communications for Intelligent Transportation Systems Protocol (NTCIP) calls and replays them to test controllers. Output events are grouped by timestamp and aligned using dynamic time warping with Jaccard distance between event sets. It also checks clearance intervals and incompatible signal phases and overlaps. Approximately 23 hours of events from each of 25 production configurations were replayed to controller emulators. Separate runs tested repeatability, known timing changes, and practical use for software-version acceptance.
+*Methods.* An open-source Python package converts high-resolution logs to National Transportation Communications for Intelligent Transportation Systems Protocol (NTCIP) calls and replays them to test controllers. Output events are grouped into sets of near-simultaneous events and aligned using dynamic time warping with Jaccard distance between event sets. It also checks clearances and incompatible phases and overlaps. Approximately 23 hours of events from each of 25 production configurations were replayed to controller emulators. Separate runs tested repeatability, known timing changes, and practical use for software-version acceptance.
 
-*Findings.* Controller outputs from separate unchanged runs aligned with 99.6 percent mean sequence match and 97.7 percent mean timing match, demonstrating that controller responses to field-derived replay were deterministic enough for automatic comparison. The method flagged operational differences in 11 of 14 configurations with deliberate overlap clearance-setting changes and none of the 11 unchanged configurations. Applied to a software update, it identified differences within similar full-day operation, including correction of a rail-preemption exit bug. No incompatible signal phases or overlaps were detected.
+*Findings.* Controller outputs from separate unchanged runs aligned with 99.6 percent mean sequence match and 97.7 percent mean timing match, demonstrating that controller responses to field-derived replay were deterministic enough for automatic comparison. The method flagged 11 of 14 configurations with deliberate overlap clearance-setting changes and none of the 11 unchanged configurations. Applied to a software update, it identified differences within similar full-day operation, including correction of a rail-preemption exit bug. No incompatible signal phases or overlaps were detected among the 21 configurations with defined incompatible pairs.
 
-*Novelty.* The study combines replay of full-day event sequences actually experienced by live field controllers with automatic alignment and comparison of complete controller-output sequences across numerous production timing configurations.
+*Novelty.* The study combines replay of full-day events experienced by live field controllers with automatic alignment of operational-output sequences across numerous production timing configurations.
 
-*Practical Applications.* The open-source workflow expands acceptance testing beyond manually toggling individual inputs. Agencies can replay signal activity across many configurations, identify unexpected differences before field deployment, reproduce field failures, and test software or timing corrections against the same inputs. The Oregon Department of Transportation (ODOT) now uses the workflow for software-version acceptance.
+*Practical Applications.* The open-source workflow expands acceptance testing beyond manual input toggling. Agencies can replay signal activity across many configurations, identify unexpected differences before field deployment, reproduce field failures, and test software or timing corrections against the same inputs. The Oregon Department of Transportation (ODOT) now uses the workflow for software-version acceptance.
 #pagebreak()
 
 = Introduction
@@ -51,11 +52,11 @@ Feasibility requires both repeatability and sensitivity to change. Replaying the
 The evaluation covers 25 production configurations and three emulator campaigns using MAXTIME controller software: version 2.15.1, version 2.18.1, and version 2.18.1 after overlap trailing yellow and red clearance settings were changed to prevent occasional truncated yellow and red intervals. The primary contribution is evidence that field-derived controller outputs were repeatable enough for automated comparison and that the method successfully identified real operational differences. The specific software versions provide the case study; the finding is that this form of testing works.
 = Related Work
 
-Li et al. developed a controller automated-testing tool using its CIDScript language @li2008. A subsequent Idaho Transportation Department system used Extensible Markup Language (XML) scripts to activate inputs and verify predefined responses @ahmed2010. Tung first demonstrated automated testing on a National Electrical Manufacturers Association (NEMA) TS2 Type-1 controller @tung2012, then reported 20 NTCIP-based test programs evaluated on five compliant controller models @tung2015. These systems established the value of repeatable automated tests. The present method differs by replaying real events recorded as they occurred at live field controllers and using a prior complete output trace as the expected response rather than requiring staff to author every input and assertion.
+Li et al. developed a controller automated-testing tool using its CIDScript language @li2008. A subsequent Idaho Transportation Department system used Extensible Markup Language (XML) scripts to activate inputs and verify predefined responses @ahmed2010. Tung first demonstrated automated testing on a National Electrical Manufacturers Association (NEMA) TS2 Type-1 controller @tung2012, then reported 20 NTCIP-based test programs evaluated on five compliant controller models @tung2015. These systems established the value of repeatable automated tests. The present method differs by replaying real events recorded as they occurred at live field controllers and using a prior operational-output trace as the expected response rather than requiring staff to author every input and assertion.
 
-Controller-in-the-loop studies have connected controllers and emulators to traffic simulation through physical or virtual interfaces @wang2021. Stevanovic, Klanac, and Radivojevic evaluated high-resolution logging across six controller vendors @stevanovic2017. Those studies support the use of controlled controller environments and show that output-event semantics require platform-specific validation. They did not evaluate field-log replay for software regression across production configurations.
+Controller-in-the-loop studies have connected controllers and emulators to traffic simulation through physical or virtual interfaces @wang2021. Stevanovic, Klanac, and Radivojevic evaluated high-resolution logging across six controller vendors @stevanovic2017. A recent Oregon Department of Transportation (ODOT) controller-in-the-loop study evaluated timing changes across 15 microsimulation models @hurwitz2026. Those studies support controlled controller environments and platform-specific output validation. The present study instead replays inputs recorded during live field operation and compares operational-output event traces across production configurations.
 
-High-resolution event records provide tenth-second controller and detector histories @sturdevant2012. Dynamic time warping (DTW) provides a monotone alignment for sequences with local timing variation @sakoe1978. The literature reviewed for this study did not identify a prior evaluation combining full-day replay of events recorded from live field controllers, automatic complete-output alignment, and repeated software and timing tests across numerous production configurations.
+High-resolution event records provide tenth-second controller and detector histories @sturdevant2012. Dynamic time warping (DTW) provides a monotone alignment for sequences with local timing variation @sakoe1978. The literature reviewed for this study did not identify a prior evaluation combining full-day replay of events recorded from live field controllers, automatic operational-output event alignment, and repeated software and timing tests across numerous production configurations.
 
 = Replay and Test Architecture
 
@@ -66,7 +67,7 @@ High-resolution event records provide tenth-second controller and detector histo
 
 == Field event conversion
 
-Each of the 25 source logs spans approximately 9:00 a.m. to 8:00 a.m. the next day. Together they contain 7,296,218 records: approximately 23 hours per controller, or 575 hours when summed across all controllers. Replay selects vehicle detector, pedestrian detector, and preemption changes. Table 1 shows the conversion implemented in the package.
+Each of the 25 source logs spans approximately 9:00 a.m. to 8:00 a.m. the next day. Together they contain 7,296,218 records: approximately 23 hours per controller, or 575 hours when summed across all controllers. Replay selects vehicle detector, pedestrian detector, and preemption changes. Table 1 shows the conversion implemented in the package @sturdevant2012.
 
 #text(size: 10pt)[#table(
   columns: (1.25fr, 1fr, 1.1fr, 2.3fr), inset: 3pt, stroke: 0.5pt,
@@ -77,12 +78,12 @@ Each of the 25 source logs spans approximately 9:00 a.m. to 8:00 a.m. the next d
 )]
 #figure.caption([Table 1. Conversion from field events to replay inputs.])
 
-Repeated on/off records are repaired by imputing the missing opposite transition. The Oregon Department of Transportation (ODOT) reserves detector numbers 65 and above for nonstandard uses, so those detector numbers are excluded from replay. Before replay, all calls are reset to zero. The package then sends Simple Network Management Protocol (SNMP) SET operations to NTCIP 1202 vehicle, pedestrian, and preempt objects at the recorded time of day @ntcip1202. Preserving time of day also exercises coordination and time-of-day plan changes.
+Repeated on/off records are repaired by imputing the missing opposite transition. ODOT reserves detector numbers 65 and above for nonstandard uses, so those detector numbers are excluded from replay. Before replay, all calls are reset to zero. The package then sends Simple Network Management Protocol (SNMP) SET operations to NTCIP 1202 vehicle, pedestrian, and preempt objects at the recorded time of day @ntcip1202. Preserving time of day also exercises coordination and time-of-day plan changes.
 
 The evaluated implementation used MAXTIME emulators loaded with production databases. Emulator accommodations removed detector delay/extension, disabled unused input/output modules, removed inverted preempt logic, used localhost peer addresses, and mapped overlap pedestrian calls to reserved detector inputs because MAXTIME was not accepting overlap pedestrian calls through NTCIP. Output events were collected through a MAXTIME Hypertext Transfer Protocol (HTTP) interface. Because replay inputs are sent through NTCIP 1202 objects, the input side is not tied to MAXTIME or another controller brand. The event-log collector currently reads MAXTIME logs; it can be extended to another controller family by mapping that controller's events to the common timestamp/event/parameter format.
 == Parallel replay and latency control
 
-Signals assigned to available emulator targets run concurrently. The 25 configurations were processed in batches over approximately one week without requiring staff to operate each input. After the initial setup, future releases are expected to require only a few hours of staff preparation and review; this is operational experience, not a formal labor study.
+Signals assigned to available emulator targets run concurrently. The 25 configurations were processed in batches over approximately one week without requiring staff to operate each input. Based on this deployment, future releases are expected to require only a few hours of staff preparation and review, although labor was not measured formally.
 
 The workstation clock was found to drift relative to the test-controller clocks during the long replays. Without correction, the same input could gradually be recorded at a different controller time. The replay therefore schedules each command early by a per-controller latency offset. At periodic intervals, the package matches isolated detector-on inputs with the corresponding detector-on events recorded by the controller, compares the scheduled send time with the controller timestamp, and updates the offset to the measured median delay. The offset changes gradually during playback to avoid an abrupt timing jump. The MAXTIME version 2.18.1 release database contains 707,458 latency samples and 6,577 applied updates. Each campaign contains 627,240 replay commands and between 7.57 and 8.02 million controller-output events.
 
@@ -90,7 +91,7 @@ The workstation clock was found to drift relative to the test-controller clocks 
 
 == Discrete-event dynamic time warping
 
-Events recorded at the same time, or within a 0.25-second grouping window, are represented as one set of (event identifier, parameter) pairs. This prevents the arbitrary database order of simultaneous events from affecting the result. The timestamps define the groups and support the initial time alignment, but they are not part of the DTW sequence cost. Let $A_i$ and $B_j$ be the $i$th and $j$th event groups in the reference and candidate sequences. Their local sequence cost is Jaccard distance:
+Events recorded at the same time, or within a 0.25-second grouping window, are represented as one set of (event identifier, parameter) pairs. This prevents the arbitrary database order of simultaneous events from affecting the result. The timestamps define the groups and support the initial time alignment, but they are not part of the DTW sequence cost. The comparison retains 33 specified operational-output event codes; input events and redundant output codes are excluded. Let $A_i$ and $B_j$ be the $i$th and $j$th event groups in the reference and candidate sequences. Their local sequence cost is Jaccard distance:
 
 $ d(A_i, B_j) = 1 - frac(abs(A_i ∩ B_j), abs(A_i ∪ B_j)). $ <eq-jaccard>
 
@@ -105,7 +106,7 @@ with $D(0,0)=0$ and inaccessible borders set to infinity. Backtracking produces 
   caption: [Simplified event-sequence alignment. DTW aligns matching event groups by content and flags the additional Phase 6 call. After the sequence alignment is established, timestamp differences are evaluated separately.],
 ) <fig-alignment>
 
-Sequence scores are calculated in 45-minute windows advanced every 40 minutes. Sixty seconds are clipped from each window edge to avoid penalizing a cycle split at a boundary. Sequence match is the percentage of aligned event-group pairs with zero Jaccard distance. Timing match is the percentage of exactly matched groups within 0.50 seconds after removing the remaining median clock offset from their timestamp differences. A configuration passes at 95 percent sequence match and 90 percent timing match.
+Sequence scores are calculated in 45-minute windows advanced every 40 minutes. Sixty seconds are clipped from each window edge to avoid penalizing a cycle split at a boundary. Sequence match is the percentage of aligned event-group pairs with zero Jaccard distance. Timing match is the percentage of exactly matched groups within 0.50 seconds after removing the remaining median clock offset from their timestamp differences. A configuration passes at 95 percent sequence match and 90 percent timing match. These are operational screening thresholds for staff review, not statistically calibrated decision boundaries.
 
 Vehicle phase-call similarity provides a separate replay-reliability check. Windows below 85 percent are displayed but excluded from the configuration average. This helps distinguish controller differences from a test environment that did not reproduce the intended inputs.
 
@@ -142,7 +143,7 @@ Occasional truncated overlap yellow and red clearance intervals had been observe
 
 All 11 unchanged configurations passed across separate MAXTIME 2.18.1 replay campaigns. Their mean sequence match was 99.6 percent (range 99.1--100.0 percent), and their mean timing match was 97.7 percent (range 90.6--99.7 percent). These were independent full-day controller executions, not a recorded output compared with itself. This is the principal feasibility result: the controller responses were deterministic enough for DTW to align and compare them automatically.
 
-Eleven of 14 configurations with applicable overlap clearance-setting changes were flagged, while none of the 11 unchanged configurations was flagged. The three changed configurations that passed had sequence matches of 99.3, 99.9, and 100.0 percent; the recorded input apparently did not materially exercise the affected behavior. Table 3 summarizes the result without implying exhaustive coverage of every possible timing change.
+Eleven of 14 configurations with applicable overlap clearance-setting changes were flagged, while none of the 11 unchanged configurations was flagged. The three changed configurations that passed had sequence matches of 99.3, 99.9, and 100.0 percent; the recorded input may not have exercised the affected behavior, or the comparison may have been insensitive to the resulting change. Table 3 summarizes the result without implying exhaustive coverage of every possible timing change.
 
 #table(
   columns: (2fr, 1fr, 1fr, 1fr), inset: 4pt, stroke: 0.5pt,
@@ -160,7 +161,7 @@ The overlap-setting test was motivated by the type of event shown in @fig-overla
 ) <fig-overlap>
 == Application to software-version acceptance
 
-After repeatability was established, the method was applied to acceptance testing of a new software version. Configuration labels such as 12036 and 2B045 are ODOT internal tracking identifiers for individual signalized intersections. Nineteen of 25 configurations passed the aggregate thresholds and six were directed to staff review. Mean sequence match was 96.2 percent and mean timing match was 93.8 percent. Four configurations fell below the sequence threshold; two exceeded the sequence threshold but fell below the timing threshold. These counts describe how the review was organized; the important result is that the aligned traces exposed specific changes in signal operation.
+After repeatability was established, the method was applied to acceptance testing of a new software version. Configuration labels such as 12036 and 2B045 are ODOT internal tracking identifiers for individual signalized intersections. Nineteen of 25 configurations passed the aggregate thresholds and six were directed to staff review. Mean sequence match across all 25 configurations was 96.2 percent. Among the 21 configurations with timing scores, mean timing match was 93.8 percent. Four configurations fell below the sequence threshold; two exceeded the sequence threshold but fell below the timing threshold.
 
 #text(size: 10pt)[#table(
   columns: (1.25fr, 0.8fr, 2.8fr), inset: 3pt, stroke: 0.5pt,
@@ -177,7 +178,7 @@ The detailed findings were more informative than the aggregate status:
 - *Transition-algorithm difference (2B049).* The aligned traces showed that the two versions used different short-way coordination-transition logic. The difference did not appear to change signal operation. The trace also raised a separate question: the controller appeared to be in step while still reporting transition (@fig-transition).
 - *Expected clearance behavior (13008).* The report flagged an irregular phase 4 red-clearance interval. Review showed that dynamic red-clear extension was configured, and both versions handled it consistently. The flag demonstrated that an unexpected clearance change would have been visible.
 
-The first two configurations passed the aggregate thresholds. This is important: the tool did not merely label controllers pass or fail. It retained localized differences that confirmed an operationally important bug fix and exposed an apparently non-operational algorithm change within otherwise similar full-day operation.
+Both examples passed the aggregate thresholds, showing why localized differences must be retained for review rather than reduced to a single pass/fail result.
 
 #figure(
   image("figures/preempt-exit-bug-fix.png", width: 100%),
@@ -189,37 +190,35 @@ The first two configurations passed the aggregate thresholds. This is important:
   caption: [Configuration 2B049, short-way transition. The aligned traces show a change in transition logic between MAXTIME versions. No operational difference was apparent, although the controller appeared to be in step while still reporting transition.],
 ) <fig-transition>
 
-No new operation-impacting software defect was confirmed in MAXTIME version 2.18.1 from the reviewed results. The new version was otherwise operationally similar across the tested configurations, and the virtual conflict monitor recorded no incompatible simultaneous outputs.
+No new operation-impacting software defect was confirmed in MAXTIME version 2.18.1 from the reviewed results. The new version was otherwise operationally similar across the tested configurations, and the virtual conflict monitor recorded no incompatible simultaneous outputs among the 21 configurations with defined incompatible pairs.
 
 = Discussion
 
-ODOT now uses the method for controller-software acceptance. It enhances controller testing; it does not simply automate the same manual test. Staff can still check individual functions deliberately, while field replay adds approximately 23 hours of interacting inputs across 25 actual timing configurations. Available emulators run concurrently, and the software checks millions of output events for sequence and timing changes, clearance irregularities, preemption and pedestrian differences, and incompatible signal phases and overlaps. Staff can concentrate on the exceptions instead of choosing and operating every input combination.
-
-The high repeatability of the unchanged runs is what makes this practical. If repeated controller outputs could not be aligned, an unexpected software effect would be indistinguishable from ordinary run-to-run variation. Instead, the same inputs produced closely matching sequences, while deliberate timing changes and a software bug fix remained visible. The comparison therefore provides a broad safety net for unforeseen changes in every behavior exercised by the replay.
+ODOT now uses the method for controller-software acceptance. Its value is added test coverage: approximately 23 hours of interacting inputs are replayed across multiple production configurations while the software checks millions of output events. The repeatability results show that ordinary run-to-run variation is low enough for deliberate timing changes and software differences to remain visible.
 
 Field logs also capture combinations that are difficult to anticipate: simultaneous vehicle and pedestrian calls, time-of-day plan changes, coordination transitions, and preemption during actual traffic operation. A rare failure or flash event can be saved as a targeted replay, used to reproduce a reported problem, and then run again to test a vendor correction or timing workaround.
 
 The accepted baseline is a reference trace, not an assumption that the old operation is always correct. The 13008 preemption difference was desirable because the candidate software fixed a baseline defect. Staff must classify each reported difference as expected, beneficial, harmful, caused by the test environment, or unexplained before accepting a new baseline.
 
-The open-source package separates NTCIP inputs from product-specific outputs. The replay-input method is not tied to a controller brand and can be applied to controllers that implement the required NTCIP objects. MAXTIME is the implementation evaluated here, not a limitation of the underlying replay method.
+The package separates NTCIP replay inputs from product-specific output collection. The input method is potentially portable to controllers supporting the required NTCIP objects, but another controller family would require an event-log collector and event-code mapping and has not yet been evaluated.
 = Limitations
 
 The current event-log collector supports MAXTIME only. Supporting another controller family requires a new event-log interface and event-code mapping. Replay capacity is limited by available computing and network resources, but this evaluation ran as many as 15 emulators simultaneously on a standard Windows desktop. The 23-hour traces cover only the conditions experienced by the 25 field controllers during the recorded day. An edge case occurring on another day or at another configuration will be missed unless that trace and configuration are added. Current time and computing constraints make testing every agency controller impractical, although additional complex or critical intersections can be included as needed.
 
 = Conclusions
 
-This study found that field-derived high-resolution event replay is feasible for comprehensive controller testing. Independent unchanged runs averaged 99.6 percent sequence match and 97.7 percent timing match, demonstrating that DTW could reliably align complete controller-output sequences. The comparison then flagged 11 of 14 configurations with deliberate overlap clearance-setting changes and none of the unchanged configurations. Applied to a software update, it surfaced real operational differences within otherwise similar full-day operation, including a confirmed rail-preemption exit bug fix. The virtual conflict monitor found no incompatible signal phases or overlaps in the three campaigns.
+This study found that field-derived high-resolution event replay is feasible for expanded controller testing. Independent unchanged runs averaged 99.6 percent sequence match and 97.7 percent timing match, demonstrating that DTW could reliably align full-day operational-output event sequences. The comparison then flagged 11 of 14 configurations with deliberate overlap clearance-setting changes and none of the unchanged configurations. Applied to a software update, it surfaced real operational differences within otherwise similar full-day operation, including a confirmed rail-preemption exit bug fix. The virtual conflict monitor found no incompatible signal phases or overlaps among the 21 configurations with defined incompatible pairs.
 
-The significance is the increase in test coverage. Instead of relying only on staff to select and toggle individual inputs, agencies can replay actual field activity across many production configurations and automatically compare the resulting signal phases, clearances, pedestrian service, preemption, coordination, and conflicts. This creates a practical opportunity to discover unforeseen software or timing effects in the test environment rather than after field deployment. The same process can reproduce field failures and verify proposed fixes against identical inputs.
+The method expands test coverage beyond manually selected inputs by replaying actual field activity across production configurations and comparing signal phases, clearances, pedestrian service, preemption, coordination, and conflicts. It can expose unforeseen effects before field deployment and reproduce field failures for verification of proposed fixes.
 
-The open-source package provides a reusable NTCIP-based input interface and a comparison method that other agencies can adapt. Controller-specific output collection and event mapping are still required, but the successful alignment and detection results establish that the underlying approach works.
+The results establish the feasibility of the underlying field-replay and event-alignment approach.
 = Acknowledgments
 
 The author thanks Chris Primm, State Traffic Operations Engineer, Oregon Department of Transportation, for reviewing the results and contributing ideas for testing.
 
 = Code and Data Availability
 
-Signal-Replay is an open-source Python package available from #link("https://github.com/ShawnStrasser/ATC-Signal-Replay")[GitHub] and #link("https://pypi.org/project/signal-replay/")[PyPI]. The study used repository version 0.2.0, which includes replay and comparison code, tests, documentation, and offline examples.
+Signal-Replay is an open-source Python package. The study used repository version 0.2.0 from #link("https://github.com/ShawnStrasser/ATC-Signal-Replay")[GitHub]; version 0.1.0 is distributed through #link("https://pypi.org/project/signal-replay/")[PyPI]. The repository includes replay and comparison code, tests, documentation, and offline examples.
 
 The repository includes a self-contained comparison-stage example for configuration 13008: saved MAXTIME 2.15.1 and 2.18.1 output events, comparison settings, expected results, and a reproduction script. Running the example regenerates the HTML report and verifies 98.6 percent sequence match and 96.6 percent timing match without controller hardware, firmware, or configuration databases. It reproduces comparison and report generation only; the original controller replay still requires controller/emulator software, configuration databases, and agency test infrastructure.
 = Generative AI Disclosure

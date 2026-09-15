@@ -1,47 +1,40 @@
-# Signal-Replay (beta release)
+# Signal-Replay
 
-Replay historical traffic signal events to test traffic-signal controllers for **bug replication**, **software validation**, **configuration validation**, and **behavior comparison**.
+Replay high-resolution traffic-signal event logs to an ATC controller over NTCIP, collect what the controller does, and compare the result against a baseline.
 
-Signal-Replay reads high-resolution event logs, replays vehicle, pedestrian, and preempt inputs via NTCIP/SNMP, collects output events from controllers, monitors for phase conflicts, and compares controller behavior across runs. The comparison can identify differences caused by a software release, a timing-parameter change, or a replay/collection problem. Input replay uses standard NTCIP 1202 v3 detector objects in principle; the current output collector is MAXTIME-specific.
+Use it to:
 
-## Features
+- **Replicate a field event** (a conflict flash, a preempt bug, a cycle fault) on a bench controller or emulator.
+- **Validate a controller software release** by replaying the same field traces to the old and new versions and comparing every phase and overlap event.
+- **Validate a configuration change** the same way, with the software held constant.
 
-- **Replay** hi-res detector events to any ATC controller via NTCIP SNMP
-- **Detect conflicts** between incompatible phase/overlap pairs
-- **Compare runs** for sequence and timing similarity
-- **Multi-signal** replay with parallel execution
-- **Time-of-day alignment** for replaying events at real wall-clock times
-- **Cycle synchronization** for coordinated signal replay with offsets
-- **Timeline charts** for visual comparison of phase timing
-- **Batch runner & HTML reports** for firmware validation workflows (experimental)
+Input replay uses standard NTCIP 1202 detector, pedestrian, and preempt objects, so it works against any NTCIP controller or emulator. Output collection currently reads the MAXTIME HTTP event-log endpoint; other controller families need a collector adapter.
 
-## Installation
+## Install
 
 ```bash
-py -m pip install -e .
+pip install signal-replay          # from PyPI
+pip install -e .                   # from a clone of this repository
 ```
 
-## Paper reproducibility
+Requires Python 3.10 or newer. The package installs `duckdb`, `pandas`, `pysnmp`, `atspm`, `matplotlib`, and the other runtime dependencies.
 
-The paper includes a self-contained saved-output example for configuration
-13008. It reproduces comparison and HTML report generation without a
-controller, emulator, firmware, or private configuration database. The 16 MB
-committed CSV includes both the 2.15.1 baseline output and saved 2.18.1 output.
+## Inputs and outputs
 
-```powershell
-py -m pip install -e . duckdb
-py paper/reproducibility/13008/reproduce_report.py
-```
+| | What | Format |
+|---|---|---|
+| **Input** | High-resolution event log for one or more intersections | CSV, Parquet, MAXTIME SQLite `.db`, or a pandas DataFrame. Columns `timestamp`, `event_id`, `parameter`, `device_id` (see [Event data format](#event-data-format)). |
+| **Input** | Controller target per intersection | IP address, SNMP UDP port (161 for real controllers, per-instance for emulators), HTTP port for log collection |
+| **Input** | Optional conflict pairs | Phase/overlap pairs that must never be active together, e.g. `('O5', 'Ph4')` |
+| **Output** | DuckDB database | Collected controller events, detected conflicts, stored input events, comparison metrics |
+| **Output** | Python results | `dict` from `ATCSimulation.run()`, `ComparisonResult` objects, `ScenarioResult` lists |
+| **Output** | Plots and reports | Gantt comparison charts (`.png`) and a self-contained HTML validation report |
 
-The command writes and verifies a self-contained HTML report. See
-[`paper/reproducibility/13008`](paper/reproducibility/13008/README.md) for the
-included data and the boundary between report reproduction and controller replay.
+Only detector-type events are replayed: vehicle detector off/on (81/82), pedestrian detector off/on (89/90), and preempt on/off (102/104). Everything the controller emits in response (phase, overlap, and pedestrian state changes) is what gets collected and compared.
 
+## Workflow 1: Replay a single study
 
-
-## Quick Start: Conflict Detection
-
-Replay events to a controller and monitor for phase conflicts:
+Replay one intersection's log to one controller, monitor for a conflict, and compare the controller's output to the original log.
 
 ```python
 import signal_replay as sr
@@ -49,653 +42,255 @@ import signal_replay as sr
 sim = sr.ATCSimulation(
     signals=[
         sr.SignalConfig(
-            device_id='0',
-            ip='192.0.2.10',
+            device_id='2C039',                 # must match the device_id column in the events
+            ip='192.0.2.10',                   # controller or emulator address
+            udp_port=161,                      # SNMP port (required for 127.0.0.1)
+            http_port=80,                      # MAXTIME log endpoint; None disables collection
             incompatible_pairs=[('O5', 'Ph4'), ('O5', 'Ph8')],
         )
     ],
-    events='2025-01-15_events.csv',  # Must have device_id column
-    replays=40,
-    stop_on_conflict=True,
-    db_path='./conflict_test.db',
+    events='2C039_events.parquet',
+    replays=40,                                # repeat the log up to 40 times
+    stop_on_conflict=True,                     # stop as soon as a conflict is recorded
+    db_path='./2C039_conflict.db',
 )
 
 results = sim.run()
 ```
 
-Assigning the return value is optional. `sim.run()` prints a human-readable summary,
-while `results` gives you the same outcome as structured data for notebook follow-up,
-tests, or custom logic without having to scrape printed text.
+What happens:
 
-The simulation will:
-1. Load events and filter by `device_id`
-2. Generate an activation feed (detector on/off SNMP commands)
-3. Reset all detector states on the controller
-4. Replay detector actuations in real-time via SNMP
-5. Periodically collect output events from the controller via HTTP
-6. Check for conflicts between incompatible phase/overlap pairs
-7. Stop early if `stop_on_conflict=True` and a conflict is found
-8. Run DTW comparison between input events and each replay run
+1. Events are loaded, filtered to the signal's `device_id`, and reduced to detector actuations. Missing on/off pairs are imputed.
+2. All detector states on the controller are reset over SNMP.
+3. Actuations are sent in real time as SNMP SET commands, one bitmask per 8-detector group.
+4. A background collector polls the controller's event log every `collection_interval_minutes`, stores events in DuckDB, and checks `incompatible_pairs`.
+5. After the last run, each run is compared to the input log with dynamic time warping (DTW) and the summary is printed.
 
-**Output:**
+`sim.run()` returns a dictionary with `completed_runs`, `conflicts`, `failed_signals_by_run`, `stopped_early`, `collection_error`, and `comparison_summary`. `sim.get_events()`, `sim.get_conflicts()`, and `sim.get_comparison_results()` return the same data as DataFrames and objects.
 
-```
-Starting ATC simulation with 1 signals, 40 replays
-Estimated duration per run: 0h 32m (computed in 0.3s)
+### Replay timing modes
 
-Working on run 1 of 40
+| Mode | Setting | Use when |
+|---|---|---|
+| **Compressed** (default) | `cycle_length=0`, `tod_align=False` | The log is replayed immediately, preserving relative timing. Good for replicating a specific pattern or bug. |
+| **Time-of-day aligned** | `tod_align=True` | Each event is sent at the same wall-clock time of day as the original. Required for testing time-of-day plans, and for the software validation workflow. A 23-hour log takes 23 hours. |
+| **Cycle synchronized** | `cycle_length=120`, `cycle_offset=30` | Coordinated signals: replay starts at the configured offset within the cycle so multiple signals stay in step. Incompatible with `tod_align`. |
 
-Conflict detected! Stopping simulation.
+### Multiple signals
 
---- Running Comparison Analysis ---
-
-============================================================
-SIMULATION COMPLETE
-============================================================
-
-Completed Runs: 1
-Conflicts Found: 1
-
-Conflicts:
-  [0] Run 1: O5 & Ph4; O5 & Ph8 at 2026-02-02 14:28:16.100000
-
-Comparison Summary:
-
-Device: 0
-  input vs 1: Sequence DTW=0.0034, Timing DTW=0.0001, Match=56.0%
-```
-
-## Multi-Signal Coordinated Replay
-
-Test coordinated signals using a **single event file** containing all device data.
-Events are automatically filtered by `device_id` and distributed to each signal:
+Pass several `SignalConfig` objects and one events source containing all of them. Events are split by `device_id` and each signal replays in its own thread.
 
 ```python
-import signal_replay as sr
-
 sim = sr.ATCSimulation(
     signals=[
-        sr.SignalConfig(
-            device_id='main_1st',
-            ip='127.0.0.1',
-            udp_port=1025,          # Required for localhost
-            cycle_length=120,
-            cycle_offset=0,
-        ),
-        sr.SignalConfig(
-            device_id='main_2nd',
-            ip='127.0.0.1',
-            udp_port=1026,
-            cycle_length=120,
-            cycle_offset=30,        # 30s offset from reference
-        ),
+        sr.SignalConfig(device_id='main_1st', ip='127.0.0.1', udp_port=1025, cycle_length=120, cycle_offset=0),
+        sr.SignalConfig(device_id='main_2nd', ip='127.0.0.1', udp_port=1026, cycle_length=120, cycle_offset=30),
     ],
-    events='all_signals_events.csv',  # Must have 'device_id' column
+    events='all_signals.csv',
     replays=5,
     db_path='./coordination_test.db',
-    debug=True,
-)
-
-results = sim.run()
-```
-
-When multiple signals share the same `cycle_length`, each signal waits for its `cycle_offset` position in the cycle before beginning replay. All signals run in parallel via ThreadPoolExecutor.
-
-The centralized events file must contain a `device_id` column matching the `device_id` in each `SignalConfig`.
-
----
-
-## Time-of-Day Alignment
-
-Use `tod_align=True` to replay events at their real wall-clock times. Instead of compressing events relative to the start of the data, each event is sent at the same time-of-day as the original log:
-
-```python
-sr.SignalConfig(
-    device_id='intersection_1',
-    ip='192.0.2.10',
-    tod_align=True,       # Replay at real wall-clock times
-    # cycle_length must be 0 when tod_align is True
 )
 ```
 
-This is useful for testing time-of-day plans rather than specific patterns. If you wanted to test for a conflict that occured during a specefic pattern, you don't need this, you could just set the controller to run that pattern and configure the cycle length and offset parameters.
+### Configuration reference
 
-> **Note:** `tod_align=True` is incompatible with `cycle_length > 0` and requires `simulation_speed=1.0`.
+`SignalConfig` (one per intersection):
 
----
+| Parameter | Default | Description |
+|---|---|---|
+| `device_id` | required | Identifier matching the `device_id` column of the events |
+| `ip` | required | Controller IP address |
+| `udp_port` | 161 | SNMP port. Required explicitly for `127.0.0.1` |
+| `http_port` | `udp_port` for localhost, 80 otherwise | MAXTIME log endpoint port. `None` disables collection and conflict checking |
+| `incompatible_pairs` | `None` | Phase/overlap pairs to monitor. `None` disables conflict checking |
+| `tod_align` | `False` | Replay at original wall-clock time of day |
+| `cycle_length` / `cycle_offset` | 0 / 0.0 | Coordinated start (seconds). `cycle_length=0` disables |
+| `limit_minutes` / `buffer_minutes` | 0 / 0 | Replay only the last N minutes, with an optional lead-in |
+| `replay_latency_offset_seconds` | 0.1853 | Sends are scheduled this much earlier to cancel measured SNMP latency. `0.0` disables |
 
-## Querying Results with DuckDB
+`ATCSimulation` keyword arguments:
 
-All events, conflicts, and comparisons are stored in DuckDB:
+| Parameter | Default | Description |
+|---|---|---|
+| `signals`, `events` | required | Signals and the events source (path or DataFrame) |
+| `replays` | 1 | Number of replay runs |
+| `stop_on_conflict` | `True` | Stop before the next run once a conflict has been recorded |
+| `db_path` | `./atc_replay.db` | DuckDB output file |
+| `simulation_speed` | 1.0 | Speed multiplier. Must be 1.0 with `tod_align` |
+| `collection_interval_minutes` | 5.0 | How often the collector polls the controller |
+| `post_replay_settle_seconds` | 10.0 | Wait before the final collection |
+| `snmp_timeout_seconds`, `snmp_send_retries`, `snmp_retry_backoff_seconds` | 2.0, 0, 0.25 | SNMP send behaviour |
+| `replay_latency_offset_lookback_min` | `None` | Enable adaptive per-device latency calibration using the last N minutes of sparse detector events. Requires `tod_align=True` |
+| `comparison_thresholds` | defaults | `ComparisonThresholds(sequence_threshold=0.05, timing_threshold=0.02, match_threshold=95.0)` |
+| `output_dir` | `None` | Where to write Gantt plots when a comparison exceeds thresholds |
+| `skip_comparison` | `False` | Skip the post-replay DTW comparison |
+| `show_progress_logs`, `debug` | `False` | Verbosity |
+
+### Query the results
 
 ```python
 import duckdb
-
-con = duckdb.connect('./conflict_test.db')
-
-# Find all conflicts
-conflicts = con.execute("""
-    SELECT timestamp, conflict_details, run_number
-    FROM conflicts
-    ORDER BY timestamp
-""").df()
-
-print(conflicts)
+con = duckdb.connect('./2C039_conflict.db')
+con.execute("SELECT run_number, timestamp, conflict_details FROM conflicts ORDER BY timestamp").df()
+con.execute("SELECT * FROM events WHERE run_number = 1 ORDER BY timestamp").df()
 ```
 
-| timestamp | conflict_details | run_number |
-|-----------|------------------|------------|
-| 2026-02-02 14:28:16.100 | O5 & Ph4; O5 & Ph8 | 1 |
+<details>
+<summary>Database tables</summary>
 
-```python
-# Compare phase green times across runs
-phase_greens = con.execute("""
-    SELECT 
-        run_number,
-        parameter as phase,
-        COUNT(*) as green_count,
-        MIN(timestamp) as first_green,
-        MAX(timestamp) as last_green
-    FROM events
-    WHERE event_id = 1  -- Phase On
-    GROUP BY run_number, parameter
-    ORDER BY run_number, parameter
-""").df()
+| Table | Contents |
+|---|---|
+| `events` | Collected controller events: `device_id`, `run_number`, `timestamp`, `event_id`, `parameter` |
+| `conflicts` | Detected incompatible-pair activations with `conflict_details` |
+| `input_events` | Source phase/overlap events kept for comparison |
+| `input_detector_events` | Source detector events actually replayed |
+| `simulation_runs` | One row per run with status and timing |
+| `latency_offset_samples`, `latency_offset_updates` | Adaptive latency calibration history |
+| `comparison_results` | DTW metrics per run pair, thresholds, and plot paths (created on first comparison) |
 
-print(phase_greens)
+</details>
+
+## Workflow 2: Software validation (many intersections, A/B)
+
+The [`software_validation/`](software_validation/README.md) folder is a ready-to-use workspace for validating a controller software release. It replays field logs from many intersections to a bank of controllers running the release under test, then compares the collected output to the same logs collected under the baseline release and produces one HTML report.
+
+```
+software_validation/
+  settings.json                 # copy of settings.example.json, edited for your bench
+  databases.xlsx                # catalog: one row per intersection to test
+  logs/<TSSU>.parquet           # replay input logs, one per intersection
+  databases/<TSSU>.bin          # controller configuration files you load onto the controllers
+  conflict_monitor/conflict_pairs.json    # optional: {"<TSSU>": [["O5","Ph4"], ...]}
+  results/<software_version>/   # everything the run produces
+      collected.db              # DuckDB of collected controller events
+      device_events/<TSSU>.csv  # baseline and new events side by side
+      divergence_plots/*.png    # Gantt charts of the largest differences
+      report.html               # the validation report
 ```
 
-| run_number | phase | green_count | first_green | last_green |
-|------------|-------|-------------|-------------|------------|
-| 1 | 1 | 42 | 2025-01-15 14:00:01 | 2025-01-15 14:32:15 |
-| 1 | 2 | 38 | 2025-01-15 14:00:45 | 2025-01-15 14:31:52 |
-| 2 | 1 | 42 | 2025-01-15 14:00:01 | 2025-01-15 14:32:14 |
+Run it from that folder:
 
----
+```bash
+py software_validate.py                  # replay the next pending batch, then analyse and report when all are collected
+py software_validate.py --report-only    # skip replay: re-run analysis and rebuild the report
+py software_validate.py --archive        # also export results/<version>/logs/*.parquet
+```
 
-## Dynamic Time Warping (DTW)
+The script picks up to one intersection per configured controller that has not yet been collected, prints which configuration file to load on which controller, waits for you to press Enter, checks SNMP and HTTP connectivity, and replays that batch time-of-day aligned. Run it again the next day for the next batch. Once every catalog row has data in `collected.db`, it compares each intersection against the baseline and writes `report.html`.
 
-Signal-Replay uses DTW to compare event sequences between runs. DTW aligns two time series by finding the optimal "warping path" that minimizes the total distance between matched points, even when events are shifted in time.
+Baseline resolution: if `results/<baseline_version>/collected.db` exists, it is the baseline. Otherwise the original field logs in `logs/` are used. To validate the next release, set `baseline_version` to the version you just finished, set `software_version` to the new label, load the new software on the controllers, and run again.
 
-**How it works:**
+Pass criteria in the report:
 
-1. **Event filtering**: Only phase and overlap state-change events are compared (green on/off, yellow, red, overlap states, pedestrian walk/dont-walk, etc.). Detector actuations are excluded since they are the *input*, not the *output*.
+- **Similarity scenario** passes when sequence match is at least 95 percent and timing match is at least 90 percent (within 0.5 s), and the input phase-call similarity check did not flag the run as unreliable.
+- **Conflict scenario** passes when the baseline reproduces the configured conflict and the new software does not.
 
-2. **Timestamp grouping**: Events at the same timestamp are grouped into sets of `(event_id, parameter)` tuples. This makes comparison order-independent — events at the same timestamp may appear in different order between runs.
+Settings keys, catalog columns, and file-naming rules are documented in [`software_validation/README.md`](software_validation/README.md).
 
-3. **Jaccard distance**: Distance between two timestamp groups is computed as Jaccard distance: 0 if the event sets are identical, otherwise the fraction of non-overlapping events. This means `{(1, 5), (1, 6)}` (Phase 5 and 6 Green) is treated as completely different from `{(1, 5), (7, 6)}` (Phase 5 Green and Phase 6 Yellow End).
+### Use the validation pieces from your own application
 
-4. **Auto-alignment**: Before DTW, the sequences are automatically aligned by trying different timestamp-group offsets and finding the one with the best Jaccard match over the first 6 minutes.
-
-5. **DTW alignment**: The algorithm finds the best alignment between grouped sequences, allowing for insertions, deletions, and timing shifts.
-
-6. **Divergence detection**: Two types of divergences are detected:
-   - **Structural gaps**: Where one sequence advances while the other stalls (missing events)
-   - **Value mismatches**: Consecutive timestamp groups with different event sets
-
-7. **Timing analysis**: For matched groups, the time differences between runs are analyzed to measure timing jitter (std deviation, max, 95th percentile).
-
-8. **Timing DTW**: Standard Euclidean DTW on normalized time deltas provides a backward-compatible timing distance metric.
-
-**Metrics reported:**
-
-| Metric | Meaning |
-|--------|---------|
-| Sequence DTW | Jaccard-based distance on timestamp groups (lower = more similar) |
-| Timing DTW | Euclidean distance on normalized time deltas (lower = more similar) |
-| Match % | Percentage of aligned timestamp groups with identical event sets |
-
-**Example interpretation:**
-- `Match=99%` → Nearly identical runs
-- `Match=92%`, 2 divergences → Runs diverged in specific windows
-
-### Manual Comparison
-
-You can compare any two event DataFrames directly:
+`software_validate.py` is a reference runner built only on the public package API. An application can call the same building blocks directly:
 
 ```python
-import pandas as pd
 import signal_replay as sr
 
-# Load events from any source
-events_a = pd.read_csv('simulation_1/run_3.csv')
-events_b = pd.read_csv('simulation_2/run_7.csv')
-
-# Compare them directly
-result = sr.compare_event_sequences(
-    events_a,
-    events_b,
-    label_a="Sim1 Run3",
-    label_b="Sim2 Run7",
-)
-```
-
-**Output:**
-
-```
-============================================================
-DTW Comparison: Sim1 Run3 vs Sim2 Run7
-============================================================
-  Match Percentage:          97.2%
-  Groups in A:               312
-  Groups in B:               308
-  Alignment offset:          2 groups
-  Divergence Windows:        1
-============================================================
-
-Divergence Windows:
-  1. ~15s gap in Replay at 12:34–12:49 (8 unmatched groups)
-
-Timing Analysis (298 matched groups):
-  Timing jitter std:  0.142s
-  Max jitter:         0.831s
-  95th percentile:    0.287s
-```
-
-Access detailed results programmatically:
-
-```python
-# Suppress automatic printing for scripted use
-result = sr.compare_event_sequences(
-    events_a, events_b,
-    label_a="A", label_b="B",
-    print_summary=False,
+suite = sr.SoftwareTestSuite(
+    suite_name='Release 2.18.1 validation',
+    software_version='2.18.1',
+    baseline_version='2.15.1',
+    output_dir='./results',
+    scenarios=[
+        sr.TestScenario(
+            scenario_id='13008',
+            database_name='databases/13008.bin',        # shown to the operator, not uploaded
+            events_source='logs/13008.parquet',
+            test_type=sr.TestType.SIMILARITY,
+            tod_align=True,
+        ),
+        sr.TestScenario(
+            scenario_id='2C039',
+            database_name='databases/2C039.bin',
+            events_source='logs/2C039.parquet',
+            test_type=sr.TestType.CONFLICT,
+            replays=25,
+            incompatible_pairs=[('O5', 'Ph4'), ('O5', 'Ph8')],
+        ),
+    ],
+    batches=[
+        sr.TestBatch(batch_id='day1', assignments={
+            '13008': '192.0.2.10:161:80',              # host:udp_port:http_port
+            '2C039': '192.0.2.11:161:80',
+        }),
+    ],
 )
 
-print(f"Match: {result.match_percentage:.1f}%")
-print(f"Divergences: {len(result.divergence_windows)}")
+# 1. Replay. The callback is called with (database_name, target) before each scenario;
+#    return True once the configuration is loaded on that controller.
+runner = sr.BatchRunner(suite)
+checkpoint = runner.run(db_loader_callback=lambda db_name, target: True)
 
-# Examine divergence windows
-for div in result.divergence_windows:
-    print(f"  {div.description}")
+# 2. Compare against a previous run of the same suite on the baseline software.
+results = sr.compare_software(
+    baseline_run_dir='./results/2.15.1',
+    new_run_dir='./results/2.18.1',
+    suite=suite,
+)
 
-# Timing stats
-if result.timing_stats:
-    print(f"Timing jitter std: {result.timing_stats['std_diff']:.3f}s")
+# 3. Report.
+sr.generate_report(results, suite, './results/2.18.1/report.html')
+for r in results:
+    print(r.scenario_id, r.test_type.value, 'PASS' if r.passed else 'FAIL', r.match_percentage)
 ```
 
----
+`BatchRunner.run()` writes `checkpoint.json` and `collected.db` under `output_dir/<software_version>/` and skips batches already completed, so it can be resumed. `compare_software()` reads the checkpoints of both run directories and returns one `ScenarioResult` per scenario. `generate_report()` embeds all plots as base64 so the HTML file is portable.
 
-## Comparison Visualization
+## Compare logs without a controller
 
-Compare any two event logs and generate a Gantt chart showing signal phase timing side-by-side:
+The comparison stage works on any two event logs:
 
 ```python
 import signal_replay as sr
 
 result = sr.compare_and_visualize(
-    events_a='input_events.csv',      # Path, DataFrame, or .db file
-    events_b='output_run_0.csv',
-    label_a='Input Events',
-    label_b='Output Run 0',
-    output_dir='./comparison_plots',
-    output_name='my_comparison',       # Generates my_comparison.png
-    
-    # Optional thresholds
-    match_threshold=95.0,      # Warn if match < 95%
-    sequence_threshold=0.05,   # Warn if sequence DTW > 0.05
-    timing_threshold=0.02,     # Warn if timing DTW > 0.02
+    events_a='baseline_run.parquet',
+    events_b='candidate_run.parquet',
+    label_a='2.15.1', label_b='2.18.1',
+    output_dir='./plots',              # Gantt chart written when a threshold is exceeded
+    match_threshold=95.0,
 )
+print(result.match_percentage, len(result.divergence_windows))
 ```
 
-**Output:**
+`compare_event_sequences(events_a, events_b, ...)` does the same without plotting. `load_events(path)` reads CSV, Parquet, or a MAXTIME `.db` into a DataFrame. A runnable no-hardware example lives in [`examples/offline_comparison`](examples/offline_comparison/README.md).
 
-```
-============================================================
-Comparison: Input Events vs Output Run 0
-============================================================
-  Match Percentage:  97.2%  (threshold: ≥95.0%)
-    ✓ OK
-  Timestamp groups in A: 312
-  Timestamp groups in B: 308
-  Alignment: trimmed 2 groups (0.0s from A, 3.2s from B)
-  Divergences: 1
-    1. ~15s gap in Replay at 12:34–12:49 (8 unmatched groups)
-  Timing: jitter_std=0.142s, max=0.831s, p95=0.287s
-============================================================
-Generating timelines with atspm...
-Creating Gantt chart with 1240 events (A) and 1235 events (B)...
-Timeline alignment offset: -2.5s
-```
+How the comparison works: phase, overlap, and pedestrian state-change events are grouped by timestamp into sets, the two sequences are auto-aligned, and DTW with Jaccard distance finds the best alignment. Reported metrics are **Match %** (aligned groups with identical event sets), **Sequence DTW** and **Timing DTW** (lower is more similar), divergence windows (where one side has events the other lacks), and timing jitter statistics for matched groups. Intervals with missing or unreliable data on either side are excluded rather than reported as differences.
 
-Plots are only generated when thresholds are exceeded (or `force_plot=True`).
+## Event data format
 
-> **Note:** Gantt chart generation requires the `atspm` package for timeline reconstruction and `matplotlib` for rendering. Output format is `.png` (also supports `.pdf`, `.svg`, `.jpg`).
+Column names are matched case-insensitively:
 
-### Supported Input Formats
+| Column | Accepted names | Notes |
+|---|---|---|
+| `timestamp` | `TimeStamp`, `time_stamp`, `time` | Event time |
+| `event_id` | `EventId`, `EventTypeID`, `event_type_id` | Indiana hi-res event code |
+| `parameter` | `Parameter`, `Detector`, `param` | Phase, overlap, or detector number |
+| `device_id` | `DeviceId` | Required when the file contains more than one intersection |
 
-The `compare_and_visualize` and `load_events` functions accept multiple formats:
-
-| Format | Example |
-|--------|---------|
-| CSV file | `'events.csv'` |
-| Parquet file | `'events.parquet'` |
-| SQLite database | `'results.db'` (reads `Event` table, MAXTIME format) |
-| pandas DataFrame | `pd.DataFrame(...)` |
-
-### Gantt Chart Features
-
-The generated matplotlib chart includes:
-- **Two-panel layout**: Original events on top, replay on bottom
-- **Color-coded phases**: Green, Yellow, Red, and Overlap states
-- **Divergence markers**: Red shaded regions indicate where sequences diverged
-- **Time-aligned**: Cross-correlation is used to align the two timelines
-
-### Threshold Interpretation
-
-| Metric | Good Value | Meaning |
-|--------|------------|---------|
-| Match % | ≥95% | Percentage of timestamp groups that align with identical events |
-| Sequence DTW | <0.05 | Lower = more similar event sequences |
-| Timing DTW | <0.02 | Lower = more similar event timing |
-
-### Database Storage
-
-When running via `ATCSimulation`, comparison results are automatically stored in the database:
-
-```sql
--- Find all comparisons with poor match percentage
-SELECT device_id, run_a, run_b, match_percentage
-FROM comparison_results
-WHERE match_percentage < 90
-ORDER BY match_percentage ASC;
-```
-
----
-
-## Configuration Reference
-
-### ATCSimulation
-
-The main entry point. Events are **always** provided at this level and automatically filtered by `device_id`.
-
-Accepts either a `SimulationConfig` object (legacy) or keyword arguments (recommended):
-
-```python
-# Recommended API
-sim = sr.ATCSimulation(
-    signals=[...],                     # List of SignalConfig
-    events='events.csv',               # REQUIRED: centralized events with device_id column
-    replays=5,                         # Number of simulation runs
-    stop_on_conflict=False,            # Stop on first conflict
-    db_path='./test.db',               # Database path
-    simulation_speed=1.0,              # Speed multiplier (must be 1.0 with tod_align)
-    collection_interval_minutes=5.0,   # How often to poll controller logs
-    post_replay_settle_seconds=10.0,   # Wait after replay before final collection
-    snmp_timeout_seconds=2.0,          # SNMP response timeout
-    show_progress_logs=False,          # Print periodic "Sent x/y events" updates
-    progress_log_interval_seconds=60.0,# Seconds between progress log lines
-    comparison_thresholds=None,        # ComparisonThresholds object (or use defaults)
-    output_dir=None,                   # Directory for comparison plots
-    skip_comparison=False,             # Skip post-replay DTW comparison
-    debug=False,
-)
-
-# Legacy API (still supported)
-config = sr.SimulationConfig(
-    signals=[...],
-    events='events.csv',
-    simulation_replays=5,
-)
-sim = sr.ATCSimulation(config)
-```
-
-### SignalConfig
-
-Configuration for individual signals. Events are provided at the simulation level.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `device_id` | str | *required* | Unique identifier matching the events file |
-| `ip` | str | *required* | Controller IP address |
-| `udp_port` | int | 161 | SNMP port. **Required for localhost** (no default for 127.0.0.1) |
-| `cycle_length` | int | 0 | Cycle length in seconds for coordination (0 = disabled) |
-| `cycle_offset` | float | 0.0 | Offset in seconds within cycle for synchronized start |
-| `tod_align` | bool | False | Replay events at real wall-clock time-of-day |
-| `incompatible_pairs` | list | None | Phase/overlap pairs to monitor, e.g. `[('O5', 'Ph4')]`. `None` = no conflict checking |
-| `http_port` | int/None | Auto | HTTP port for log collection. Auto = `udp_port` for localhost, `80` for remote. `None` disables collection |
-| `limit_minutes` | float | 0.0 | Only replay the last N minutes of events (0 = all) |
-| `buffer_minutes` | float | 0.0 | Include extra lead-in minutes before `limit_minutes` window |
-| `replay_latency_offset_seconds` | float | 0.1853 | Positive detector latency compensation. Replay subtracts this from detector timestamps so sends happen slightly earlier. |
-
-### SimulationConfig (Legacy)
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `signals` | list | *required* | List of `SignalConfig` |
-| `events` | DataFrame/Path | *required* | Centralized events (filtered by `device_id`) |
-| `simulation_replays` | int | 1 | Number of replay runs |
-| `stop_on_conflict` | bool | False | Stop on first conflict detection |
-| `db_path` | str | `./atc_replay.db` | Database path |
-| `controller_type` | str | `"MAXTIME"` | Controller type (only MAXTIME supported) |
-| `simulation_speed` | float | 1.0 | Speed multiplier |
-| `collection_interval_minutes` | float | 5.0 | Minutes between controller log polls |
-| `post_replay_settle_seconds` | float | 10.0 | Seconds to wait after replay before final collection |
-| `snmp_timeout_seconds` | float | 2.0 | SNMP response timeout |
-| `show_progress_logs` | bool | False | Print periodic send progress |
-| `progress_log_interval_seconds` | float | 60.0 | Seconds between progress log lines |
-
----
-
-## Event Data Format
-
-Input events require these columns (flexible naming — case-insensitive matching):
-
-| Column | Alternatives | Description |
-|--------|--------------|-------------|
-| `timestamp` | `TimeStamp`, `time_stamp`, `time` | Event timestamp |
-| `event_id` | `EventId`, `EventTypeID`, `event_type_id` | Event type code |
-| `parameter` | `Parameter`, `Detector`, `param` | Phase/detector number |
-| `device_id` | `DeviceId` | **Required** — maps events to signals |
-
-Only detector actuation events are replayed (event IDs 81/82 = vehicle on/off, 89/90 = ped on/off, 102/104 = preempt on/off). Detectors with parameter ≥ 65 are filtered out.
-
-For comparison, phase and overlap state-change events are used (phase green/yellow/red, overlap green/yellow/end, pedestrian walk/dont-walk, etc.).
-
----
-
-## How Replay Works
-
-1. **Load events**: Input events are loaded from CSV, Parquet, SQLite (.db), or DataFrame
-2. **Filter detectors**: Only detector actuation events (81, 82, 89, 90, 102, 104) are kept
-3. **Impute missing actuations**: Missing on/off pairs are interpolated to ensure correct state tracking (e.g., two consecutive "on" events get an "off" inserted between them)
-4. **Generate activation feed**: Events are grouped by detector group (8 detectors per group), cumulative bitmask states are computed, and inter-event sleep times are calculated
-5. **Reset detectors**: All detector states on the controller are set to 0 via SNMP
-6. **Wait for cycle**: If `cycle_length > 0`, wait until the correct cycle offset position
-7. **Send commands**: SNMP SET commands are sent to the controller in real-time sequence. Each command sets the bitmask state for a detector group.
-8. **Collect output**: A background thread periodically polls the controller's HTTP event log endpoint and stores events in DuckDB
-9. **Check conflicts**: Each collection also checks for incompatible phase/overlap pairs being active simultaneously
-
----
-
-<details>
-<summary><strong>Database Schema</strong></summary>
-
-**`events`** — Output events collected from controller
-
-| Column | Type | PK |
-|--------|------|-----|
-| device_id | VARCHAR | ✓ |
-| run_number | INTEGER | ✓ |
-| timestamp | TIMESTAMP | ✓ |
-| event_id | INTEGER | ✓ |
-| parameter | INTEGER | ✓ |
-
-**`conflicts`** — Detected phase/overlap conflicts
-
-| Column | Type |
-|--------|------|
-| device_id | VARCHAR |
-| run_number | INTEGER |
-| timestamp | TIMESTAMP |
-| conflict_details | VARCHAR |
-
-**`input_events`** — Source phase/overlap events stored for comparison
-
-| Column | Type |
-|--------|------|
-| device_id | VARCHAR |
-| timestamp | TIMESTAMP |
-| event_id | INTEGER |
-| parameter | INTEGER |
-
-**`comparison_results`** — DTW comparison metrics (created on first comparison)
-
-| Column | Type | Description |
-|--------|------|-------------|
-| device_id | VARCHAR | Signal identifier |
-| run_a | VARCHAR | First run label (e.g., `'input'`) |
-| run_b | VARCHAR | Second run label (e.g., `'1'`) |
-| timestamp | TIMESTAMP | When comparison was performed |
-| sequence_dtw_distance | DOUBLE | Raw sequence DTW distance |
-| sequence_dtw_normalized | DOUBLE | Normalized sequence DTW distance |
-| timing_dtw_distance | DOUBLE | Raw timing DTW distance |
-| timing_dtw_normalized | DOUBLE | Normalized timing DTW distance |
-| match_percentage | DOUBLE | Percentage of aligned timestamp groups that match |
-| num_divergences | INTEGER | Number of divergence windows |
-| sequence_threshold | DOUBLE | Threshold used |
-| timing_threshold | DOUBLE | Threshold used |
-| match_threshold | DOUBLE | Threshold used |
-| exceeds_threshold | BOOLEAN | Whether any threshold was exceeded |
-| threshold_reason | VARCHAR | Description of exceeded thresholds |
-| plot_path | VARCHAR | Path to generated plot file |
-
-</details>
-
----
-
-## SNMP Detector Latency Calibration
-
-The SNMP SET commands that send detector actuations arrive at the controller with a measurable latency. To compensate, the replay pipeline applies a **global positive compensation offset** before sending by subtracting it from detector event timestamps, so commands are scheduled slightly earlier and arrive closer to the intended wall-clock moment.
-
-The default offset value was determined empirically using the latency scaling study in [`experiments/run_latency_scaling_study.py`](experiments/run_latency_scaling_study.py).
-
-**Latest result: 185.3 ms** (see full report at [`experiments/latency_scaling_runs/report.md`](experiments/latency_scaling_runs/report.md))
-
-Use `SignalConfig(replay_latency_offset_seconds=...)` to override it in code, or set `replay_latency_offset_seconds` in `firmware_validation/settings.json` for firmware validation runs. Set it to `0.0` to disable compensation.
-
-### Re-running the study
-
-```bash
-# Full study (~29 min, requires 10 simulator ports running on localhost 9701–9710)
-python experiments/run_latency_scaling_study.py
-
-# Regenerate report and charts from an existing run
-python experiments/run_latency_scaling_study.py --finalize-run-dir experiments/latency_scaling_runs/<folder>
-```
-
-The study sweeps detector counts (1–40) and device counts (1–10) to quantify how latency scales, then fits a linear model and runs permutation tests. Results are saved to `experiments/latency_scaling_runs/` with a canonical summary at `experiments/latency_scaling_runs/report.md`.
-
----
+Replayed detector events: 81/82 (vehicle off/on), 89/90 (pedestrian off/on), 102/104 (preempt on/off). Detectors numbered 65 and above are ignored. [`ASCControllerEventTypes.csv`](ASCControllerEventTypes.csv) lists the event codes.
 
 ## Compatibility
 
-- **Sending actuations**: Any NTCIP 1202 v3 controller (uses standard detector actuation OIDs for vehicle, pedestrian, and preempt detectors)
-- **Collecting output logs**: MAXTIME controllers via HTTP XML endpoint (`/v1/asclog/xml/full`). Other controller types can be added by implementing a new collection method.
-- **Loading input logs**: CSV, Parquet, MAXTIME SQLite `.db` files\n\nThe portability boundary is deliberate: NTCIP makes the input side reusable, while each controller family needs an output-log adapter and event-code mapping before the same comparison can be applied.
+- **Replay**: any NTCIP 1202 v3 controller or emulator (vehicle, pedestrian, and preempt detector objects).
+- **Collection**: MAXTIME controllers via `http://<ip>:<port>/v1/asclog/xml/full`. Other controller families need a new collection method and event-code mapping.
+- **Latency compensation**: the default 185 ms offset came from the study in [`experiments/latency_scaling_runs/report.md`](experiments/latency_scaling_runs/report.md). Adaptive per-device calibration is available for time-of-day aligned replays.
 
----
+## Development
 
-## Experimental: Behavioral Validation
-
-> **⚠️ Work in Progress** — The firmware validation workflow is functional but still under active development. APIs and configuration formats may change.
-
-The validation system extends Signal-Replay to automate A/B testing of controller behavior. The two runs may use different firmware releases, different timing parameters with the same firmware, or both. The same field-derived input traces are replayed and the resulting high-resolution output events are compared.
-
-### Concepts
-
-- **Test Suite** (`FirmwareTestSuite`): Defines scenarios, batches, and firmware versions to compare
-- **Scenario** (`TestScenario`): A single intersection/controller log to replay. Each scenario has a `test_type`:
-  - `similarity` — Replay and compare output via DTW. Pass = behavior matches baseline within thresholds.
-  - `conflict` — Replay repeatedly to trigger a known conflict. Pass = baseline reproduces conflict, new firmware does not.
-- **Batch** (`TestBatch`): Groups scenarios assigned to physical controllers for a single replay session. Contains a mapping of `scenario_id` → controller `host:port`.
-- **Batch Runner** (`BatchRunner`): Executes batches sequentially with checkpoint/resume support. Prompts (or calls a callback) for database loading between batches.
-- **Comparison** (`compare_firmware`): Compares baseline vs new replay outputs across all scenarios using parallel workers.
-- **Report** (`generate_report`): Generates a self-contained HTML report with pass/fail status, match percentages, divergence details, and embedded Gantt chart images.
-
-### Test Suite YAML Format
-
-```yaml
-suite_name: Firmware Validation
-firmware_version: "2.15.1"
-baseline_version: "original_logs"
-scenarios:
-  - scenario_id: "03013"
-    database_name: "/path/to/03013.bin"
-    events_source: "/path/to/03013.parquet"
-    test_type: similarity
-    description: "Lots of rail preemption"
-    tod_align: true
-  - scenario_id: "2C039"
-    database_name: "/path/to/2C039.bin"
-    events_source: "/path/to/2C039.parquet"
-    test_type: conflict
-    replays: 40
-    incompatible_pairs:
-      - ["O5", "Ph4"]
-      - ["O5", "Ph8"]
-    description: "Known cycle fault conflict"
-batches:
-  - batch_id: day1
-    assignments:
-      "03013": "192.168.1.10:161:80"
-      "2C039": "192.168.1.11:161:80"
+```bash
+pip install -e .[dev]
+pytest                    # runs tests/; live-controller tests skip when no device is reachable
 ```
 
-### Running a Firmware Validation
+## Citation and license
 
-```python
-import signal_replay as sr
-
-# Load the test suite
-suite = sr.load_from_yaml('firmware_validation/test_suite.yaml')
-
-# Run baseline (on original firmware)
-runner = sr.BatchRunner(suite, debug=True)
-baseline_checkpoint = runner.run()
-
-# ... flash new firmware onto controllers ...
-
-# Run new firmware
-suite.firmware_version = "candidate"
-runner_new = sr.BatchRunner(suite, debug=True)
-new_checkpoint = runner_new.run()
-
-# Compare baseline vs new
-results = sr.compare_firmware(
-    baseline_run_dir=str(runner.run_dir),
-    new_run_dir=str(runner_new.run_dir),
-    suite=suite,
-    output_dir='./comparison_output',
-)
-
-# Generate HTML report
-sr.generate_report(
-    results=results,
-    suite=suite,
-    output_path='./report.html',
-)
-```
-
-### BatchRunner Features
-
-- **Checkpoint/resume**: Progress is saved to `checkpoint.json` after each batch. Re-running skips completed batches.
-- **Database loading prompts**: Before each batch, the runner prompts the operator to load the correct controller database (or accepts a callback for automation).
-- **Separate conflict handling**: Conflict scenarios run individually with `stop_on_conflict=True` and their own DuckDB files.
-- **Logging**: Per-run log file at `<output_dir>/<firmware_version>/run.log`.
-
-### HTML Report
-
-`generate_report()` produces a self-contained HTML file with:
-- Summary tiles (pass/fail counts, average match percentage)
-- Sortable results tables for similarity and conflict tests
-- Detailed per-scenario sections with match %, divergence info, and timing analysis
-- Phase/overlap difference breakdowns
-- Embedded Gantt chart images (base64-encoded, no external dependencies)
-- Configuration summary
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE)
+See [`CITATION.cff`](CITATION.cff) for how to cite Signal-Replay. Released under the MIT License, see [LICENSE](LICENSE).

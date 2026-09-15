@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal_replay"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP"
 readme = "README.md"
 license = {text = "MIT"}
@@ -15,6 +15,7 @@ authors = [
 
 dependencies = [
     "pysnmp>=7.0,<8.0",
+    "duckdb",
     "pandas",
     "dtaidistance",
     "jinja2",
@@ -46,6 +47,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 signal_replay = ["sql/*.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.black]
 line-length = 100

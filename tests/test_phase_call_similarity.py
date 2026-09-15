@@ -22,7 +22,7 @@ from signal_replay.comparison import (
 )
 from signal_replay.report import _flag_clearance_irregularity, _normalize_clearance_rows, generate_report
 from signal_replay.test_suite import (
-    FirmwareTestSuite,
+    SoftwareTestSuite,
     ScenarioResult,
     TestBatch as SuiteBatch,
     TestScenario as SuiteScenario,
@@ -848,9 +848,9 @@ def test_operational_summary_includes_transition_rows_with_null_event_value():
 
 
 def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
-    suite = FirmwareTestSuite(
-        suite_name="Firmware Validation",
-        firmware_version="2.17.3",
+    suite = SoftwareTestSuite(
+        suite_name="Software Validation",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             SuiteScenario(
@@ -886,7 +886,7 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     result = ScenarioResult(
         scenario_id="03013",
         test_type=SuiteTestType.SIMILARITY,
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         passed=True,
         match_percentage=97.5,
         timing_match_percentage=92.5,
@@ -1047,7 +1047,7 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     trend_peer = ScenarioResult(
         scenario_id="03015",
         test_type=SuiteTestType.SIMILARITY,
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         passed=False,
         match_percentage=91.2,
         num_divergences=1,
@@ -1175,7 +1175,7 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     thrown_out = ScenarioResult(
         scenario_id="03014",
         test_type=SuiteTestType.SIMILARITY,
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         passed=False,
         match_percentage=0.0,
         num_divergences=2,
@@ -1201,7 +1201,7 @@ def test_generate_report_includes_combined_timeline_and_threshold(tmp_path):
     unavailable = ScenarioResult(
         scenario_id="03016",
         test_type=SuiteTestType.SIMILARITY,
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         passed=False,
         match_percentage=None,
         num_divergences=0,

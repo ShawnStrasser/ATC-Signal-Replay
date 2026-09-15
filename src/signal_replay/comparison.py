@@ -2185,7 +2185,7 @@ def compare_runs(
             settling period is excluded from the results.
         group_tolerance: Maximum gap (seconds) between consecutive timestamps
             that should be merged into the same event group.  0.0 means exact
-            matching (original behaviour).  Use ~0.15 to absorb firmware
+            matching (original behaviour).  Use ~0.15 to absorb software
             timestamp-resolution differences.
     
     Returns:
@@ -3863,7 +3863,7 @@ def create_multi_divergence_plots(
 
     Candidate divergence windows that overlap an invalid (missing/unreliable
     data) interval on either side are skipped, since such a mismatch reflects
-    a data collection gap rather than an actual firmware behavior difference.
+    a data collection gap rather than an actual software behavior difference.
 
     Returns list of generated file paths.
     """

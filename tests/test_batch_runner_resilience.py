@@ -5,7 +5,7 @@ from unittest.mock import patch
 import signal_replay as sr
 
 
-def _build_suite(tmp_path: Path) -> sr.FirmwareTestSuite:
+def _build_suite(tmp_path: Path) -> sr.SoftwareTestSuite:
     scenario = sr.TestScenario(
         scenario_id="S1",
         database_name="S1.bin",
@@ -13,9 +13,9 @@ def _build_suite(tmp_path: Path) -> sr.FirmwareTestSuite:
         test_type=sr.TestType.SIMILARITY,
     )
     batch = sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:1025"})
-    return sr.FirmwareTestSuite(
+    return sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="new",
+        software_version="new",
         baseline_version="old",
         scenarios=[scenario],
         batches=[batch],

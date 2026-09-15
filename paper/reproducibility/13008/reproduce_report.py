@@ -18,9 +18,9 @@ def load_dependencies():
         import pandas as pd
     except ImportError as exc:
         raise SystemExit("From the repository root run: py -m pip install -e . duckdb") from exc
-    sys.path.insert(0, str(REPOSITORY / "firmware_validation"))
+    sys.path.insert(0, str(REPOSITORY / "software_validation"))
     try:
-        return duckdb, pd, import_module("firmware_validate"), import_module("signal_replay")
+        return duckdb, pd, import_module("software_validate"), import_module("signal_replay")
     except ImportError as exc:
         raise SystemExit("From the repository root run: py -m pip install -e . duckdb") from exc
 
@@ -46,7 +46,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=HERE / "reproduced-report.html")
     args = parser.parse_args()
-    duckdb, pd, firmware_validate, sr = load_dependencies()
+    duckdb, pd, software_validate, sr = load_dependencies()
     expected = json.loads((HERE / "expected-results.json").read_text(encoding="utf-8"))
     events = pd.read_csv(HERE / "events.csv")
     required = {"DeviceId", "timestamp", "EventId", "Parameter"}
@@ -71,8 +71,8 @@ def main() -> None:
                                    "analysis_start_time": comparison["analysis_start_time"], "analysis_end_time": "",
                                    "group_tolerance": comparison["group_tolerance_seconds"],
                                    "max_divergence_plots": 2, "divergence_window_minutes": 5.0}}
-        suite = sr.FirmwareTestSuite(
-            suite_name="Paper reproducibility example: 13008", firmware_version=expected["candidate_version"],
+        suite = sr.SoftwareTestSuite(
+            suite_name="Paper reproducibility example: 13008", software_version=expected["candidate_version"],
             baseline_version=expected["baseline_version"], batches=[], output_dir=str(results_root),
             scenarios=[sr.TestScenario(scenario_id="13008", database_name="not required", events_source="not required",
                                        test_type=sr.TestType.SIMILARITY, tod_align=True)],
@@ -81,7 +81,7 @@ def main() -> None:
                                                           match_threshold=comparison["pass_threshold_percent"]),
             phase_call_similarity_threshold=comparison["phase_call_reliability_percent"],
             analysis_start_time=comparison["analysis_start_time"])
-        results = firmware_validate.run_analysis(suite, settings, workspace, export_device_csvs=False)
+        results = software_validate.run_analysis(suite, settings, workspace, export_device_csvs=False)
         if len(results) != 1:
             raise SystemExit(f"Expected one comparison result, found {len(results)}.")
         result = results[0]
@@ -95,7 +95,7 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         sr.generate_report(results, suite, str(output))
     report = output.read_text(encoding="utf-8")
-    if "13008" not in report or "Firmware Validation Report" not in report:
+    if "13008" not in report or "Software Validation Report" not in report:
         raise SystemExit("Generated HTML is missing expected report content.")
     print(f"Verified {actual['status']} result and wrote self-contained report: {output}")
 

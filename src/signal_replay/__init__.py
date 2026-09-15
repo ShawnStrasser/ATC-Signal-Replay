@@ -59,7 +59,7 @@ from .test_suite import (
     TestType,
     TestScenario,
     TestBatch,
-    FirmwareTestSuite,
+    SoftwareTestSuite,
     ScenarioResult,
 )
 from .latency import (
@@ -68,12 +68,12 @@ from .latency import (
     match_sparse_event82_latency,
     sparse_detector_events,
 )
-from .batch_runner import BatchRunner, compare_firmware
+from .batch_runner import BatchRunner, compare_software
 from .report import generate_report, load_annotations
 from .ntcip import send_ntcip, reset_all_detectors, async_send_ntcip, async_reset_all_detectors
 from . import collector, comparison, config, latency, ntcip, orchestrator, replay, test_suite, batch_runner, report
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     # Core simulation
     "ATCSimulation",
@@ -117,14 +117,14 @@ __all__ = [
     "clip_timeline_to_relative_periods",
     "timeline_overlaps_interval",
     "render_sparkline_svg",
-    # Firmware validation
+    # Software validation
     "TestType",
     "TestScenario",
     "TestBatch",
-    "FirmwareTestSuite",
+    "SoftwareTestSuite",
     "ScenarioResult",
     "BatchRunner",
-    "compare_firmware",
+    "compare_software",
     "generate_report",
     "load_annotations",
     "AdaptiveLatencyOffsetManager",

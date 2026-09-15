@@ -34,13 +34,13 @@ class TestBatch:
 
 
 @dataclass
-class FirmwareTestSuite:
+class SoftwareTestSuite:
     suite_name: str
-    firmware_version: str
+    software_version: str
     baseline_version: str
     scenarios: List[TestScenario]
     batches: List[TestBatch]
-    output_dir: str = "./firmware_test_results"
+    output_dir: str = "./software_test_results"
     comparison_thresholds: Optional[ComparisonThresholds] = None
     phase_call_similarity_threshold: float = 90.0
     analysis_settle_minutes: float = 0.0
@@ -71,7 +71,7 @@ class FirmwareTestSuite:
 class ScenarioResult:
     scenario_id: str
     test_type: TestType
-    firmware_version: str
+    software_version: str
     passed: bool
     match_percentage: Optional[float] = None
     timing_match_percentage: Optional[float] = None

@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """
-extract_data.py — Extract collected event logs from a firmware validation run.
+extract_data.py — Extract collected event logs from a software validation run.
 
-This script reads the DuckDB files recorded for a firmware run and exports one
-parquet file per device into firmware_validation/results/<firmware_version>/logs/.
+This script reads the DuckDB files recorded for a software run and exports one
+parquet file per device into software_validation/results/<software_version>/logs/.
 
 Usage:
-    python extract_data.py --firmware-version 2.3.1.0
-    python extract_data.py --firmware-version 2.3.1.0 --settings custom_settings.json
+    python extract_data.py --software-version 2.3.1.0
+    python extract_data.py --software-version 2.3.1.0 --settings custom_settings.json
 
 Notes:
-- Firmware versions containing periods are supported as-is.
-- Output is written under results/<firmware_version>/logs/.
+- Software versions containing periods are supported as-is.
+- Output is written under results/<software_version>/logs/.
 """
 
 from __future__ import annotations
@@ -31,15 +31,15 @@ def load_settings(path: Path) -> dict:
         return json.load(f)
 
 
-def extract_logs(firmware_dir: Path, firmware_version: str, settings_path: Path) -> Path:
+def extract_logs(software_dir: Path, software_version: str, settings_path: Path) -> Path:
     settings = load_settings(settings_path)
-    results_dir = firmware_dir / settings["results_dir"]
-    run_dir = results_dir / firmware_version
+    results_dir = software_dir / settings["results_dir"]
+    run_dir = results_dir / software_version
     checkpoint_path = run_dir / "checkpoint.json"
 
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            f"Checkpoint not found for firmware version '{firmware_version}': {checkpoint_path}"
+            f"Checkpoint not found for software version '{software_version}': {checkpoint_path}"
         )
 
     with open(checkpoint_path, "r", encoding="utf-8") as f:
@@ -83,30 +83,30 @@ def extract_logs(firmware_dir: Path, firmware_version: str, settings_path: Path)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract device event logs from a firmware validation run into parquet files."
+        description="Extract device event logs from a software validation run into parquet files."
     )
     parser.add_argument(
-        "--firmware-version",
+        "--software-version",
         required=True,
-        help="Firmware/test version folder name to extract from, e.g. 2.3.1.0",
+        help="Software/test version folder name to extract from, e.g. 2.3.1.0",
     )
     parser.add_argument(
         "--settings",
         default="settings.json",
-        help="Settings JSON file relative to firmware_validation/",
+        help="Settings JSON file relative to software_validation/",
     )
     args = parser.parse_args()
 
-    firmware_dir = Path(__file__).resolve().parent
-    settings_path = firmware_dir / args.settings
+    software_dir = Path(__file__).resolve().parent
+    settings_path = software_dir / args.settings
     if not settings_path.exists():
         print(f"ERROR: Settings file not found: {settings_path}", file=sys.stderr)
         sys.exit(1)
 
     try:
         extract_logs(
-            firmware_dir=firmware_dir,
-            firmware_version=args.firmware_version,
+            software_dir=software_dir,
+            software_version=args.software_version,
             settings_path=settings_path,
         )
     except Exception as exc:

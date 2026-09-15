@@ -12,7 +12,7 @@ import pandas as pd
 from .comparison import compare_runs
 from .config import SignalConfig
 from .orchestrator import ATCSimulation
-from .test_suite import FirmwareTestSuite, ScenarioResult, TestType, TestScenario
+from .test_suite import SoftwareTestSuite, ScenarioResult, TestType, TestScenario
 
 
 def _parse_assignment(value: str) -> Tuple[str, Optional[int], Optional[int]]:
@@ -53,7 +53,7 @@ def _raise_if_simulation_collection_failed(result: object, batch_label: str) -> 
 
 
 def _comparison_worker(args: Tuple[dict, str, str, str, str, float]) -> dict:
-    scenario_data, baseline_db, new_db, baseline_version, firmware_version, trim_edges_minutes = args
+    scenario_data, baseline_db, new_db, baseline_version, software_version, trim_edges_minutes = args
     scenario_id = scenario_data["scenario_id"]
 
     con_base = duckdb.connect(baseline_db)
@@ -103,7 +103,7 @@ def _comparison_worker(args: Tuple[dict, str, str, str, str, float]) -> dict:
         events_b=new_events,
         device_id=scenario_id,
         run_a_label=baseline_version,
-        run_b_label=firmware_version,
+        run_b_label=software_version,
         auto_align=True,
         trim_edges_minutes=trim_edges_minutes,
     )
@@ -119,15 +119,15 @@ def _comparison_worker(args: Tuple[dict, str, str, str, str, float]) -> dict:
 
 
 class BatchRunner:
-    def __init__(self, suite: FirmwareTestSuite, debug: bool = False):
+    def __init__(self, suite: SoftwareTestSuite, debug: bool = False):
         self.suite = suite
         self.debug = debug
-        self.run_dir = Path(suite.output_dir) / suite.firmware_version
+        self.run_dir = Path(suite.output_dir) / suite.software_version
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path = self.run_dir / "checkpoint.json"
         self._active_simulation: Optional[ATCSimulation] = None
 
-        self.logger = logging.getLogger(f"signal_replay.batch_runner.{suite.firmware_version}")
+        self.logger = logging.getLogger(f"signal_replay.batch_runner.{suite.software_version}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
 
@@ -142,7 +142,7 @@ class BatchRunner:
     def _default_checkpoint(self) -> dict:
         return {
             "suite_name": self.suite.suite_name,
-            "firmware_version": self.suite.firmware_version,
+            "software_version": self.suite.software_version,
             "completed_batches": [],
             "batch_members": {},
             "scenario_db_map": {},
@@ -488,10 +488,10 @@ class BatchRunner:
         return checkpoint
 
 
-def compare_firmware(
+def compare_software(
     baseline_run_dir: str,
     new_run_dir: str,
-    suite: FirmwareTestSuite,
+    suite: SoftwareTestSuite,
     output_dir: Optional[str] = None,
     max_workers: Optional[int] = None,
     trim_edges_minutes: float = 2.0,
@@ -521,7 +521,7 @@ def compare_firmware(
                 ScenarioResult(
                     scenario_id=scenario.scenario_id,
                     test_type=TestType.SIMILARITY,
-                    firmware_version=suite.firmware_version,
+                    software_version=suite.software_version,
                     passed=False,
                     error="Missing baseline or new database mapping",
                 )
@@ -536,7 +536,7 @@ def compare_firmware(
                 baseline_db,
                 new_db,
                 suite.baseline_version,
-                suite.firmware_version,
+                suite.software_version,
                 trim_edges_minutes,
             )
         )
@@ -562,7 +562,7 @@ def compare_firmware(
                 ScenarioResult(
                     scenario_id=output["scenario_id"],
                     test_type=TestType.SIMILARITY,
-                    firmware_version=suite.firmware_version,
+                    software_version=suite.software_version,
                     passed=passed,
                     match_percentage=output["match_percentage"],
                     num_divergences=output["num_divergences"],
@@ -580,7 +580,7 @@ def compare_firmware(
                 ScenarioResult(
                     scenario_id=scenario.scenario_id,
                     test_type=TestType.CONFLICT,
-                    firmware_version=suite.firmware_version,
+                    software_version=suite.software_version,
                     passed=False,
                     error="Missing baseline or new database mapping",
                 )
@@ -643,13 +643,13 @@ def compare_firmware(
         if not baseline_has_conflict:
             note_parts.append("Baseline did not reproduce conflict; test validity warning")
         if new_has_conflict:
-            note_parts.append("Conflict observed on new firmware")
+            note_parts.append("Conflict observed on new software")
 
         results.append(
             ScenarioResult(
                 scenario_id=scenario.scenario_id,
                 test_type=TestType.CONFLICT,
-                firmware_version=suite.firmware_version,
+                software_version=suite.software_version,
                 passed=passed,
                 conflicts_found=new_conflicts.to_dict("records") if not new_conflicts.empty else [],
                 runs_completed=runs_completed,

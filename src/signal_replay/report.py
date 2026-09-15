@@ -8,7 +8,7 @@ import yaml
 from jinja2 import Template
 
 from .comparison import PhaseCallChunkScore, render_sparkline_svg
-from .test_suite import FirmwareTestSuite, ScenarioResult, TestType
+from .test_suite import SoftwareTestSuite, ScenarioResult, TestType
 
 
 def load_annotations(path: str) -> Dict[str, str]:
@@ -580,7 +580,7 @@ _REPORT_TEMPLATE = Template("""\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ suite.suite_name }} &mdash; Firmware Validation Report</title>
+<title>{{ suite.suite_name }} &mdash; Software Validation Report</title>
 <style>
 :root {
   --pass: #1b8a2e;
@@ -721,7 +721,7 @@ a:hover { text-decoration: underline; }
 
 <div class="header">
   <h1>{{ suite.suite_name }}</h1>
-  <div class="subtitle">Baseline <strong>{{ suite.baseline_version }}</strong> &rarr; New firmware <strong>{{ suite.firmware_version }}</strong></div>
+  <div class="subtitle">Baseline <strong>{{ suite.baseline_version }}</strong> &rarr; New software <strong>{{ suite.software_version }}</strong></div>
   <div class="generated">Generated {{ generated_at }}</div>
 </div>
 
@@ -808,7 +808,7 @@ a:hover { text-decoration: underline; }
       <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total clearance events whose duration differs from that movement's own median by at least 0.1s. Overlap yellow/red rows are included here only when their median is at most 6.0s and at least 95% of samples are within 2.0s of that median.</div>
       <table class="trends-table">
         <thead>
-          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Irregular Count</th><th>{{ suite.firmware_version }}<br>Irregular Count</th><th>&#916; Count</th><th>Devices</th></tr>
+          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Irregular Count</th><th>{{ suite.software_version }}<br>Irregular Count</th><th>&#916; Count</th><th>Devices</th></tr>
         </thead>
         <tbody>
         {% for trend in clearance_trends %}
@@ -849,7 +849,7 @@ a:hover { text-decoration: underline; }
       <div class="section-copy" style="padding:0 20px 12px; margin:0; max-width:none;">Total count of timeline rows where ATSPM marked the event as invalid (<code>IsValid = False</code>), grouped by main event type instead of movement number. The detailed device breakdowns and flagged charts below use only valid timeline rows.</div>
       <table class="trends-table">
         <thead>
-          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Invalid Count</th><th>{{ suite.firmware_version }}<br>Invalid Count</th><th>&#916; Count</th><th>Devices</th></tr>
+          <tr><th>Type</th><th>{{ suite.baseline_version }}<br>Invalid Count</th><th>{{ suite.software_version }}<br>Invalid Count</th><th>&#916; Count</th><th>Devices</th></tr>
         </thead>
         <tbody>
         {% for row in integrity_rows %}
@@ -873,7 +873,7 @@ a:hover { text-decoration: underline; }
   <div class="card-header"><h2>Combined Timeline</h2></div>
   <div class="card-body">
     <div class="section-copy">
-      Black points and the connecting line show the average vehicular phase-call input similarity across all similarity devices. This is a system-wide sanity check for network or compute issues that may have affected every device at once, independent of firmware version.
+      Black points and the connecting line show the average vehicular phase-call input similarity across all similarity devices. This is a system-wide sanity check for network or compute issues that may have affected every device at once, independent of software version.
     </div>
     <div class="sparkline-wrap">{{ combined_phase_call_timeline_svg }}</div>
   </div>
@@ -929,7 +929,7 @@ a:hover { text-decoration: underline; }
           <div style="font-weight:600;margin-bottom:6px;">Match Timeline</div>
           <div class="sparkline-wrap">{{ row.sparkline_svg }}</div>
           {% if row.test_type == 'similarity' %}
-          <div class="chart-note"><strong>Match bars</strong> show the firmware comparison score by chunk. <strong>Black points/line</strong> show vehicular phase-call input similarity, which is treated as a simulation-reliability sanity check independent of firmware version. Semi-transparent bars were excluded from the device-level match average because input similarity fell below {{ phase_call_similarity_threshold }}%.</div>
+          <div class="chart-note"><strong>Match bars</strong> show the software comparison score by chunk. <strong>Black points/line</strong> show vehicular phase-call input similarity, which is treated as a simulation-reliability sanity check independent of software version. Semi-transparent bars were excluded from the device-level match average because input similarity fell below {{ phase_call_similarity_threshold }}%.</div>
           {% endif %}
         </div>
       {% endif %}
@@ -1096,7 +1096,7 @@ a:hover { text-decoration: underline; }
       <thead><tr><th>Setting</th><th>Value</th><th>Description</th></tr></thead>
       <tbody>
       <tr><td>Suite name</td><td>{{ suite.suite_name }}</td><td>Name of this validation test suite</td></tr>
-      <tr><td>Firmware version</td><td>{{ suite.firmware_version }}</td><td>New firmware version being validated</td></tr>
+      <tr><td>Software version</td><td>{{ suite.software_version }}</td><td>New software version being validated</td></tr>
       <tr><td>Baseline version</td><td>{{ suite.baseline_version }}</td><td>Reference baseline used for comparison</td></tr>
       <tr><td>Collection interval</td><td>{{ suite.collection_interval_minutes }} minutes</td><td>Duration of event log collection per scenario</td></tr>
       <tr><td>Post-replay settle</td><td>{{ suite.post_replay_settle_seconds }} seconds</td><td>Wait time after log replay before collecting events</td></tr>
@@ -1120,7 +1120,7 @@ a:hover { text-decoration: underline; }
 </div><!-- container -->
 
 <div class="footer">
-  Firmware Validation Report &mdash; signal_replay v{{ version }} &mdash; {{ generated_at }}
+  Software Validation Report &mdash; signal_replay v{{ version }} &mdash; {{ generated_at }}
 </div>
 </body>
 </html>
@@ -1129,11 +1129,11 @@ a:hover { text-decoration: underline; }
 
 def generate_report(
     results: List[ScenarioResult],
-    suite: FirmwareTestSuite,
+    suite: SoftwareTestSuite,
     output_path: str,
     annotations: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Generate a self-contained HTML firmware validation report.
+    """Generate a self-contained HTML software validation report.
 
     The report embeds all plot images as base64 so it is portable as a single file.
     """

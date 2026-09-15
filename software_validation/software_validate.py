@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 """
-firmware_validate.py — Standalone firmware validation script.
+software_validate.py — Standalone software validation script.
 
-Replays source logs to controllers with new firmware, compares collected output
+Replays source logs to controllers with new software, compares collected output
 to the configured baseline, and generates an HTML report with divergence charts.
 
 Usage:
-    python firmware_validate.py                  # interactive, uses settings.json
-    python firmware_validate.py --verbose        # extra debug output
-    python firmware_validate.py --report-only    # skip replay, just run analysis + report
-    python firmware_validate.py --report-only-fast
-    python firmware_validate.py --settings custom_settings.json
+    python software_validate.py                  # interactive, uses settings.json
+    python software_validate.py --verbose        # extra debug output
+    python software_validate.py --report-only    # skip replay, just run analysis + report
+    python software_validate.py --report-only-fast
+    python software_validate.py --settings custom_settings.json
 
 Settings are loaded from settings.json (editable JSON file in the same folder).
 """
@@ -194,21 +194,21 @@ def load_settings(path: Path) -> dict:
         return json.load(f)
 
 
-def get_results_dir(firmware_dir: Path, settings: dict) -> Path:
-    return firmware_dir / settings["results_dir"]
+def get_results_dir(software_dir: Path, settings: dict) -> Path:
+    return software_dir / settings["results_dir"]
 
 
-def get_version_collected_db_path(firmware_dir: Path, settings: dict, version: str) -> Path:
-    return get_results_dir(firmware_dir, settings) / version / COLLECTED_DB_FILENAME
+def get_version_collected_db_path(software_dir: Path, settings: dict, version: str) -> Path:
+    return get_results_dir(software_dir, settings) / version / COLLECTED_DB_FILENAME
 
 
-def get_version_logs_dir(firmware_dir: Path, settings: dict, version: str) -> Path:
-    return get_results_dir(firmware_dir, settings) / version / "logs"
+def get_version_logs_dir(software_dir: Path, settings: dict, version: str) -> Path:
+    return get_results_dir(software_dir, settings) / version / "logs"
 
 
-def resolve_baseline_db_path(firmware_dir: Path, settings: dict) -> Tuple[Optional[Path], str]:
+def resolve_baseline_db_path(software_dir: Path, settings: dict) -> Tuple[Optional[Path], str]:
     baseline_db_path = get_version_collected_db_path(
-        firmware_dir,
+        software_dir,
         settings,
         settings["baseline_version"],
     )
@@ -219,14 +219,14 @@ def resolve_baseline_db_path(firmware_dir: Path, settings: dict) -> Tuple[Option
 
 def resolve_baseline_source(
     tssu: str,
-    firmware_dir: Path,
+    software_dir: Path,
     settings: dict,
 ) -> Tuple[Optional[BaselineSource], str]:
-    baseline_db_path, baseline_label = resolve_baseline_db_path(firmware_dir, settings)
+    baseline_db_path, baseline_label = resolve_baseline_db_path(software_dir, settings)
     if baseline_db_path is not None:
         return ("db", str(baseline_db_path)), baseline_label
 
-    baseline_log = find_log(tssu, firmware_dir / settings["logs_dir"])
+    baseline_log = find_log(tssu, software_dir / settings["logs_dir"])
     if baseline_log is None:
         return None, baseline_label
     return ("file", str(baseline_log)), baseline_label
@@ -294,16 +294,16 @@ def normalize_target(target: str) -> str:
 # ---------------------------------------------------------------------------
 def build_suite(
     settings: dict,
-    firmware_dir: Path,
+    software_dir: Path,
     catalog: List[dict],
     conflict_pairs: dict,
-) -> Tuple[sr.FirmwareTestSuite, dict]:
+) -> Tuple[sr.SoftwareTestSuite, dict]:
     """Build the full test suite and return it with the discovered input file map."""
 
-    logs_dir = firmware_dir / settings["logs_dir"]
-    databases_dir = firmware_dir / settings["databases_dir"]
-    firmware_version = settings["firmware_version"]
-    _baseline_db_path, baseline_version = resolve_baseline_db_path(firmware_dir, settings)
+    logs_dir = software_dir / settings["logs_dir"]
+    databases_dir = software_dir / settings["databases_dir"]
+    software_version = settings["software_version"]
+    _baseline_db_path, baseline_version = resolve_baseline_db_path(software_dir, settings)
 
     file_map: Dict[str, dict] = {}
     for r in catalog:
@@ -367,13 +367,13 @@ def build_suite(
     if analysis_start_time and scenarios and all(s.tod_align for s in scenarios):
         effective_settle_minutes = 0.0
 
-    suite = sr.FirmwareTestSuite(
-        suite_name="Firmware Validation",
-        firmware_version=firmware_version,
+    suite = sr.SoftwareTestSuite(
+        suite_name="Software Validation",
+        software_version=software_version,
         baseline_version=baseline_version,
         scenarios=scenarios,
         batches=[],
-        output_dir=str(firmware_dir / settings["results_dir"]),
+        output_dir=str(software_dir / settings["results_dir"]),
         comparison_thresholds=sr.ComparisonThresholds(
             sequence_threshold=comp.get("sequence_threshold", 0.05),
             timing_threshold=comp.get("timing_threshold", 0.02),
@@ -398,8 +398,8 @@ def _replace_on_rerun_enabled(value: object) -> bool:
     return str(value).strip().lower() == "yes"
 
 
-def _shared_collected_db_path(suite: sr.FirmwareTestSuite) -> Path:
-    return Path(suite.output_dir) / suite.firmware_version / COLLECTED_DB_FILENAME
+def _shared_collected_db_path(suite: sr.SoftwareTestSuite) -> Path:
+    return Path(suite.output_dir) / suite.software_version / COLLECTED_DB_FILENAME
 
 
 def _get_collected_device_ids(db_path: Path) -> set[str]:
@@ -435,7 +435,7 @@ def _get_collected_device_ids(db_path: Path) -> set[str]:
 
 
 def _select_pending_replay_batch(
-    suite: sr.FirmwareTestSuite,
+    suite: sr.SoftwareTestSuite,
     settings: dict,
     catalog: List[dict],
     existing_ids: set[str],
@@ -531,7 +531,7 @@ def wait_for_controllers(targets: List[str], labels: List[str]) -> None:
 # ---------------------------------------------------------------------------
 # Replay operations
 # ---------------------------------------------------------------------------
-def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> Path:
+def run_batch(suite: sr.SoftwareTestSuite, batch: sr.TestBatch) -> Path:
     runner = sr.BatchRunner(suite, debug=_VERBOSE)
 
     def auto_db_loader(db_name: str, target: str) -> bool:
@@ -550,7 +550,7 @@ def run_batch(suite: sr.FirmwareTestSuite, batch: sr.TestBatch) -> Path:
 # Analysis (comparison) — designed for multiprocessing
 # ---------------------------------------------------------------------------
 def _extract_collected_events(
-    suite: sr.FirmwareTestSuite,
+    suite: sr.SoftwareTestSuite,
     collected_db_path: Path,
     output_dir: Path,
 ) -> Dict[str, Path]:
@@ -893,7 +893,7 @@ def _analyze_conflict_scenario(
     baseline_source: BaselineSource,
     baseline_label: str,
     collected_db_path: Path,
-    firmware_version: str,
+    software_version: str,
 ) -> sr.ScenarioResult:
     """Build a conflict result from persisted baseline/new logs."""
     baseline_events = _load_baseline_events(baseline_source, scenario.scenario_id)
@@ -903,7 +903,7 @@ def _analyze_conflict_scenario(
         return sr.ScenarioResult(
             scenario_id=scenario.scenario_id,
             test_type=sr.TestType.CONFLICT,
-            firmware_version=firmware_version,
+            software_version=software_version,
             passed=False,
             runs_completed=0,
             total_runs=scenario.replays,
@@ -937,17 +937,17 @@ def _analyze_conflict_scenario(
     if new_has_conflict:
         conflict_runs = sorted({record["run_number"] for record in new_conflicts})
         notes.append(
-            f"Conflict observed on {firmware_version} in run(s): {', '.join(str(run) for run in conflict_runs)}."
+            f"Conflict observed on {software_version} in run(s): {', '.join(str(run) for run in conflict_runs)}."
         )
     else:
-        notes.append(f"No conflicts detected on {firmware_version} across {runs_completed} completed run(s).")
+        notes.append(f"No conflicts detected on {software_version} across {runs_completed} completed run(s).")
 
     passed = configured_pairs and baseline_has_conflict and not new_has_conflict
 
     return sr.ScenarioResult(
         scenario_id=scenario.scenario_id,
         test_type=sr.TestType.CONFLICT,
-        firmware_version=firmware_version,
+        software_version=software_version,
         passed=passed,
         conflicts_found=new_conflicts,
         runs_completed=runs_completed,
@@ -1562,7 +1562,7 @@ def _generate_special_issue_plots(
 
     Candidate windows that overlap an invalid (missing/unreliable data) interval
     on either side are skipped, since such a mismatch reflects a data collection
-    gap rather than an actual firmware behavior difference.
+    gap rather than an actual software behavior difference.
     """
     if timeline_a.empty or timeline_b.empty:
         return [], []
@@ -1725,7 +1725,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     Reads collected output directly from DuckDB.
     """
     (scenario_id, baseline_source, baseline_label, test_type_str, collected_db_path,
-     firmware_version, plots_dir_str, settle_minutes, group_tolerance,
+     software_version, plots_dir_str, settle_minutes, group_tolerance,
       max_plots, window_minutes, verbose, notes_column, tod_align,
           analysis_start_time, analysis_end_time, phase_call_threshold) = args
 
@@ -1807,7 +1807,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
     result = sr.compare_runs(
         events_a=baseline_for_analysis, events_b=collected_for_analysis,
         device_id=scenario_id,
-        run_a_label=baseline_label, run_b_label=firmware_version,
+        run_a_label=baseline_label, run_b_label=software_version,
         start_time_a=start_time_a,
         start_time_b=start_time_b,
         auto_align=not tod_align, settle_minutes=compare_settle_minutes,
@@ -1993,7 +1993,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         operational_diffs=operational_diffs,
                         plots_dir=plots_dir_str,
                         label_a=baseline_label,
-                        label_b=firmware_version,
+                        label_b=software_version,
                         window_minutes=window_minutes,
                         time_offset_b=chart_time_offset_b,
                         align_by_time_delta=chart_align_by_time_delta,
@@ -2008,7 +2008,7 @@ def _compare_one_scenario(args: Tuple) -> dict:
                         comparison_result=result,
                         output_dir=plots_dir_str,
                         label_a=baseline_label,
-                        label_b=firmware_version,
+                        label_b=software_version,
                         max_plots=remaining_divergence_plots,
                         window_minutes=window_minutes,
                         time_offset_b=chart_time_offset_b,
@@ -2134,20 +2134,20 @@ def _compare_one_scenario(args: Tuple) -> dict:
 
 
 def _export_device_csvs(
-    suite: sr.FirmwareTestSuite,
+    suite: sr.SoftwareTestSuite,
     collected_db_path: Path,
     baseline_sources: Dict[str, BaselineSource],
     group_tolerance: float = 0.0,
 ) -> Path:
     """Export a combined CSV per device with baseline + collected events.
 
-    Each CSV lives in results/<fw_version>/device_events/<scenario_id>.csv
+    Each CSV lives in results/<sw_version>/device_events/<scenario_id>.csv
     and contains a ``DeviceId`` column (``baseline`` vs ``new``)
     to distinguish the two runs. Baseline timestamps are shifted onto the
     new run's absolute timeline using the same temporal offset logic used
     by the comparison / Gantt chart alignment.
     """
-    out_dir = Path(suite.output_dir) / suite.firmware_version / "device_events"
+    out_dir = Path(suite.output_dir) / suite.software_version / "device_events"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not collected_db_path.exists():
@@ -2233,14 +2233,14 @@ def _export_device_csvs(
 
 
 def run_analysis(
-    suite: sr.FirmwareTestSuite,
+    suite: sr.SoftwareTestSuite,
     settings: dict,
-    firmware_dir: Path,
+    software_dir: Path,
     *,
     export_device_csvs: bool = True,
 ) -> List[sr.ScenarioResult]:
     """Run comparisons with multiprocessing. Returns list of ScenarioResult."""
-    firmware_version = suite.firmware_version
+    software_version = suite.software_version
     comp = settings.get("comparison", {})
     settle_minutes = comp.get("settle_minutes", 10.0)
     group_tolerance = comp.get("group_tolerance", 0.0)
@@ -2249,11 +2249,11 @@ def run_analysis(
     phase_call_threshold = comp.get("phase_call_similarity_threshold", comp.get("detector_similarity_threshold", 90.0))
     max_workers = settings.get("analysis_workers", 4)
 
-    plots_dir = Path(suite.output_dir) / firmware_version / "divergence_plots"
+    plots_dir = Path(suite.output_dir) / software_version / "divergence_plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     collected_db_path = _shared_collected_db_path(suite)
 
-    baseline_db_path, baseline_label = resolve_baseline_db_path(firmware_dir, settings)
+    baseline_db_path, baseline_label = resolve_baseline_db_path(software_dir, settings)
     if baseline_db_path is not None:
         log(f"Baseline collected DB: {baseline_db_path}")
     else:
@@ -2269,7 +2269,7 @@ def run_analysis(
 
     baseline_sources: Dict[str, BaselineSource] = {}
     for scenario in suite.scenarios:
-        baseline_source, _ = resolve_baseline_source(scenario.scenario_id, firmware_dir, settings)
+        baseline_source, _ = resolve_baseline_source(scenario.scenario_id, software_dir, settings)
         if baseline_source is None:
             log(
                 f"WARNING: Missing baseline source for {scenario.scenario_id}; "
@@ -2312,7 +2312,7 @@ def run_analysis(
             baseline_label,
             test_type_str,
             str(collected_db_path),
-            firmware_version,
+            software_version,
             str(plots_dir),
             settle_minutes,
             group_tolerance,
@@ -2352,7 +2352,7 @@ def run_analysis(
                     results.append(sr.ScenarioResult(
                         scenario_id=out["scenario_id"],
                         test_type=sr.TestType.SIMILARITY,
-                        firmware_version=firmware_version,
+                        software_version=software_version,
                         passed=out["passed"],
                         match_percentage=out["match_percentage"],
                         timing_match_percentage=out.get("timing_match_percentage"),
@@ -2391,12 +2391,12 @@ def run_analysis(
                     if out["phase_diffs"]:
                         diffs_msg = f"\n    Phase/overlap differences ({len(out['phase_diffs'])} phases):\n"
                         diffs_msg += sr.format_phase_differences(
-                            out["phase_diffs"], label_a=baseline_label, label_b=firmware_version
+                            out["phase_diffs"], label_a=baseline_label, label_b=software_version
                         )
                     if out.get("operational_diffs"):
                         diffs_msg += f"\n    Transition/preempt/ped service differences ({len(out['operational_diffs'])} rows):\n"
                         diffs_msg += sr.format_phase_differences(
-                            out["operational_diffs"], label_a=baseline_label, label_b=firmware_version
+                            out["operational_diffs"], label_a=baseline_label, label_b=software_version
                         )
                     error_msg = f"\n    {out['error']}" if out.get("error") else ""
                     log(f"  [{done}/{total_jobs}] {out['scenario_id']}: {match_text}  {status}  ({out['num_divergences']} divergences{plots_msg}){diffs_msg}{error_msg}")
@@ -2415,7 +2415,7 @@ def run_analysis(
                     baseline_source,
                     baseline_label,
                     collected_db_path,
-                    firmware_version,
+                    software_version,
                 )
                 results.append(result)
                 status = "ERROR" if result.error else ("PASS" if result.passed else "FAIL")
@@ -2438,9 +2438,9 @@ def run_analysis(
 # ---------------------------------------------------------------------------
 def build_report(
     results: List[sr.ScenarioResult],
-    suite: sr.FirmwareTestSuite,
+    suite: sr.SoftwareTestSuite,
 ) -> Path:
-    report_dir = Path(suite.output_dir) / suite.firmware_version
+    report_dir = Path(suite.output_dir) / suite.software_version
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / "report.html"
     generate_report(results, suite, str(report_path))
@@ -2450,13 +2450,13 @@ def build_report(
 # ---------------------------------------------------------------------------
 # Refresh versioned collected logs
 # ---------------------------------------------------------------------------
-def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path, settings: dict) -> None:
-    fw_ver = suite.firmware_version
+def archive_and_extract(suite: sr.SoftwareTestSuite, software_dir: Path, settings: dict) -> None:
+    sw_ver = suite.software_version
     collected_db_path = _shared_collected_db_path(suite)
     if not collected_db_path.exists():
         log(f"No collected DuckDB found to export: {collected_db_path}")
         return
-    output_dir = get_version_logs_dir(firmware_dir, settings, fw_ver)
+    output_dir = get_version_logs_dir(software_dir, settings, sw_ver)
     extracted_map = _extract_collected_events(suite, collected_db_path, output_dir)
     log(f"Collected logs refreshed in {output_dir} ({len(extracted_map)} scenario(s)).")
 
@@ -2467,7 +2467,7 @@ def archive_and_extract(suite: sr.FirmwareTestSuite, firmware_dir: Path, setting
 def main() -> None:
     global _VERBOSE
 
-    parser = argparse.ArgumentParser(description="Firmware validation: replay, compare, report.")
+    parser = argparse.ArgumentParser(description="Software validation: replay, compare, report.")
     parser.add_argument("--settings", default="settings.json", help="Path to settings JSON file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     report_mode = parser.add_mutually_exclusive_group()
@@ -2497,8 +2497,8 @@ def main() -> None:
 
     # Preserve the invoked workspace path on Windows rather than resolving a
     # mapped drive into its UNC share, which can break temp parquet access.
-    firmware_dir = Path(__file__).parent
-    settings_path = firmware_dir / args.settings
+    software_dir = Path(__file__).parent
+    settings_path = software_dir / args.settings
     if not settings_path.exists():
         print(f"ERROR: Settings file not found: {settings_path}", file=sys.stderr)
         sys.exit(1)
@@ -2507,16 +2507,16 @@ def main() -> None:
     if args.settle_minutes is not None:
         settings.setdefault("comparison", {})["settle_minutes"] = args.settle_minutes
     log(f"signal_replay version: {sr.__version__}")
-    log(f"Firmware dir:  {firmware_dir}")
+    log(f"Software dir:  {software_dir}")
     log(f"Settings:      {settings_path}")
 
     # --- Read catalog ---
-    catalog_path = firmware_dir / settings["catalog_file"]
+    catalog_path = software_dir / settings["catalog_file"]
     catalog = read_catalog(catalog_path)
     log(f"Catalog:       {len(catalog)} rows from {catalog_path.name}")
 
     # --- Load conflict pairs ---
-    conflict_pairs_path = firmware_dir / settings["conflict_pairs_file"]
+    conflict_pairs_path = software_dir / settings["conflict_pairs_file"]
     conflict_pairs: dict = {}
     if conflict_pairs_path.exists():
         with open(conflict_pairs_path, "r") as f:
@@ -2525,7 +2525,7 @@ def main() -> None:
         vlog(f"Loaded conflict pairs for {len(conflict_pairs)} devices")
 
     # --- Build suite ---
-    suite, file_map = build_suite(settings, firmware_dir, catalog, conflict_pairs)
+    suite, file_map = build_suite(settings, software_dir, catalog, conflict_pairs)
     scenario_lookup = {scenario.scenario_id: scenario for scenario in suite.scenarios}
 
     if suite.analysis_start_time:
@@ -2648,7 +2648,7 @@ def main() -> None:
         # ANALYSIS PHASE
         # ======================================================================
         log(f"\n{'='*70}")
-        log(f"ANALYSIS: Comparing {suite.firmware_version} output to {suite.baseline_version}")
+        log(f"ANALYSIS: Comparing {suite.software_version} output to {suite.baseline_version}")
         log(f"{'='*70}")
 
         if args.top_n is not None:
@@ -2662,7 +2662,7 @@ def main() -> None:
         results = run_analysis(
             suite,
             settings,
-            firmware_dir,
+            software_dir,
             export_device_csvs=export_device_csvs,
         )
         passed = sum(1 for r in results if r.passed)
@@ -2686,7 +2686,7 @@ def main() -> None:
             log(f"\n{'='*70}")
             log("EXPORT: Refreshing versioned collected logs")
             log(f"{'='*70}")
-            archive_and_extract(suite, firmware_dir, settings)
+            archive_and_extract(suite, software_dir, settings)
 
         log("\nDone.")
     finally:

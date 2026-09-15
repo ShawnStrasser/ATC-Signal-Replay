@@ -2,7 +2,7 @@
 Live emulator tests for preempt 5/6 replay and collection.
 
 These tests are intended to diagnose the suspected preempt-6 round-trip issue
-seen in firmware-validation results. They:
+seen in software-validation results. They:
 
 1. Replay short synthetic preempt-only sequences to localhost emulators
 2. Collect the controller event log back over HTTP

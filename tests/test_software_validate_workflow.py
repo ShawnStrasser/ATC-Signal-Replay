@@ -11,9 +11,9 @@ import pandas as pd
 import signal_replay as sr
 
 
-def _load_firmware_validate_module():
-    module_path = Path(__file__).resolve().parents[1] / "firmware_validation" / "firmware_validate.py"
-    spec = importlib.util.spec_from_file_location("firmware_validate_module", module_path)
+def _load_software_validate_module():
+    module_path = Path(__file__).resolve().parents[1] / "software_validation" / "software_validate.py"
+    spec = importlib.util.spec_from_file_location("software_validate_module", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -21,23 +21,23 @@ def _load_firmware_validate_module():
 
 
 def test_build_suite_uses_root_logs_for_replay_and_fallback_baseline_label(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    (firmware_dir / "logs").mkdir(parents=True)
-    (firmware_dir / "databases").mkdir()
+    software_dir = tmp_path / "software_validation"
+    (software_dir / "logs").mkdir(parents=True)
+    (software_dir / "databases").mkdir()
 
-    root_log = firmware_dir / "logs" / "S1.parquet"
+    root_log = software_dir / "logs" / "S1.parquet"
     pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
     ).to_parquet(root_log, index=False)
-    (firmware_dir / "databases" / "S1.bin").write_bytes(b"db")
+    (software_dir / "databases" / "S1.bin").write_bytes(b"db")
 
     settings = {
         "logs_dir": "logs",
         "databases_dir": "databases",
         "controller_targets": ["127.0.0.1:9701"],
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "replay_latency_offset_seconds": 1.55,
         "replay_latency_offset_lookback_min": 10.0,
@@ -47,7 +47,7 @@ def test_build_suite_uses_root_logs_for_replay_and_fallback_baseline_label(tmp_p
     }
     catalog = [{"TSSU": "S1", "Type": "Similarity", "CycleLength": 0, "Offset": 0.0, "Notes": ""}]
 
-    suite, _file_map = firmware_validate.build_suite(settings, firmware_dir, catalog, {})
+    suite, _file_map = software_validate.build_suite(settings, software_dir, catalog, {})
 
     assert suite.baseline_version == "2.15.1 (source logs)"
     assert suite.scenarios[0].events_source == str(root_log)
@@ -57,23 +57,23 @@ def test_build_suite_uses_root_logs_for_replay_and_fallback_baseline_label(tmp_p
 
 
 def test_build_suite_zeroes_reported_settle_when_manual_start_replaces_it(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    (firmware_dir / "logs").mkdir(parents=True)
-    (firmware_dir / "databases").mkdir()
+    software_dir = tmp_path / "software_validation"
+    (software_dir / "logs").mkdir(parents=True)
+    (software_dir / "databases").mkdir()
 
-    root_log = firmware_dir / "logs" / "S1.parquet"
+    root_log = software_dir / "logs" / "S1.parquet"
     pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
     ).to_parquet(root_log, index=False)
-    (firmware_dir / "databases" / "S1.bin").write_bytes(b"db")
+    (software_dir / "databases" / "S1.bin").write_bytes(b"db")
 
     settings = {
         "logs_dir": "logs",
         "databases_dir": "databases",
         "controller_targets": ["127.0.0.1:9701"],
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "results_dir": "results",
         "comparison": {
@@ -84,7 +84,7 @@ def test_build_suite_zeroes_reported_settle_when_manual_start_replaces_it(tmp_pa
     }
     catalog = [{"TSSU": "S1", "Type": "Similarity", "CycleLength": 0, "Offset": 0.0, "Notes": ""}]
 
-    suite, _file_map = firmware_validate.build_suite(settings, firmware_dir, catalog, {})
+    suite, _file_map = software_validate.build_suite(settings, software_dir, catalog, {})
 
     assert suite.scenarios[0].tod_align is True
     assert suite.analysis_start_time == "09:10"
@@ -93,23 +93,23 @@ def test_build_suite_zeroes_reported_settle_when_manual_start_replaces_it(tmp_pa
 
 
 def test_build_suite_keeps_settle_for_non_tod_scenarios(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    (firmware_dir / "logs").mkdir(parents=True)
-    (firmware_dir / "databases").mkdir()
+    software_dir = tmp_path / "software_validation"
+    (software_dir / "logs").mkdir(parents=True)
+    (software_dir / "databases").mkdir()
 
-    root_log = firmware_dir / "logs" / "S1.parquet"
+    root_log = software_dir / "logs" / "S1.parquet"
     pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
     ).to_parquet(root_log, index=False)
-    (firmware_dir / "databases" / "S1.bin").write_bytes(b"db")
+    (software_dir / "databases" / "S1.bin").write_bytes(b"db")
 
     settings = {
         "logs_dir": "logs",
         "databases_dir": "databases",
         "controller_targets": ["127.0.0.1:9701"],
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "results_dir": "results",
         "comparison": {
@@ -119,14 +119,14 @@ def test_build_suite_keeps_settle_for_non_tod_scenarios(tmp_path):
     }
     catalog = [{"TSSU": "S1", "Type": "Similarity", "CycleLength": 90, "Offset": 0.0, "Notes": ""}]
 
-    suite, _file_map = firmware_validate.build_suite(settings, firmware_dir, catalog, {})
+    suite, _file_map = software_validate.build_suite(settings, software_dir, catalog, {})
 
     assert suite.scenarios[0].tod_align is False
     assert suite.analysis_settle_minutes == 10.0
 
 
 def test_load_coord_split_schedules_groups_rows_by_device(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     coord_dir = tmp_path / "coord_patterns"
     coord_dir.mkdir()
@@ -139,7 +139,7 @@ def test_load_coord_split_schedules_groups_rows_by_device(tmp_path):
         encoding="utf-8",
     )
 
-    schedules = firmware_validate._load_coord_split_schedules(str(coord_dir))
+    schedules = software_validate._load_coord_split_schedules(str(coord_dir))
 
     assert list(schedules) == ["2B045"]
     assert schedules["2B045"] == [
@@ -157,7 +157,7 @@ def test_load_coord_split_schedules_groups_rows_by_device(tmp_path):
 
 
 def test_load_coord_split_schedules_refreshes_csvs_from_json(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     coord_dir = tmp_path / "coord_patterns"
     coord_dir.mkdir()
@@ -171,30 +171,30 @@ def test_load_coord_split_schedules_refreshes_csvs_from_json(tmp_path):
     )
     (coord_dir / "2B049.json").write_text("{}", encoding="utf-8")
 
-    schedules = firmware_validate._load_coord_split_schedules(str(coord_dir))
+    schedules = software_validate._load_coord_split_schedules(str(coord_dir))
 
     assert list(schedules) == ["2B049"]
     assert schedules["2B049"][0]["phase"] == 4
 
 
 def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    (firmware_dir / "logs").mkdir(parents=True)
-    (firmware_dir / "databases").mkdir()
+    software_dir = tmp_path / "software_validation"
+    (software_dir / "logs").mkdir(parents=True)
+    (software_dir / "databases").mkdir()
 
     for scenario_id in ("C1", "S1", "S2", "C2"):
         pd.DataFrame(
             [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
-        ).to_parquet(firmware_dir / "logs" / f"{scenario_id}.parquet", index=False)
-        (firmware_dir / "databases" / f"{scenario_id}.bin").write_bytes(b"db")
+        ).to_parquet(software_dir / "logs" / f"{scenario_id}.parquet", index=False)
+        (software_dir / "databases" / f"{scenario_id}.bin").write_bytes(b"db")
 
     settings = {
         "logs_dir": "logs",
         "databases_dir": "databases",
         "controller_targets": ["127.0.0.1:9701", "127.0.0.1:9702"],
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "results_dir": "results",
         "comparison": {},
@@ -206,7 +206,7 @@ def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path
         {"TSSU": "C2", "Type": "Conflict", "CycleLength": 0, "Offset": 0.0, "Notes": ""},
     ]
 
-    suite, _file_map = firmware_validate.build_suite(settings, firmware_dir, catalog, {})
+    suite, _file_map = software_validate.build_suite(settings, software_dir, catalog, {})
 
     assert [scenario.scenario_id for scenario in suite.scenarios] == ["S1", "S2", "C1", "C2"]
     assert suite.batches == []
@@ -215,14 +215,14 @@ def test_build_suite_groups_conflict_scenarios_after_similarity_batches(tmp_path
 
 
 def test_resolve_baseline_source_prefers_baseline_collected_db(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    (firmware_dir / "logs").mkdir(parents=True)
-    baseline_results_dir = firmware_dir / "results" / "2.15.1"
+    software_dir = tmp_path / "software_validation"
+    (software_dir / "logs").mkdir(parents=True)
+    baseline_results_dir = software_dir / "results" / "2.15.1"
     baseline_results_dir.mkdir(parents=True)
 
-    root_log = firmware_dir / "logs" / "S1.parquet"
+    root_log = software_dir / "logs" / "S1.parquet"
     pd.DataFrame([{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]).to_parquet(root_log, index=False)
     baseline_db = baseline_results_dir / "collected.db"
     con = duckdb.connect(str(baseline_db))
@@ -248,14 +248,14 @@ def test_resolve_baseline_source_prefers_baseline_collected_db(tmp_path):
         "baseline_version": "2.15.1",
     }
 
-    baseline_source, baseline_label = firmware_validate.resolve_baseline_source("S1", firmware_dir, settings)
+    baseline_source, baseline_label = software_validate.resolve_baseline_source("S1", software_dir, settings)
 
     assert baseline_label == "2.15.1"
     assert baseline_source == ("db", str(baseline_db))
 
 
 def test_extract_collected_events_writes_versioned_logs(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     db_path = tmp_path / "shared.db"
     con = duckdb.connect(str(db_path))
@@ -275,9 +275,9 @@ def test_extract_collected_events_writes_versioned_logs(tmp_path):
     )
     con.close()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -291,7 +291,7 @@ def test_extract_collected_events_writes_versioned_logs(tmp_path):
         output_dir=str(tmp_path / "results"),
     )
 
-    exported = firmware_validate._extract_collected_events(
+    exported = software_validate._extract_collected_events(
         suite,
         db_path,
         tmp_path / "results" / "2.17.3" / "logs",
@@ -302,7 +302,7 @@ def test_extract_collected_events_writes_versioned_logs(tmp_path):
 
 
 def test_load_collected_events_from_duckdb_reads_single_scenario(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     db_path = tmp_path / "collected.db"
     con = duckdb.connect(str(db_path))
@@ -327,7 +327,7 @@ def test_load_collected_events_from_duckdb_reads_single_scenario(tmp_path):
     )
     con.close()
 
-    collected = firmware_validate._load_collected_events_from_duckdb(db_path, "S1")
+    collected = software_validate._load_collected_events_from_duckdb(db_path, "S1")
 
     assert collected["device_id"].tolist() == ["S1", "S1"]
     assert collected["run_number"].tolist() == [1, 2]
@@ -335,7 +335,7 @@ def test_load_collected_events_from_duckdb_reads_single_scenario(tmp_path):
 
 
 def test_load_baseline_events_reads_single_scenario_from_collected_db(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     db_path = tmp_path / "baseline.db"
     con = duckdb.connect(str(db_path))
@@ -360,7 +360,7 @@ def test_load_baseline_events_reads_single_scenario_from_collected_db(tmp_path):
     )
     con.close()
 
-    baseline = firmware_validate._load_baseline_events(("db", str(db_path)), "S1")
+    baseline = software_validate._load_baseline_events(("db", str(db_path)), "S1")
 
     assert baseline["device_id"].tolist() == ["S1", "S1"]
     assert baseline["run_number"].tolist() == [1, 2]
@@ -368,7 +368,7 @@ def test_load_baseline_events_reads_single_scenario_from_collected_db(tmp_path):
 
 
 def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     baseline_log = tmp_path / "baseline.parquet"
     pd.DataFrame(
@@ -399,9 +399,9 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
     )
     con.close()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -415,7 +415,7 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
         output_dir=str(tmp_path / "results"),
     )
 
-    out_dir = firmware_validate._export_device_csvs(
+    out_dir = software_validate._export_device_csvs(
         suite,
         db_path,
         {"S1": ("file", str(baseline_log))},
@@ -431,7 +431,7 @@ def test_export_device_csv_normalizes_columns_and_reads_duckdb(tmp_path):
 
 
 def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     baseline_log = tmp_path / "baseline.parquet"
     pd.DataFrame(
@@ -459,9 +459,9 @@ def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
     )
     con.close()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -475,7 +475,7 @@ def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
         output_dir=str(tmp_path / "results"),
     )
 
-    out_dir = firmware_validate._export_device_csvs(
+    out_dir = software_validate._export_device_csvs(
         suite,
         db_path,
         {"S1": ("file", str(baseline_log))},
@@ -485,11 +485,11 @@ def test_export_device_csv_skips_scenarios_without_collected_rows(tmp_path):
 
 
 def test_select_pending_replay_batch_skips_existing_data_and_honors_replace_flag(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario("S1", "S1.bin", "S1.parquet", sr.TestType.SIMILARITY),
@@ -506,7 +506,7 @@ def test_select_pending_replay_batch_skips_existing_data_and_honors_replace_flag
         {"TSSU": "S3", "ReplaceOnRerun": ""},
     ]
 
-    batch, remaining, replace_selected, skipped_existing = firmware_validate._select_pending_replay_batch(
+    batch, remaining, replace_selected, skipped_existing = software_validate._select_pending_replay_batch(
         suite,
         settings,
         catalog,
@@ -521,11 +521,11 @@ def test_select_pending_replay_batch_skips_existing_data_and_honors_replace_flag
 
 
 def test_select_pending_replay_batch_returns_only_first_controller_group(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario("S1", "S1.bin", "S1.parquet", sr.TestType.SIMILARITY),
@@ -542,7 +542,7 @@ def test_select_pending_replay_batch_returns_only_first_controller_group(tmp_pat
         {"TSSU": "S3", "ReplaceOnRerun": ""},
     ]
 
-    batch, remaining, replace_selected, skipped_existing = firmware_validate._select_pending_replay_batch(
+    batch, remaining, replace_selected, skipped_existing = software_validate._select_pending_replay_batch(
         suite,
         settings,
         catalog,
@@ -557,11 +557,11 @@ def test_select_pending_replay_batch_returns_only_first_controller_group(tmp_pat
 
 
 def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    logs_dir = firmware_dir / "logs"
-    results_dir = firmware_dir / "results"
+    software_dir = tmp_path / "software_validation"
+    logs_dir = software_dir / "logs"
+    results_dir = software_dir / "results"
     logs_dir.mkdir(parents=True)
     (results_dir / "2.17.3").mkdir(parents=True)
 
@@ -612,9 +612,9 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
             handle,
         )
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -632,14 +632,14 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
     settings = {
         "logs_dir": "logs",
         "results_dir": "results",
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "comparison": {},
         "analysis_workers": 1,
     }
 
-    with patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
-        results = firmware_validate.run_analysis(suite, settings, firmware_dir)
+    with patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
+        results = software_validate.run_analysis(suite, settings, software_dir)
 
     assert len(results) == 1
     assert not (results_dir / "2.17.3" / "logs").exists()
@@ -660,11 +660,11 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
 
 
 def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_errors(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    logs_dir = firmware_dir / "logs"
-    results_dir = firmware_dir / "results"
+    software_dir = tmp_path / "software_validation"
+    logs_dir = software_dir / "logs"
+    results_dir = software_dir / "results"
     logs_dir.mkdir(parents=True)
     (results_dir / "2.17.3").mkdir(parents=True)
 
@@ -700,9 +700,9 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
             handle,
         )
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -718,14 +718,14 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
     settings = {
         "logs_dir": "logs",
         "results_dir": "results",
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "comparison": {},
         "analysis_workers": 1,
     }
 
-    with patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
-        results = firmware_validate.run_analysis(suite, settings, firmware_dir)
+    with patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
+        results = software_validate.run_analysis(suite, settings, software_dir)
 
     assert len(results) == 1
     result = results[0]
@@ -736,11 +736,11 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
 
 
 def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    logs_dir = firmware_dir / "logs"
-    results_dir = firmware_dir / "results"
+    software_dir = tmp_path / "software_validation"
+    logs_dir = software_dir / "logs"
+    results_dir = software_dir / "results"
     logs_dir.mkdir(parents=True)
     (results_dir / "2.17.3").mkdir(parents=True)
 
@@ -767,9 +767,9 @@ def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
     )
     con.close()
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[
             sr.TestScenario(
@@ -785,20 +785,20 @@ def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
     settings = {
         "logs_dir": "logs",
         "results_dir": "results",
-        "firmware_version": "2.17.3",
+        "software_version": "2.17.3",
         "baseline_version": "2.15.1",
         "comparison": {},
         "analysis_workers": 1,
     }
 
     with (
-        patch.object(firmware_validate, "_export_device_csvs", side_effect=AssertionError("device CSV export should be skipped")),
-        patch.object(firmware_validate, "ProcessPoolExecutor", ThreadPoolExecutor),
+        patch.object(software_validate, "_export_device_csvs", side_effect=AssertionError("device CSV export should be skipped")),
+        patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor),
     ):
-        results = firmware_validate.run_analysis(
+        results = software_validate.run_analysis(
             suite,
             settings,
-            firmware_dir,
+            software_dir,
             export_device_csvs=False,
         )
 
@@ -808,7 +808,7 @@ def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
 
 
 def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     baseline = pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
@@ -834,10 +834,10 @@ def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_pat
             return "Match: thrown out\nInsufficient scored chunks remained after settling/filtering for a reliable comparison."
 
     with (
-        patch.object(firmware_validate, "_load_baseline_events", return_value=baseline),
-        patch.object(firmware_validate, "_load_collected_events_from_duckdb", return_value=collected),
+        patch.object(software_validate, "_load_baseline_events", return_value=baseline),
+        patch.object(software_validate, "_load_collected_events_from_duckdb", return_value=collected),
         patch.object(
-            firmware_validate,
+            software_validate,
             "_prepare_analysis_inputs",
             return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 1)),
         ),
@@ -845,7 +845,7 @@ def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_pat
         patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
         patch("signal_replay.render_sparkline_svg", return_value=""),
     ):
-        out = firmware_validate._compare_one_scenario(
+        out = software_validate._compare_one_scenario(
             (
                 "12035",
                 ("parquet", str(tmp_path / "12035.parquet")),
@@ -873,7 +873,7 @@ def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_pat
 
 
 def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     baseline = pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
@@ -886,7 +886,7 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
     class FakeComparisonResult:
         def __init__(self):
             self.chunk_scores = [
-                firmware_validate.sr.ChunkScore(
+                software_validate.sr.ChunkScore(
                     center_seconds=1350.0,
                     match_percentage=100.0,
                     window_seconds=2700.0,
@@ -908,10 +908,10 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
             return "Match: 100.0%\nTiming: Timing match=89.9%, max=2.000s, 95th pctl=0.750s"
 
     with (
-        patch.object(firmware_validate, "_load_baseline_events", return_value=baseline),
-        patch.object(firmware_validate, "_load_collected_events_from_duckdb", return_value=collected),
+        patch.object(software_validate, "_load_baseline_events", return_value=baseline),
+        patch.object(software_validate, "_load_collected_events_from_duckdb", return_value=collected),
         patch.object(
-            firmware_validate,
+            software_validate,
             "_prepare_analysis_inputs",
             return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 0)),
         ),
@@ -919,7 +919,7 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
         patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
         patch("signal_replay.render_sparkline_svg", return_value=""),
     ):
-        out = firmware_validate._compare_one_scenario(
+        out = software_validate._compare_one_scenario(
             (
                 "12035",
                 ("parquet", str(tmp_path / "12035.parquet")),
@@ -949,30 +949,30 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
 
 
 def test_main_report_only_fast_skips_device_csv_export(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
-    firmware_dir = tmp_path / "firmware_validation"
-    firmware_dir.mkdir(parents=True)
-    settings_path = firmware_dir / "settings.json"
+    software_dir = tmp_path / "software_validation"
+    software_dir.mkdir(parents=True)
+    settings_path = software_dir / "settings.json"
     settings_path.write_text(
         json.dumps(
             {
                 "catalog_file": "catalog.csv",
                 "conflict_pairs_file": "conflict_pairs.json",
                 "controller_targets": ["127.0.0.1:9701"],
-                "firmware_version": "2.17.3",
+                "software_version": "2.17.3",
                 "baseline_version": "2.15.1",
                 "comparison": {},
             }
         ),
         encoding="utf-8",
     )
-    (firmware_dir / "catalog.csv").write_text("TSSU,Type,CycleLength,Offset,Notes\n", encoding="utf-8")
-    (firmware_dir / "conflict_pairs.json").write_text("{}", encoding="utf-8")
+    (software_dir / "catalog.csv").write_text("TSSU,Type,CycleLength,Offset,Notes\n", encoding="utf-8")
+    (software_dir / "conflict_pairs.json").write_text("{}", encoding="utf-8")
 
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="2.17.3",
+        software_version="2.17.3",
         baseline_version="2.15.1",
         scenarios=[],
         batches=[],
@@ -980,21 +980,21 @@ def test_main_report_only_fast_skips_device_csv_export(tmp_path):
     )
     captured = {}
 
-    def fake_run_analysis(_suite, _settings, _firmware_dir, *, export_device_csvs=True):
+    def fake_run_analysis(_suite, _settings, _software_dir, *, export_device_csvs=True):
         captured["export_device_csvs"] = export_device_csvs
         return []
 
     with (
-        patch.object(firmware_validate, "__file__", str(firmware_dir / "firmware_validate.py")),
-        patch.object(firmware_validate, "load_settings", return_value=json.loads(settings_path.read_text(encoding="utf-8"))),
-        patch.object(firmware_validate, "read_catalog", return_value=[]),
-        patch.object(firmware_validate, "build_suite", return_value=(suite, {})),
-        patch.object(firmware_validate, "run_analysis", side_effect=fake_run_analysis),
-        patch.object(firmware_validate, "build_report", return_value=tmp_path / "report.html"),
-        patch.object(firmware_validate, "archive_and_extract"),
-        patch("sys.argv", ["firmware_validate.py", "--report-only-fast"]),
+        patch.object(software_validate, "__file__", str(software_dir / "software_validate.py")),
+        patch.object(software_validate, "load_settings", return_value=json.loads(settings_path.read_text(encoding="utf-8"))),
+        patch.object(software_validate, "read_catalog", return_value=[]),
+        patch.object(software_validate, "build_suite", return_value=(suite, {})),
+        patch.object(software_validate, "run_analysis", side_effect=fake_run_analysis),
+        patch.object(software_validate, "build_report", return_value=tmp_path / "report.html"),
+        patch.object(software_validate, "archive_and_extract"),
+        patch("sys.argv", ["software_validate.py", "--report-only-fast"]),
     ):
-        firmware_validate.main()
+        software_validate.main()
 
     assert captured["export_device_csvs"] is False
 
@@ -1010,7 +1010,7 @@ def _build_issue_timeline(rows):
 
 
 def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_duration_outlier():
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1045,7 +1045,7 @@ def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_du
         ]
     )
 
-    issue_window = firmware_validate._select_operational_issue_anchor(
+    issue_window = software_validate._select_operational_issue_anchor(
         timeline_a,
         timeline_b,
         {
@@ -1065,7 +1065,7 @@ def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_du
 
 
 def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1099,7 +1099,7 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
 
     with (
         patch.object(
-            firmware_validate,
+            software_validate,
             "_load_coord_split_schedules",
             return_value={
                 "S1": [
@@ -1111,10 +1111,10 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
                 ]
             },
         ),
-        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(firmware_validate.plt, "close"),
+        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(software_validate.plt, "close"),
     ):
-        plot_paths, plot_captions = firmware_validate._generate_special_issue_plots(
+        plot_paths, plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1160,7 +1160,7 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
 
 
 def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transition_with_base_device_fallback(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1198,7 +1198,7 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
 
     with (
         patch.object(
-            firmware_validate,
+            software_validate,
             "_load_coord_split_schedules",
             return_value={
                 "2B045": [
@@ -1210,10 +1210,10 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
                 ]
             },
         ),
-        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(firmware_validate.plt, "close"),
+        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(software_validate.plt, "close"),
     ):
-        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+        plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="2B045_c",
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1248,7 +1248,7 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
 
 
 def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1280,7 +1280,7 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
 
     with (
         patch.object(
-            firmware_validate,
+            software_validate,
             "_load_coord_split_schedules",
             return_value={
                 "S1": [
@@ -1292,10 +1292,10 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
                 ]
             },
         ),
-        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(firmware_validate.plt, "close"),
+        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(software_validate.plt, "close"),
     ):
-        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+        plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1335,7 +1335,7 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
 
 
 def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1408,10 +1408,10 @@ def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(t
         return object()
 
     with (
-        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(firmware_validate.plt, "close"),
+        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(software_validate.plt, "close"),
     ):
-        plot_paths, _plot_captions = firmware_validate._generate_special_issue_plots(
+        plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1503,7 +1503,7 @@ def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(t
 
 
 def test_select_operational_issue_anchor_handles_transition_rows_with_missing_event_value():
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1526,7 +1526,7 @@ def test_select_operational_issue_anchor_handles_transition_rows_with_missing_ev
         ]
     )
 
-    issue_window = firmware_validate._select_operational_issue_anchor(
+    issue_window = software_validate._select_operational_issue_anchor(
         timeline_a,
         timeline_b,
         {
@@ -1543,7 +1543,7 @@ def test_select_operational_issue_anchor_handles_transition_rows_with_missing_ev
 
 
 def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conflicts(tmp_path):
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1586,10 +1586,10 @@ def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conf
         return object()
 
     with (
-        patch.object(firmware_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(firmware_validate.plt, "close"),
+        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
+        patch.object(software_validate.plt, "close"),
     ):
-        plot_paths, plot_captions = firmware_validate._generate_special_issue_plots(
+        plot_paths, plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
             timeline_a=timeline_a,
             timeline_b=timeline_b,
@@ -1650,7 +1650,7 @@ def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conf
 
 
 def test_select_clearance_issue_spec_anchors_current_version_irregularity():
-    firmware_validate = _load_firmware_validate_module()
+    software_validate = _load_software_validate_module()
 
     timeline_a = _build_issue_timeline(
         [
@@ -1697,7 +1697,7 @@ def test_select_clearance_issue_spec_anchors_current_version_irregularity():
         ]
     )
 
-    issue_spec = firmware_validate._select_clearance_issue_spec(
+    issue_spec = software_validate._select_clearance_issue_spec(
         scenario_id="S1",
         row={
             "label": "Ph 4",

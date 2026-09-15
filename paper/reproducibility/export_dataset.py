@@ -8,9 +8,9 @@ import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
 DBS = {
-    "outputs-2.15.1": ROOT / "firmware_validation/results/2.15.1/collected.db",
-    "outputs-2.18.1": ROOT / "firmware_validation/results/2.18.1/collected.db",
-    "outputs-2.18.1-parameter-modified": ROOT / "firmware_validation/results/2.18.1_trailing/collected.db",
+    "outputs-2.15.1": ROOT / "software_validation/results/2.15.1/collected.db",
+    "outputs-2.18.1": ROOT / "software_validation/results/2.18.1/collected.db",
+    "outputs-2.18.1-parameter-modified": ROOT / "software_validation/results/2.18.1_trailing/collected.db",
 }
 
 

@@ -7,7 +7,7 @@ import pytest
 
 
 def _load_module():
-    path = Path(__file__).resolve().parents[1] / "firmware_validation" / "coord_split_schedule.py"
+    path = Path(__file__).resolve().parents[1] / "software_validation" / "coord_split_schedule.py"
     spec = importlib.util.spec_from_file_location("coord_split_schedule_module", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -25,7 +25,7 @@ def _rows():
 def _fixture_path():
     path = (
         Path(__file__).resolve().parents[1]
-        / "firmware_validation" / "coord_patterns" / "test.json"
+        / "software_validation" / "coord_patterns" / "test.json"
     )
     if not path.exists():
         pytest.skip(f"coord split fixture is not available: {path}")

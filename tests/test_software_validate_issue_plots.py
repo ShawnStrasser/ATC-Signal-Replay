@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-def _load_firmware_validate_module():
-    module_name = "_firmware_validate_under_test"
+def _load_software_validate_module():
+    module_name = "_software_validate_under_test"
     if module_name in sys.modules:
         return sys.modules[module_name]
 
-    module_path = Path(__file__).resolve().parents[1] / "firmware_validation" / "firmware_validate.py"
+    module_path = Path(__file__).resolve().parents[1] / "software_validation" / "software_validate.py"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -42,7 +42,7 @@ def _timeline(event_class, event_value, durations):
 
 
 def test_clearance_issue_plots_skip_old_version_only_irregularities(tmp_path, monkeypatch):
-    fv = _load_firmware_validate_module()
+    fv = _load_software_validate_module()
     captured = []
 
     def fake_create_comparison_gantt_matplotlib(**kwargs):
@@ -83,7 +83,7 @@ def test_clearance_issue_plots_skip_old_version_only_irregularities(tmp_path, mo
 
 
 def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, monkeypatch):
-    fv = _load_firmware_validate_module()
+    fv = _load_software_validate_module()
     base_time = datetime(2026, 4, 2, 9, 0, 0)
     captured = []
 
@@ -155,7 +155,7 @@ def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, 
 
 
 def test_clearance_issue_plots_anchor_new_version_irregularity(tmp_path, monkeypatch):
-    fv = _load_firmware_validate_module()
+    fv = _load_software_validate_module()
     captured = []
 
     def fake_create_comparison_gantt_matplotlib(**kwargs):
@@ -201,7 +201,7 @@ def test_clearance_issue_plots_anchor_new_version_irregularity(tmp_path, monkeyp
 
 
 def test_mixed_use_overlap_yellow_is_treated_as_non_clearance_issue():
-    fv = _load_firmware_validate_module()
+    fv = _load_software_validate_module()
     diff = {
         "event_class": "Overlap Yellow",
         "event_value": 5,
@@ -215,7 +215,7 @@ def test_mixed_use_overlap_yellow_is_treated_as_non_clearance_issue():
 
 
 def test_clustered_overlap_yellow_remains_clearance_for_issue_selection():
-    fv = _load_firmware_validate_module()
+    fv = _load_software_validate_module()
     diff = {
         "event_class": "Overlap Yellow",
         "event_value": 5,

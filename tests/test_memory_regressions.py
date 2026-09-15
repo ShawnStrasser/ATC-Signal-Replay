@@ -140,9 +140,9 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
             test_type=sr.TestType.SIMILARITY,
         ),
     ]
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="new",
+        software_version="new",
         baseline_version="old",
         scenarios=scenarios,
         batches=[sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701", "S2": "127.0.0.1:9702"})],
@@ -187,9 +187,9 @@ def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
         test_type=sr.TestType.CONFLICT,
         replays=25,
     )
-    suite = sr.FirmwareTestSuite(
+    suite = sr.SoftwareTestSuite(
         suite_name="suite",
-        firmware_version="new",
+        software_version="new",
         baseline_version="old",
         scenarios=[scenario],
         batches=[sr.TestBatch(batch_id="batch_1", assignments={"S1": "127.0.0.1:9701"})],

@@ -1,10 +1,10 @@
 [paths]
-source_logs = "../../firmware_validation/logs"
-database_2_15_1 = "../../firmware_validation/results/2.15.1/collected.db"
-database_2_18_1 = "../../firmware_validation/results/2.18.1/collected.db"
-database_2_18_1_parameter_modified = "../../firmware_validation/results/2.18.1_trailing/collected.db"
-report_2_18_1 = "../../firmware_validation/results/2.18.1/report.html"
-report_2_18_1_parameter_modified = "../../firmware_validation/results/2.18.1_trailing/report.html"
+source_logs = "../../software_validation/logs"
+database_2_15_1 = "../../software_validation/results/2.15.1/collected.db"
+database_2_18_1 = "../../software_validation/results/2.18.1/collected.db"
+database_2_18_1_parameter_modified = "../../software_validation/results/2.18.1_trailing/collected.db"
+report_2_18_1 = "../../software_validation/results/2.18.1/report.html"
+report_2_18_1_parameter_modified = "../../software_validation/results/2.18.1_trailing/report.html"
 
 [experiments]
 software_label = "2.15.1 to 2.18.1"

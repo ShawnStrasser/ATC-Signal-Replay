@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pandas as pd
 
-import firmware_validation.firmware_validate as fv
+import software_validation.software_validate as fv
 from signal_replay.comparison import ChunkScore, _filter_chunk_scores_after_settle, render_sparkline_svg
 
 

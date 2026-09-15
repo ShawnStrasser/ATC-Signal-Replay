@@ -65,7 +65,7 @@ for pair in conflict_pairs:
 json_str += ',\n'.join(pairs_str)
 json_str += '\n    ]\n}\n'
 
-with open('firmware_validation/conflict_monitor/conflict_pairs.json', 'w') as f:
+with open('software_validation/conflict_monitor/conflict_pairs.json', 'w') as f:
     f.write(json_str)
 
 print(f"Generated {len(conflict_pairs)} conflict pairs.")

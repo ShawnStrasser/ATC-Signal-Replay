@@ -159,6 +159,7 @@ class TestOrchestratorTimingWithMocks:
             stop_on_conflict=False,
             db_path=temp_db_path,
             simulation_speed=1.0,
+            post_replay_settle_seconds=1.0,   # settle time is not what this test measures
         )
         
         # Get expected duration from replay
@@ -172,11 +173,10 @@ class TestOrchestratorTimingWithMocks:
         results = sim.run()
         actual_duration = time.time() - start
         
-        # With mocks (no real SNMP), overhead should be minimal
-        # Account for post_replay_settle_seconds (default 10s) and thread scheduling
-        # If double-wait exists, actual will be ~2x expected (FAIL)
+        # Allow half a replay duration plus 2 s for thread scheduling and DuckDB writes.
+        # The double-wait bug adds a full replay duration plus 5 s, so it still fails clearly.
         settle = sim_config.post_replay_settle_seconds
-        max_allowed = expected_duration + settle + 3.0
+        max_allowed = expected_duration + settle + 0.5 * expected_duration + 2.0
         
         assert actual_duration <= max_allowed, (
             f"Single-run took {actual_duration:.1f}s but expected ~{expected_duration:.1f}s "
@@ -226,6 +226,7 @@ class TestOrchestratorTimingWithMocks:
             stop_on_conflict=False,
             db_path=temp_db_path,
             simulation_speed=1.0,
+            post_replay_settle_seconds=1.0,   # settle time is not what this test measures
         )
         
         # Manually set events on signal config for replay duration calculation
@@ -239,11 +240,10 @@ class TestOrchestratorTimingWithMocks:
         results = sim.run()
         actual_duration = time.time() - start
         
-        # With mocks, overhead should be minimal
-        # Account for post_replay_settle_seconds (default 10s) per run
-        # Double-wait bug would make ratio ~2x (FAIL)
+        # Per run, allow half a replay duration plus 2 s of overhead. The double-wait bug
+        # adds a full replay duration plus 5 s per run, so it still fails clearly.
         settle = sim_config.post_replay_settle_seconds
-        max_allowed = expected_total + (settle * num_runs) + (3.0 * num_runs)
+        max_allowed = expected_total + (settle * num_runs) + (0.5 * expected_per_run + 2.0) * num_runs
         
         assert actual_duration <= max_allowed, (
             f"Multi-run took {actual_duration:.1f}s "

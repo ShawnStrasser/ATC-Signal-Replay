@@ -6,6 +6,12 @@ This module provides:
 - Common test utilities and synthetic data generators
 """
 
+import matplotlib
+
+# Headless plotting for the whole test session. CI has no display, and the interactive
+# Tk backend that Windows picks by default is not safe to drive from pytest's worker threads.
+matplotlib.use("Agg")
+
 import pytest
 from typing import Tuple
 

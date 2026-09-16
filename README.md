@@ -68,12 +68,38 @@ What happens:
 
 `sim.run()` returns a dictionary with `completed_runs`, `conflicts`, `failed_signals_by_run`, `stopped_early`, `collection_error`, and `comparison_summary`. `sim.get_events()`, `sim.get_conflicts()`, and `sim.get_comparison_results()` return the same data as DataFrames and objects.
 
+### Quick trial
+
+Check that the controller answers before committing to a long run, then replay only the last few minutes of a log:
+
+```python
+import signal_replay as sr
+
+sr.reset_all_detectors(('127.0.0.1', 9701))     # raises if SNMP does not answer
+
+sim = sr.ATCSimulation(
+    signals=[
+        sr.SignalConfig(
+            device_id='13008',
+            ip='127.0.0.1', udp_port=9701, http_port=1025,   # emulator SNMP and HTTP ports; real controllers use 161 and 80
+            limit_minutes=10,                                # replay only the last 10 minutes of the log
+        )
+    ],
+    events='logs/13008.parquet',
+    replays=1,
+    db_path='./trial.db',
+)
+sim.run()
+```
+
+The run finishes in about ten minutes and prints the collected event count, any conflicts, and the DTW match against the input.
+
 ### Replay timing modes
 
 | Mode | Setting | Use when |
 |---|---|---|
 | **Compressed** (default) | `cycle_length=0`, `tod_align=False` | The log is replayed immediately, preserving relative timing. Good for replicating a specific pattern or bug. |
-| **Time-of-day aligned** | `tod_align=True` | Each event is sent at the same wall-clock time of day as the original. Required for testing time-of-day plans, and for the software validation workflow. A 23-hour log takes 23 hours. |
+| **Time-of-day aligned** | `tod_align=True` | Each event is sent at the same wall-clock time of day as the original. Required for testing time-of-day plans, and used by the software validation workflow. Replay starts at the current clock time and skips events earlier in the day, so a 23-hour log started at midnight takes 23 hours. |
 | **Cycle synchronized** | `cycle_length=120`, `cycle_offset=30` | Coordinated signals: replay starts at the configured offset within the cycle so multiple signals stay in step. Incompatible with `tod_align`. |
 
 ### Multiple signals
@@ -177,6 +203,8 @@ py software_validate.py --archive        # also export results/<version>/logs/*.
 ```
 
 The script picks up to one intersection per configured controller that has not yet been collected, prints which configuration file to load on which controller, waits for you to press Enter, checks SNMP and HTTP connectivity, and replays that batch time-of-day aligned. Run it again the next day for the next batch. Once every catalog row has data in `collected.db`, it compares each intersection against the baseline and writes `report.html`.
+
+For a first trial, use one controller target and one catalog row whose log covers a short window later today (time-of-day alignment skips events already in the past). Give the row a `CycleLength` instead if you want the replay to start immediately rather than at the log's time of day.
 
 Baseline resolution: if `results/<baseline_version>/collected.db` exists, it is the baseline. Otherwise the original field logs in `logs/` are used. To validate the next release, set `baseline_version` to the version you just finished, set `software_version` to the new label, load the new software on the controllers, and run again.
 

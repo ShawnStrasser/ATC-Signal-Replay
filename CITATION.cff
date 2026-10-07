@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use Signal-Replay, please cite the software release and the associated TRB paper when available."
 title: "Signal-Replay"
-version: "1.0.0"
+version: "1.0.1"
 date-released: "2026-10-06"
 type: software
 abstract: "Python tools for replaying high-resolution traffic-signal controller events and comparing controller behavior across software and configuration changes."

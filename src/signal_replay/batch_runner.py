@@ -549,6 +549,11 @@ class BatchRunner:
             tod_align=scenario.tod_align,
             replay_latency_offset_seconds=self.suite.replay_latency_offset_seconds,
             collection_extra=extra,
+            snmp_community=(
+                getattr(scenario, "snmp_community", None)
+                or getattr(self.suite, "snmp_community", None)
+                or "public"
+            ),
         )
         object.__setattr__(signal_cfg, "events", scenario.events_source)
         return signal_cfg

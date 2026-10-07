@@ -47,6 +47,8 @@ class SignalConfig:
             signal (for example ``'UTC'``). Overrides the source's own setting. None = local time.
         collection_extra: Optional mapping passed to the output-event source as
             ``CollectionTarget.extra`` (for example the id your source uses for this controller).
+        snmp_community: SNMP community string used for every SET sent to this controller
+            (detector replay and detector resets). Default ``'public'``.
     """
     device_id: str
     ip: str
@@ -62,6 +64,7 @@ class SignalConfig:
     clock_offset_seconds: float = 0.0
     source_timezone: Optional[str] = None
     collection_extra: Optional[Mapping[str, Any]] = None
+    snmp_community: str = "public"
     
     # Internal: populated during simulation initialization
     events: Union[pd.DataFrame, str, Path, None] = field(default=None, init=False, repr=False)
@@ -148,6 +151,8 @@ class SignalConfig:
                 raise ValueError(f"source_timezone {self.source_timezone!r} is not a known timezone") from exc
         if self.collection_extra is not None and not isinstance(self.collection_extra, Mapping):
             raise ValueError(f"collection_extra must be a mapping or None, got {type(self.collection_extra)}")
+        if not isinstance(self.snmp_community, str) or not self.snmp_community:
+            raise ValueError("snmp_community must be a non-empty string")
     
     @property
     def ip_port(self) -> Tuple[str, int]:

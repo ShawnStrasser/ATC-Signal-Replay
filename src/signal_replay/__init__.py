@@ -16,7 +16,7 @@ _logging_module.getLogger(__name__).addHandler(_logging_module.NullHandler())
 
 # Single source of the package version. pyproject.toml reads it through
 # [tool.setuptools.dynamic] version = {attr = "signal_replay.__version__"}.
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from ._logging import enable_console_logging, disable_console_logging, log_to_file
 from .progress import Stage, ProgressEvent, ProgressCallback

@@ -163,6 +163,8 @@ After each replay (and `post_replay_settle_seconds`), the package keeps polling 
 
 The package works in naive PC-local time. Timezone-aware timestamps are converted to local time and made naive. Naive timestamps are taken as local time unless the source declares `source_timezone` (on `EventSource`, as an attribute of a source object, or per signal with `SignalConfig.source_timezone`, which wins). The same timezone applies to `since` (the package converts it before calling you) and to `complete_through`. If the controller clock is off from the PC clock, set `SignalConfig.clock_offset_seconds` (seconds added to the controller's timestamps).
 
+SNMP: replay and detector resets use the community in `SignalConfig.snmp_community` (default `'public'`). For validation passes set `SoftwareTestSuite.snmp_community`, or `TestScenario.snmp_community` to override it for one controller.
+
 A warning is logged once per run when event codes needed by an enabled feature never appear (conflict detection: phase 1/10, overlap 61/63/65, pedestrian 21/23, overlap-pedestrian 67/65 for the pairs you monitor; adaptive latency: 82), or when no rows arrive at all.
 
 ## Software validation

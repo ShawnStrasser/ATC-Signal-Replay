@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.1 (2026-10-06)
+
+### Added
+
+- **`snmp_community`** on `SignalConfig` (default `'public'`), `SoftwareTestSuite` and `TestScenario` (a scenario's value overrides the suite's). Replay SETs, the reset before a replay and the reset after it all use it.
+
+### Fixed
+
+- **Cancel on Python 3.12 and earlier.** A Ctrl+C or kernel interrupt that landed inside `Thread.join()` could make Python report a still-running replay thread as finished, so the package stopped waiting before the closing detector reset was recorded (`detectors_reset` stayed `None`). Threads the package waits on now record their own completion, which an interrupt cannot corrupt.
+- **Replay timing after long gaps.** The stop-aware sleep added in 1.0.0 added up the small oversleep of each 0.25 s chunk, so on Windows an event after a quiet period could be sent more than a second late. Waits now run to an absolute deadline; measured lateness is within about 17 ms again.
+
+### Performance
+
+- **Validation analysis about 12x faster with identical results.** The DTW alignment ran in pure Python. The group-to-group Jaccard distances are now computed with a matrix product, the DTW cost matrix is filled one anti-diagonal at a time with numpy, and the timing DTW uses dtaidistance's compiled library. The issue-window statistics no longer re-convert whole timelines for every window. On two real 24-hour scenarios a comparison went from 147 s to 10.5 s and from 161 s to 12 s; every result field and every plot was byte-identical.
+
 ## 1.0.0 (2026-10-06)
 
 First stable release. From here on, renaming or removing anything in `signal_replay.__all__` bumps the major version; new features bump the minor version; fixes bump the patch version. `tests/test_public_api.py` guards the list.

@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import SimulationConfig, SignalConfig
+from ._threads import TrackedThread
 from .replay import SignalReplay, source_time_from_info
 from .collector import ConflictRecord, DatabaseManager, DataCollector, _log_memory
 from .events import CollectionTarget, required_event_codes
@@ -813,7 +814,7 @@ class ATCSimulation:
         for device_id, replay in needs_reset:
             if device_id in abandoned:
                 logger.warning("[%s] Replay worker abandoned; sending safety-net detector reset", device_id)
-            thread = threading.Thread(
+            thread = TrackedThread(
                 target=run_in_log_context(_reset), args=(device_id, replay), name=f"safety-reset-{device_id}", daemon=True
             )
             thread.start()
@@ -1315,7 +1316,7 @@ class ATCSimulation:
 
             collection_kwargs["after_collect_callback"] = _after_poll
 
-        collection_thread = threading.Thread(
+        collection_thread = TrackedThread(
             target=run_in_log_context(collector.run_collection_loop),
             args=(run_num, datetime.now(), run_stop_event, self._on_conflict_detected),
             kwargs=collection_kwargs,
@@ -1512,7 +1513,7 @@ class ATCSimulation:
             except Exception:
                 logger.warning("Final poll after cancel failed", exc_info=True)
 
-        thread = threading.Thread(target=run_in_log_context(_poll), name=f"final-poll-run{run_num}", daemon=True)
+        thread = TrackedThread(target=run_in_log_context(_poll), name=f"final-poll-run{run_num}", daemon=True)
         thread.start()
         if not self._join_bounded(thread, budget, stop_aware=False):
             abort.set()

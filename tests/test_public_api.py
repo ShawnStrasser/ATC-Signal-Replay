@@ -11,6 +11,7 @@ import sys
 import textwrap
 import types
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -89,8 +90,14 @@ def test_namespace_matches_all():
     assert public == set(sr.__all__)
 
 
-def test_version_is_1_0_0():
-    assert sr.__version__ == "1.0.0"
+def test_version_is_1_x_and_matches_changelog_and_citation():
+    root = Path(__file__).resolve().parents[1]
+    major = int(sr.__version__.split(".")[0])
+    assert major == 1, "renaming or removing public names needs a major version bump"
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    first_heading = next(line for line in changelog.splitlines() if line.startswith("## "))
+    assert first_heading.startswith(f"## {sr.__version__} ")
+    assert f'version: "{sr.__version__}"' in (root / "CITATION.cff").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("name", DEPRECATED_ALIASES)

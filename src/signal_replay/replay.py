@@ -18,6 +18,7 @@ from jinja2 import Template
 import pyarrow as pa
 
 from ._logging import debug_level, run_in_log_context
+from ._threads import TrackedThread
 from .progress import ProgressCallback, Stage, as_reporter
 from .ntcip import async_send_ntcip, async_reset_all_detectors
 from .config import SignalConfig
@@ -40,6 +41,7 @@ async def reset_detector_groups(
     snmp_engine: SnmpEngine,
     timeout: float = 2.0,
     budget: float = 5.0,
+    community: str = "public",
 ) -> bool:
     """Send state 0 to each (detector_type, group) in ``keys``, in order.
 
@@ -53,7 +55,7 @@ async def reset_detector_groups(
         for detector_type, group_number in keys:
             try:
                 await async_send_ntcip(
-                    ip_port, group_number, 0, detector_type,
+                    ip_port, group_number, 0, detector_type, community,
                     timeout=timeout, snmp_engine=snmp_engine,
                 )
             except Exception as exc:
@@ -131,6 +133,7 @@ class SignalReplay:
         self._progress = as_reporter(on_progress, log=logger)
         self.device_id = config.device_id
         self.ip_port = config.ip_port
+        self.snmp_community = getattr(config, "snmp_community", None) or "public"
         self.cycle_length = config.cycle_length
         self.cycle_offset = config.cycle_offset
         self.tod_align = config.tod_align
@@ -197,15 +200,21 @@ class SignalReplay:
         self._stop_event.set()
 
     async def _sleep_interruptibly(self, delay: float) -> bool:
-        """Sleep in short chunks so stop requests can interrupt waits quickly."""
-        remaining = max(0.0, delay)
-        while remaining > 0:
+        """Sleep in short chunks so stop requests can interrupt waits quickly.
+
+        The wait runs to an absolute deadline on the loop clock, so the small
+        oversleep of each chunk (about 15 ms on Windows) does not add up over
+        a long gap between events.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, delay)
+        while True:
             if self._stop_event.is_set():
                 return False
-            chunk = min(remaining, _STOP_POLL_SECONDS)
-            await asyncio.sleep(chunk)
-            remaining -= chunk
-        return not self._stop_event.is_set()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(remaining, _STOP_POLL_SECONDS))
 
     async def _wait_for_stop(self) -> None:
         """Return once the stop event is set (polled, so it never blocks the loop)."""
@@ -611,6 +620,7 @@ class SignalReplay:
                     group_number,
                     state_integer,
                     detector_type,
+                    self.snmp_community,
                     timeout=self.snmp_timeout_seconds,
                     snmp_engine=snmp_engine,
                 ))
@@ -1040,6 +1050,7 @@ class SignalReplay:
                 )
                 await self._run_unless_stopped(async_reset_all_detectors(
                     self.ip_port,
+                    community=self.snmp_community,
                     debug=self.debug,
                     timeout=self.snmp_timeout_seconds,
                     snmp_engine=snmp_engine,
@@ -1092,6 +1103,7 @@ class SignalReplay:
             snmp_engine=snmp_engine,
             timeout=self.snmp_timeout_seconds,
             budget=self.detector_reset_timeout_seconds,
+            community=self.snmp_community,
         )
         if ok:
             logger.log(
@@ -1124,6 +1136,7 @@ class SignalReplay:
                 return await reset_detector_groups(
                     self.ip_port, keys, snmp_engine=engine,
                     timeout=self.snmp_timeout_seconds, budget=budget,
+                    community=self.snmp_community,
                 )
             finally:
                 engine.close_dispatcher()
@@ -1137,7 +1150,7 @@ class SignalReplay:
                 )
                 outcome['ok'] = False
 
-        thread = threading.Thread(target=run_in_log_context(_target), name=f"reset-{self.device_id}", daemon=True)
+        thread = TrackedThread(target=run_in_log_context(_target), name=f"reset-{self.device_id}", daemon=True)
         thread.start()
         thread.join(budget + 1.0)
         return bool(outcome.get('ok', False))
@@ -1200,7 +1213,7 @@ class SignalReplay:
             asyncio.run(self._reset_and_run())
         else:
             # Event loop already running, use thread
-            thread = threading.Thread(target=run_in_log_context(self._run_in_thread), daemon=True)
+            thread = TrackedThread(target=run_in_log_context(self._run_in_thread), daemon=True)
             thread.start()
             # Join in short steps so Ctrl+C can still reach the caller on Windows.
             try:

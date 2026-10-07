@@ -804,6 +804,13 @@ def _merge_issue_spans(
     return merged
 
 
+def _as_datetime_series(values: pd.Series) -> pd.Series:
+    """``values`` as datetimes, skipping the conversion when they already are."""
+    if pd.api.types.is_datetime64_any_dtype(values):
+        return values
+    return pd.to_datetime(values)
+
+
 def _window_activity_stats(
     rows: pd.DataFrame,
     *,
@@ -813,9 +820,21 @@ def _window_activity_stats(
     if rows.empty or window_end <= window_start:
         return 0, 0.0, 0.0
 
+    # Only rows that can overlap the window need the per-row arithmetic below.
+    # Rows with a missing time are kept so the result matches the full loop.
+    starts = _as_datetime_series(rows["StartTime"])
+    ends = _as_datetime_series(rows["EndTime"])
+    candidate = (
+        ((ends > starts) & (ends > window_start) & (starts < window_end))
+        | starts.isna()
+        | ends.isna()
+    )
+    if not candidate.any():
+        return 0, 0.0, 0.0
+
     count = 0
     active_seconds = 0.0
-    for row in rows.itertuples(index=False):
+    for row in rows.loc[candidate.to_numpy()].itertuples(index=False):
         row_start = pd.Timestamp(row.StartTime)
         row_end = pd.Timestamp(row.EndTime)
         overlap_start = max(row_start, window_start)

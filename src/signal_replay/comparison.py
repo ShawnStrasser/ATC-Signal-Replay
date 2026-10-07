@@ -415,6 +415,122 @@ def encode_categorical_sequence(
     return encoded, encoding_map
 
 
+_DTW_C_AVAILABLE: Optional[bool] = None
+
+
+def _dtaidistance_use_c() -> bool:
+    """True when dtaidistance's compiled C library can be used (checked once)."""
+    global _DTW_C_AVAILABLE
+    if _DTW_C_AVAILABLE is None:
+        try:
+            _DTW_C_AVAILABLE = bool(dtw.try_import_c(verbose=False))
+        except Exception:
+            _DTW_C_AVAILABLE = False
+    return _DTW_C_AVAILABLE
+
+
+def _dtw_cumulative_cost(dist_matrix: np.ndarray) -> np.ndarray:
+    """DTW cumulative cost matrix for a precomputed distance matrix.
+
+    Same recurrence as the textbook loop,
+    ``cum[i, j] = dist[i-1, j-1] + min(cum[i-1, j], cum[i, j-1], cum[i-1, j-1])``,
+    evaluated one anti-diagonal at a time with strided numpy slices. Every
+    cell gets the same additions and minimums as the loop, so the values are
+    identical; only the evaluation order across independent cells changes.
+    """
+    dist = np.ascontiguousarray(dist_matrix, dtype=np.float64)
+    n, m = dist.shape
+    cum = np.full((n + 1, m + 1), np.inf)
+    cum[0, 0] = 0.0
+    flat = cum.ravel()
+    dflat = dist.ravel()
+    width = m + 1
+    cum_step = width - 1            # flat distance between cells of one anti-diagonal
+    dist_step = max(m - 1, 1)
+    for d in range(2, n + m + 1):   # d = i + j in cum coordinates
+        i_lo = max(1, d - m)
+        i_hi = min(n, d - 1)
+        count = i_hi - i_lo + 1
+        if count <= 0:
+            continue
+        start = i_lo * width + (d - i_lo)
+        stop = start + (count - 1) * cum_step + 1
+        up = flat[start - width:stop - width:cum_step]
+        left = flat[start - 1:stop - 1:cum_step]
+        diag = flat[start - width - 1:stop - width - 1:cum_step]
+        d_start = (i_lo - 1) * m + (d - i_lo - 1)
+        cost = dflat[d_start:d_start + (count - 1) * dist_step + 1:dist_step]
+        flat[start:stop:cum_step] = cost + np.minimum(np.minimum(up, left), diag)
+    return cum
+
+
+def _dtw_backtrack(cum_cost: np.ndarray) -> List[Tuple[int, int]]:
+    """Warping path from a cumulative cost matrix (ties prefer diagonal, then up, then left)."""
+    n, m = cum_cost.shape[0] - 1, cum_cost.shape[1] - 1
+    path = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        path.append((i - 1, j - 1))  # Convert to 0-indexed
+        if i == 0:
+            j -= 1
+        elif j == 0:
+            i -= 1
+        else:
+            candidates = [
+                (cum_cost[i - 1, j - 1], i - 1, j - 1),
+                (cum_cost[i - 1, j], i - 1, j),
+                (cum_cost[i, j - 1], i, j - 1),
+            ]
+            _, i, j = min(candidates, key=lambda x: x[0])
+    path.reverse()
+    return path
+
+
+def _jaccard_distance_matrix(
+    groups_a: List[Tuple[float, frozenset]],
+    groups_b: List[Tuple[float, frozenset]],
+    block_rows: int = 2048,
+) -> np.ndarray:
+    """Jaccard distance between every pair of event groups (0 when the sets are equal).
+
+    Intersection and union sizes come from a 0/1 incidence matrix product,
+    so they are exact integers and ``1 - inter / union`` matches the
+    set-based formula bit for bit.
+    """
+    n, m = len(groups_a), len(groups_b)
+    vocab: Dict[Any, int] = {}
+    for groups in (groups_a, groups_b):
+        for _, items in groups:
+            for item in items:
+                if item not in vocab:
+                    vocab[item] = len(vocab)
+    k = max(len(vocab), 1)
+
+    def incidence(groups):
+        mat = np.zeros((len(groups), k), dtype=np.float32)
+        for row, (_, items) in enumerate(groups):
+            if items:
+                mat[row, [vocab[item] for item in items]] = 1.0
+        return mat
+
+    inc_a = incidence(groups_a)
+    inc_b = incidence(groups_b)
+    size_a = inc_a.sum(axis=1, dtype=np.float64)
+    size_b = inc_b.sum(axis=1, dtype=np.float64)
+    inc_b_t = np.ascontiguousarray(inc_b.T)
+
+    dist = np.empty((n, m), dtype=np.float64)
+    for lo in range(0, n, block_rows):
+        hi = min(n, lo + block_rows)
+        inter = (inc_a[lo:hi] @ inc_b_t).astype(np.float64)
+        union = size_a[lo:hi, None] + size_b[None, :] - inter
+        with np.errstate(divide="ignore", invalid="ignore"):
+            block = 1.0 - inter / union
+        block[union == 0] = 0.0      # both groups empty: equal sets
+        dist[lo:hi] = block
+    return dist
+
+
 def compute_dtw(
     seq_a: np.ndarray,
     seq_b: np.ndarray,
@@ -460,59 +576,22 @@ def compute_dtw(
         # compute the distance matrix directly using binary distance.
         
         n, m = len(seq_a), len(seq_b)
-        
-        # Build distance matrix: 0 if values match, 1 if they differ
-        dist_matrix = np.ones((n, m), dtype=np.float64)
-        for i in range(n):
-            for j in range(m):
-                if seq_a[i] == seq_b[j]:
-                    dist_matrix[i, j] = 0.0
-        
-        # Compute DTW using the distance matrix
-        # dtaidistance doesn't directly support distance matrices,
-        # so we compute the cumulative cost matrix and path ourselves
-        
-        # Initialize cumulative cost matrix
-        cum_cost = np.full((n + 1, m + 1), np.inf)
-        cum_cost[0, 0] = 0.0
-        
-        for i in range(1, n + 1):
-            for j in range(1, m + 1):
-                cost = dist_matrix[i - 1, j - 1]
-                cum_cost[i, j] = cost + min(
-                    cum_cost[i - 1, j],      # insertion
-                    cum_cost[i, j - 1],      # deletion  
-                    cum_cost[i - 1, j - 1]   # match
-                )
-        
+
+        # Distance matrix: 0 if values match, 1 if they differ. dtaidistance
+        # does not take a distance matrix, so the cumulative cost and path
+        # are computed here.
+        dist_matrix = (np.asarray(seq_a)[:, None] != np.asarray(seq_b)[None, :]).astype(np.float64)
+        cum_cost = _dtw_cumulative_cost(dist_matrix)
         distance = float(cum_cost[n, m])
-        
-        # Backtrack to find the warping path
-        path = []
-        i, j = n, m
-        while i > 0 or j > 0:
-            path.append((i - 1, j - 1))  # Convert to 0-indexed
-            if i == 0:
-                j -= 1
-            elif j == 0:
-                i -= 1
-            else:
-                # Find which direction we came from
-                candidates = [
-                    (cum_cost[i - 1, j - 1], i - 1, j - 1),
-                    (cum_cost[i - 1, j], i - 1, j),
-                    (cum_cost[i, j - 1], i, j - 1),
-                ]
-                _, i, j = min(candidates, key=lambda x: x[0])
-        
-        path.reverse()
+        path = _dtw_backtrack(cum_cost)
         
         # Normalize by path length (gives proportion of mismatches)
         normalized_distance = distance / len(path) if path else float('inf')
     else:
         # Standard Euclidean DTW for numerical/timing data
-        distance = dtw.distance(seq_a, seq_b)
-        path = dtw.warping_path(seq_a, seq_b)
+        use_c = _dtaidistance_use_c()
+        distance = dtw.distance(seq_a, seq_b, use_c=use_c)
+        path = dtw.warping_path(seq_a, seq_b, use_c=use_c)
         
         # Normalize by path length
         normalized_distance = distance / len(path) if path else float('inf')
@@ -763,51 +842,12 @@ def _dtw_with_jaccard(
             sequence_length_b=m
         ), 0.0, np.array([])
     
-    # Build Jaccard distance matrix
-    dist_matrix = np.ones((n, m), dtype=np.float64)
-    for i in range(n):
-        set_a = groups_a[i][1]
-        for j in range(m):
-            set_b = groups_b[j][1]
-            if set_a == set_b:
-                dist_matrix[i, j] = 0.0
-            else:
-                inter = len(set_a & set_b)
-                union = len(set_a | set_b)
-                dist_matrix[i, j] = 1.0 - inter / union if union > 0 else 1.0
-    
-    # DTW with custom distance matrix
-    cum_cost = np.full((n + 1, m + 1), np.inf)
-    cum_cost[0, 0] = 0.0
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = dist_matrix[i - 1, j - 1]
-            cum_cost[i, j] = cost + min(
-                cum_cost[i - 1, j],
-                cum_cost[i, j - 1],
-                cum_cost[i - 1, j - 1]
-            )
-    
+    dist_matrix = _jaccard_distance_matrix(groups_a, groups_b)
+    cum_cost = _dtw_cumulative_cost(dist_matrix)
     distance = float(cum_cost[n, m])
-    
-    # Backtrack to find warping path
-    path = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        path.append((i - 1, j - 1))
-        if i == 0:
-            j -= 1
-        elif j == 0:
-            i -= 1
-        else:
-            candidates = [
-                (cum_cost[i - 1, j - 1], i - 1, j - 1),
-                (cum_cost[i - 1, j], i - 1, j),
-                (cum_cost[i, j - 1], i, j - 1),
-            ]
-            _, i, j = min(candidates, key=lambda x: x[0])
-    path.reverse()
-    
+    path = _dtw_backtrack(cum_cost)
+    del cum_cost
+
     normalized_distance = distance / len(path) if path else float('inf')
     matches = sum(1 for i, j in path if dist_matrix[i, j] == 0.0)
     match_pct = matches / len(path) * 100 if path else 0.0
@@ -1850,8 +1890,12 @@ def timeline_overlaps_interval(
     if end_ts < start_ts:
         start_ts, end_ts = end_ts, start_ts
 
-    row_start = pd.to_datetime(timeline['StartTime'])
-    row_end = pd.to_datetime(timeline['EndTime'])
+    row_start = timeline['StartTime']
+    row_end = timeline['EndTime']
+    if not pd.api.types.is_datetime64_any_dtype(row_start):
+        row_start = pd.to_datetime(row_start)
+    if not pd.api.types.is_datetime64_any_dtype(row_end):
+        row_end = pd.to_datetime(row_end)
     return bool(((row_start < end_ts) & (row_end > start_ts)).any())
 
 

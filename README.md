@@ -166,6 +166,7 @@ sim = sr.ATCSimulation(
 | `clock_offset_seconds` | 0.0 | Added to collected output timestamps to line the controller clock up with this PC's clock |
 | `source_timezone` | `None` | Timezone of naive timestamps from the output-event source (for example `'UTC'`). `None` means local time |
 | `collection_extra` | `None` | Mapping passed to your `event_source` as `target.extra` |
+| `snmp_community` | `'public'` | SNMP community for every SET sent to this controller. `SoftwareTestSuite.snmp_community` and `TestScenario.snmp_community` set it for validation runs |
 | `incompatible_pairs` | `None` | Phase/overlap pairs to monitor. `None` disables conflict checking |
 | `tod_align` | `False` | Replay at original wall-clock time of day |
 | `cycle_length` / `cycle_offset` | 0 / 0.0 | Coordinated start (seconds). `cycle_length=0` disables |

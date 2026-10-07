@@ -35,6 +35,8 @@ class TestScenario:
     # Passed to the output-event source as CollectionTarget.extra (merged
     # over scenario_id, database_name and assignment).
     collection_extra: Optional[Mapping[str, Any]] = None
+    # SNMP community for this scenario's controller; None uses the suite's.
+    snmp_community: Optional[str] = None
 
 
 @dataclass
@@ -75,6 +77,8 @@ class SoftwareTestSuite:
     # Output-event source for every scenario (None = MAXTIME HTTP log);
     # see signal_replay.events. BatchRunner(event_source=...) overrides it.
     event_source: Any = None
+    # SNMP community used for every controller unless a scenario sets its own.
+    snmp_community: str = "public"
     final_collection_timeout_seconds: float = 900.0
     final_collection_poll_seconds: float = 20.0
 

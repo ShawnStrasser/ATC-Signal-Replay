@@ -1,17 +1,30 @@
 import base64
+import logging
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
 from jinja2 import Template
 
 from .comparison import PhaseCallChunkScore, render_sparkline_svg
 from .test_suite import SoftwareTestSuite, ScenarioResult, TestType
 
+logger = logging.getLogger(__name__)
+
 
 def load_annotations(path: str) -> Dict[str, str]:
+    """Load a YAML mapping of scenario_id -> annotation text.
+
+    Requires the optional PyYAML dependency (``pip install signal_replay[yaml]``).
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError(
+            "load_annotations requires PyYAML. Install it with "
+            "'pip install signal_replay[yaml]' or 'pip install pyyaml'."
+        ) from exc
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return {str(k): str(v) for k, v in data.items()}

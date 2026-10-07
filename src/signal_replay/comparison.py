@@ -28,14 +28,18 @@ from typing import List, Tuple, Dict, Optional, Union, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
+import logging
 import warnings
 import duckdb
 
 from dtaidistance import dtw
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+
+from ._serialize import float_or_none, known_fields, parse_datetime, to_jsonable
 from matplotlib.colors import to_rgba
-from atspm import SignalDataProcessor
+from matplotlib.figure import Figure
+
+logger = logging.getLogger(__name__)
 
 
 # Event IDs to include in comparison
@@ -92,14 +96,41 @@ class DTWResult:
     sequence_length_a: int
     sequence_length_b: int
 
+    def to_dict(self, include_warping_path: bool = False) -> Dict[str, Any]:
+        """JSON-safe dict; ``inf``/NaN distances become None."""
+        data = {
+            "distance": float_or_none(self.distance),
+            "normalized_distance": float_or_none(self.normalized_distance),
+            "sequence_length_a": int(self.sequence_length_a),
+            "sequence_length_b": int(self.sequence_length_b),
+        }
+        if include_warping_path:
+            data["warping_path"] = [[int(i), int(j)] for i, j in self.warping_path]
+        return data
 
-@dataclass 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DTWResult":
+        """Inverse of :meth:`to_dict`; a None distance (empty side) becomes ``inf``."""
+        def _distance(value: Any) -> float:
+            return float("inf") if value is None else float(value)
+        return cls(
+            distance=_distance(data.get("distance")),
+            normalized_distance=_distance(data.get("normalized_distance")),
+            warping_path=[tuple(p) for p in data.get("warping_path") or []],
+            sequence_length_a=int(data.get("sequence_length_a") or 0),
+            sequence_length_b=int(data.get("sequence_length_b") or 0),
+        )
+
+
+@dataclass
 class DivergenceWindow:
     """A window where two sequences diverge significantly.
     
     Time fields:
         start_time_delta_a/b: Seconds from the ALIGNED start (after trimming)
         original_start_seconds_a/b: Seconds from the ORIGINAL run start (before trimming)
+        start_timestamp_a/b, end_timestamp_a/b: Absolute event timestamps of
+            the window on each side (filled by :func:`compare_runs`)
     """
     start_index_a: int
     end_index_a: int
@@ -120,6 +151,19 @@ class DivergenceWindow:
     original_end_seconds_a: float = 0.0
     original_start_seconds_b: float = 0.0
     original_end_seconds_b: float = 0.0
+
+    _TIMESTAMP_FIELDS = ("start_timestamp_a", "end_timestamp_a", "start_timestamp_b", "end_timestamp_b")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-safe dict (timestamps as ISO-8601 strings)."""
+        return to_jsonable(self, drop_keys=("_TIMESTAMP_FIELDS",))
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DivergenceWindow":
+        kwargs = known_fields(cls, data)
+        for name in cls._TIMESTAMP_FIELDS:
+            kwargs[name] = parse_datetime(kwargs.get(name))
+        return cls(**kwargs)
 
 
 @dataclass
@@ -186,7 +230,45 @@ class ComparisonResult:
     @detector_chunk_scores.setter
     def detector_chunk_scores(self, value: List[PhaseCallChunkScore]) -> None:
         self.phase_call_chunk_scores = value
-    
+
+    def to_dict(self, include_warping_path: bool = False) -> Dict[str, Any]:
+        """JSON-safe dict of the whole result.
+
+        Timestamps become ISO-8601 strings and ``inf``/NaN become None, so
+        ``json.dumps(result.to_dict(), allow_nan=False)`` always works. The
+        DTW warping paths (often very large) are left out unless
+        ``include_warping_path`` is True.
+        """
+        data = to_jsonable(self, drop_keys=("sequence_dtw", "timing_dtw", "divergence_windows"))
+        data["sequence_dtw"] = self.sequence_dtw.to_dict(include_warping_path)
+        data["timing_dtw"] = self.timing_dtw.to_dict(include_warping_path)
+        data["divergence_windows"] = [w.to_dict() for w in self.divergence_windows]
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ComparisonResult":
+        """Rebuild a result from :meth:`to_dict` output."""
+        kwargs = known_fields(cls, data)
+        kwargs["sequence_dtw"] = DTWResult.from_dict(data.get("sequence_dtw") or {})
+        kwargs["timing_dtw"] = DTWResult.from_dict(data.get("timing_dtw") or {})
+        kwargs["divergence_windows"] = [
+            DivergenceWindow.from_dict(w) for w in data.get("divergence_windows") or []
+        ]
+        kwargs["match_percentage"] = float(data.get("match_percentage") or 0.0)
+        thresholds = data.get("thresholds")
+        kwargs["thresholds"] = ComparisonThresholds(**thresholds) if thresholds else None
+        kwargs["chunk_scores"] = [
+            ChunkScore(**known_fields(ChunkScore, c)) for c in data.get("chunk_scores") or []
+        ]
+        kwargs["phase_call_chunk_scores"] = [
+            PhaseCallChunkScore(**known_fields(PhaseCallChunkScore, c))
+            for c in data.get("phase_call_chunk_scores") or []
+        ]
+        for name in ("included_event_periods_a", "included_event_periods_b"):
+            periods = data.get(name)
+            kwargs[name] = None if periods is None else [tuple(p) for p in periods]
+        return cls(**kwargs)
+
     def format_summary(self) -> str:
         """Return a human-readable summary of the comparison."""
         lines = []
@@ -2136,6 +2218,40 @@ def _filter_chunk_scores_after_settle(
     return [chunk for chunk in chunk_scores if chunk.center_seconds >= settle_seconds]
 
 
+def _comparison_time_base(prepared: pd.DataFrame, start_time: Optional[datetime]) -> Optional[pd.Timestamp]:
+    """The timestamp that ``time_delta == 0`` refers to in a prepared frame."""
+    if start_time is not None:
+        return pd.Timestamp(start_time)
+    if prepared.empty or 'timestamp' not in prepared.columns:
+        return None
+    return pd.Timestamp(prepared['timestamp'].min())
+
+
+def _set_divergence_timestamps(
+    divergences: List[DivergenceWindow],
+    base_time_a: Optional[pd.Timestamp],
+    base_time_b: Optional[pd.Timestamp],
+    shift_b_seconds: float,
+) -> None:
+    """Fill the absolute start/end timestamps of each divergence window.
+
+    ``original_*_seconds_a`` count from A's time base. B's original seconds
+    include the temporal shift added during auto-alignment, which is
+    removed again here so B's timestamps are B's own event times.
+    """
+    for div in divergences:
+        if base_time_a is not None:
+            div.start_timestamp_a = (base_time_a + pd.Timedelta(seconds=div.original_start_seconds_a)).to_pydatetime()
+            div.end_timestamp_a = (base_time_a + pd.Timedelta(seconds=div.original_end_seconds_a)).to_pydatetime()
+        if base_time_b is not None:
+            div.start_timestamp_b = (
+                base_time_b + pd.Timedelta(seconds=div.original_start_seconds_b - shift_b_seconds)
+            ).to_pydatetime()
+            div.end_timestamp_b = (
+                base_time_b + pd.Timedelta(seconds=div.original_end_seconds_b - shift_b_seconds)
+            ).to_pydatetime()
+
+
 def compare_runs(
     events_a: pd.DataFrame,
     events_b: pd.DataFrame,
@@ -2194,19 +2310,25 @@ def compare_runs(
     # Prepare events (filter, sort, compute time_deltas)
     df_a = prepare_events_for_comparison(events_a, start_time_a, event_ids=event_ids)
     df_b = prepare_events_for_comparison(events_b, start_time_b, event_ids=event_ids)
-    
+    # Time bases of the "original seconds" in divergence windows, used to
+    # report absolute timestamps for each side.
+    base_time_a = _comparison_time_base(df_a, start_time_a)
+    base_time_b = _comparison_time_base(df_b, start_time_b)
+
     # Auto-alignment: temporal cross-correlation to find the best time shift,
     # then apply a small positional trim if needed.
     alignment_offset = 0
     trim_seconds_a = 0.0
     trim_seconds_b = 0.0
     temporal_shift = 0.0
+    applied_shift_b = 0.0
     
     if auto_align and not df_a.empty and not df_b.empty:
         # Step 1: Find the true temporal shift via cross-correlation.
         # This avoids the cyclic false-match problem of positional alignment.
         temporal_shift = find_temporal_offset(df_a, df_b, group_tolerance=group_tolerance)
         if abs(temporal_shift) > 0.05:
+            applied_shift_b = temporal_shift
             df_b = df_b.copy()
             df_b['time_delta'] = df_b['time_delta'] + temporal_shift
             df_b = df_b[df_b['time_delta'] >= 0].reset_index(drop=True)
@@ -2488,7 +2610,9 @@ def compare_runs(
                     d.end_time_delta_b += c_start
                 divergences.extend(local_divs)
         divergences = filter_divergence_windows_to_periods(divergences, included_event_periods_a)
-    
+
+    _set_divergence_timestamps(divergences, base_time_a, base_time_b, applied_shift_b)
+
     # ===== TIMING ANALYSIS =====
     # For matched groups, compare how much the timing differs
     timing_stats = _analyze_timing(
@@ -2877,6 +3001,7 @@ def generate_timeline(
     params = {
         'raw_data': df,
         'bin_size': 15,  # Required by atspm - 15 minute bins
+        'verbose': 0,  # atspm prints timings to stdout otherwise; errors still raise
         'aggregations': [
             {
                 'name': 'has_data', 
@@ -2896,6 +3021,8 @@ def generate_timeline(
         ]
     }
     
+    from atspm import SignalDataProcessor
+
     with SignalDataProcessor(**params) as processor:
         processor.load()
         processor.aggregate()
@@ -3650,7 +3777,10 @@ def create_comparison_gantt_matplotlib(
     
     # Create figure
     fig_height = max(5.0, 0.34 * len(row_labels))
-    fig, ax = plt.subplots(figsize=(18, fig_height))
+    # Object-oriented Figure (Agg canvas on savefig): no pyplot global state and
+    # no GUI backend, so this is safe to call from worker threads.
+    fig = Figure(figsize=(18, fig_height))
+    ax = fig.subplots()
     legend_handles = []
 
     overlay_specs = []
@@ -3829,7 +3959,7 @@ def create_comparison_gantt_matplotlib(
             borderaxespad=0.0,
         )
     
-    plt.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
     
     # Save if output path specified
     if output_path:
@@ -3837,7 +3967,7 @@ def create_comparison_gantt_matplotlib(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # Force a large bounding box to ensure the chart isn't shrunk
         fig.savefig(str(output_path), dpi=dpi, bbox_inches=None)
-        print(f"Saved comparison chart (fixed scale) to: {output_path}")
+        logger.info("Saved comparison chart (fixed scale) to: %s", output_path)
     
     return fig
 
@@ -3930,7 +4060,6 @@ def create_multi_divergence_plots(
             programmed_split_timeline=programmed_split_timeline,
         )
         if fig is not None:
-            plt.close(fig)
             paths.append(str(output_path))
 
     return paths
@@ -4032,8 +4161,8 @@ def compare_and_visualize(
         print(f"\n{'='*60}")
         print(f"Comparison: {label_a} vs {label_b}")
         print(f"{'='*60}")
-        print(f"  Match Percentage:  {result.match_percentage:.1f}%  (threshold: ≥{thresholds.match_threshold}%)")
-        print(f"    {'⚠️  BELOW THRESHOLD' if result.match_percentage < thresholds.match_threshold else '✓ OK'}")
+        print(f"  Match Percentage:  {result.match_percentage:.1f}%  (threshold: >={thresholds.match_threshold}%)")
+        print(f"    {'WARNING: BELOW THRESHOLD' if result.match_percentage < thresholds.match_threshold else 'OK'}")
         print(f"  Timestamp groups in A: {result.sequence_dtw.sequence_length_a}")
         print(f"  Timestamp groups in B: {result.sequence_dtw.sequence_length_b}")
         print(f"  Alignment: trimmed {result.alignment_offset} groups "
@@ -4060,7 +4189,7 @@ def compare_and_visualize(
         print(f"{'='*60}")
         
         if result.exceeds_threshold:
-            print(f"\n⚠️  THRESHOLD EXCEEDED")
+            print("\nWARNING: THRESHOLD EXCEEDED")
     
     # Determine if we should generate plots
     should_plot = (result.exceeds_threshold or force_plot) and output_dir is not None
@@ -4094,7 +4223,7 @@ def compare_and_visualize(
         
         try:
             # Use atspm timeline generator
-            print("Generating timelines with atspm...")
+            logger.info("Generating timelines with atspm...")
             timeline_a = generate_timeline(df_a, device_id=device_id)
             timeline_b = generate_timeline(df_b, device_id=device_id)
             timeline_a, timeline_b = cross_invalidate_timelines(timeline_a, timeline_b)
@@ -4115,15 +4244,18 @@ def compare_and_visualize(
                     
                 output_path = Path(output_dir) / output_name
                 
-                print(f"Creating Gantt chart with {len(timeline_a)} events (A) and {len(timeline_b)} events (B)...")
-                print(f"Timeline alignment offset: {time_offset:.1f}s")
+                logger.info(
+                    "Creating Gantt chart with %d events (A) and %d events (B)...",
+                    len(timeline_a), len(timeline_b),
+                )
+                logger.info("Timeline alignment offset: %.1fs", time_offset)
                 
                 # Use matplotlib for all outputs (reliable export, no kaleido issues)
                 # Ensure we use a supported static extension
                 if not output_path.suffix.lower() in ('.png', '.pdf', '.svg', '.jpg', '.jpeg'):
                     output_path = output_path.with_suffix('.png')
 
-                fig = create_comparison_gantt_matplotlib(
+                create_comparison_gantt_matplotlib(
                     timeline_a=timeline_a,
                     timeline_b=timeline_b,
                     label_a=label_a,
@@ -4136,14 +4268,12 @@ def compare_and_visualize(
                     align_by_time_delta=True,
                     time_offset_b=time_offset
                 )
-                plt.close(fig)  # Clean up
-                
+
                 result.plot_path = str(output_path)
             
         except Exception as e:
-            import traceback
             warnings.warn(f"Failed to generate visualization: {e}")
-            traceback.print_exc()
+            logger.exception("Failed to generate visualization")
     
     return result
 
@@ -4154,12 +4284,15 @@ def compare_and_visualize(
 
 def store_comparison_result(
     db_path: str,
-    result: ComparisonResult
+    result: ComparisonResult,
+    run_uuid: Optional[str] = None,
 ) -> None:
     """
     Store comparison result in the database.
-    
-    Creates comparison_results table if it doesn't exist.
+
+    Creates comparison_results table if it doesn't exist. The connection is
+    always closed, also when the CREATE or INSERT fails, so the file is never
+    left locked.
     """
     # Retry for DuckDB file-lock issues on network shares
     last_err = None
@@ -4177,55 +4310,58 @@ def store_comparison_result(
                 raise
     else:
         raise last_err  # type: ignore[misc]
-    
-    # Create table if not exists
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS comparison_results (
-            device_id VARCHAR,
-            run_a VARCHAR,
-            run_b VARCHAR,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            sequence_dtw_distance DOUBLE,
-            sequence_dtw_normalized DOUBLE,
-            timing_dtw_distance DOUBLE,
-            timing_dtw_normalized DOUBLE,
-            match_percentage DOUBLE,
-            num_divergences INTEGER,
-            sequence_threshold DOUBLE,
-            timing_threshold DOUBLE,
-            match_threshold DOUBLE,
-            exceeds_threshold BOOLEAN,
-            threshold_reason VARCHAR,
-            plot_path VARCHAR
-        )
-    """)
-    
-    # Insert result
-    con.execute("""
-        INSERT INTO comparison_results (
-            device_id, run_a, run_b,
-            sequence_dtw_distance, sequence_dtw_normalized,
-            timing_dtw_distance, timing_dtw_normalized,
-            match_percentage, num_divergences,
-            sequence_threshold, timing_threshold, match_threshold,
-            exceeds_threshold, threshold_reason, plot_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        result.device_id,
-        str(result.run_a),
-        str(result.run_b),
-        result.sequence_dtw.distance,
-        result.sequence_dtw.normalized_distance,
-        result.timing_dtw.distance,
-        result.timing_dtw.normalized_distance,
-        result.match_percentage,
-        len(result.divergence_windows),
-        result.thresholds.sequence_threshold if result.thresholds else None,
-        result.thresholds.timing_threshold if result.thresholds else None,
-        result.thresholds.match_threshold if result.thresholds else None,
-        result.exceeds_threshold,
-        result.threshold_reason,
-        result.plot_path
-    ])
-    
-    con.close()
+
+    try:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS comparison_results (
+                device_id VARCHAR,
+                run_a VARCHAR,
+                run_b VARCHAR,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sequence_dtw_distance DOUBLE,
+                sequence_dtw_normalized DOUBLE,
+                timing_dtw_distance DOUBLE,
+                timing_dtw_normalized DOUBLE,
+                match_percentage DOUBLE,
+                num_divergences INTEGER,
+                sequence_threshold DOUBLE,
+                timing_threshold DOUBLE,
+                match_threshold DOUBLE,
+                exceeds_threshold BOOLEAN,
+                threshold_reason VARCHAR,
+                plot_path VARCHAR
+            )
+        """)
+        columns = {row[1] for row in con.execute("PRAGMA table_info('comparison_results')").fetchall()}
+        if "run_uuid" not in columns:
+            con.execute("ALTER TABLE comparison_results ADD COLUMN run_uuid VARCHAR")
+
+        con.execute("""
+            INSERT INTO comparison_results (
+                device_id, run_a, run_b,
+                sequence_dtw_distance, sequence_dtw_normalized,
+                timing_dtw_distance, timing_dtw_normalized,
+                match_percentage, num_divergences,
+                sequence_threshold, timing_threshold, match_threshold,
+                exceeds_threshold, threshold_reason, plot_path, run_uuid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            result.device_id,
+            str(result.run_a),
+            str(result.run_b),
+            result.sequence_dtw.distance,
+            result.sequence_dtw.normalized_distance,
+            result.timing_dtw.distance,
+            result.timing_dtw.normalized_distance,
+            result.match_percentage,
+            len(result.divergence_windows),
+            result.thresholds.sequence_threshold if result.thresholds else None,
+            result.thresholds.timing_threshold if result.thresholds else None,
+            result.thresholds.match_threshold if result.thresholds else None,
+            result.exceeds_threshold,
+            result.threshold_reason,
+            result.plot_path,
+            run_uuid,
+        ])
+    finally:
+        con.close()

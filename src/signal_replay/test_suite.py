@@ -1,18 +1,26 @@
+import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .comparison import ComparisonThresholds
+from ._serialize import known_fields, to_jsonable
+from .comparison import ComparisonResult, ComparisonThresholds
 from .config import DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS
+
+logger = logging.getLogger(__name__)
 
 
 class TestType(str, Enum):
+    __test__ = False  # not a pytest test class
+
     SIMILARITY = "similarity"
     CONFLICT = "conflict"
 
 
 @dataclass
 class TestScenario:
+    __test__ = False  # not a pytest test class
+
     scenario_id: str
     database_name: str
     events_source: str
@@ -24,10 +32,15 @@ class TestScenario:
     tod_align: bool = True
     cycle_length: int = 0
     cycle_offset: float = 0.0
+    # Passed to the output-event source as CollectionTarget.extra (merged
+    # over scenario_id, database_name and assignment).
+    collection_extra: Optional[Mapping[str, Any]] = None
 
 
 @dataclass
 class TestBatch:
+    __test__ = False  # not a pytest test class
+
     batch_id: str
     assignments: Dict[str, str]
     description: str = ""
@@ -35,6 +48,8 @@ class TestBatch:
 
 @dataclass
 class SoftwareTestSuite:
+    __test__ = False  # not a pytest test class
+
     suite_name: str
     software_version: str
     baseline_version: str
@@ -57,6 +72,11 @@ class SoftwareTestSuite:
     replay_latency_offset_lookback_min: Optional[float] = None
     replay_latency_offset_update_min: Optional[float] = None
     replay_latency_offset_min_samples: Optional[int] = None
+    # Output-event source for every scenario (None = MAXTIME HTTP log);
+    # see signal_replay.events. BatchRunner(event_source=...) overrides it.
+    event_source: Any = None
+    final_collection_timeout_seconds: float = 900.0
+    final_collection_poll_seconds: float = 20.0
 
     @property
     def detector_similarity_threshold(self) -> float:
@@ -69,6 +89,13 @@ class SoftwareTestSuite:
 
 @dataclass
 class ScenarioResult:
+    """Outcome of comparing one scenario (see :func:`signal_replay.compare_validation`).
+
+    ``comparison`` holds the underlying :class:`~signal_replay.ComparisonResult`
+    for similarity scenarios (warping paths removed), with absolute
+    divergence timestamps. :meth:`to_dict` is JSON-safe.
+    """
+
     scenario_id: str
     test_type: TestType
     software_version: str
@@ -102,6 +129,7 @@ class ScenarioResult:
     timeline_difference_analysis_available: bool = False
     sparkline_svg: str = ""
     temporal_shift_seconds: float = 0.0
+    comparison: Optional[ComparisonResult] = None
 
     @property
     def detector_chunk_scores(self) -> List[dict]:
@@ -110,3 +138,25 @@ class ScenarioResult:
     @detector_chunk_scores.setter
     def detector_chunk_scores(self, value: List[dict]) -> None:
         self.phase_call_chunk_scores = value
+
+    def to_dict(self, include_sparkline: bool = True) -> Dict[str, Any]:
+        """JSON-safe dict: timestamps as ISO-8601 strings, ``inf``/NaN as None.
+
+        ``comparison`` is included without DTW warping paths. Pass
+        ``include_sparkline=False`` to leave out the (large) SVG text.
+        """
+        data = to_jsonable(self, drop_keys=("comparison",))
+        data["test_type"] = self.test_type.value if isinstance(self.test_type, TestType) else str(self.test_type)
+        data["comparison"] = self.comparison.to_dict() if self.comparison is not None else None
+        if not include_sparkline:
+            data["sparkline_svg"] = ""
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ScenarioResult":
+        """Rebuild a result from :meth:`to_dict` output."""
+        kwargs = known_fields(cls, data)
+        kwargs["test_type"] = TestType(data.get("test_type", TestType.SIMILARITY.value))
+        comparison = data.get("comparison")
+        kwargs["comparison"] = ComparisonResult.from_dict(comparison) if comparison else None
+        return cls(**kwargs)

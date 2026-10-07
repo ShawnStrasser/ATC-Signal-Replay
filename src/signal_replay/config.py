@@ -2,11 +2,14 @@
 Configuration classes for ATC Signal Replay.
 """
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Mapping, Optional, Tuple, Union
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # Empirically derived from experiments/latency_scaling_runs/report.md.
 DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS = 0.1853
@@ -35,7 +38,15 @@ class SignalConfig:
         replay_latency_offset_seconds: Positive detector replay compensation, in seconds.
             This value is subtracted from detector event timestamps before scheduling
             sends, so positive values send slightly earlier.
-        http_port: Port for HTTP data collection. Defaults to udp_port for localhost, 80 for remote hosts. Use None to disable.
+        http_port: Port of the MAXTIME HTTP event log. Defaults to udp_port for localhost, 80 for
+            remote hosts. None turns off collection for this signal unless an ``event_source``
+            is given.
+        clock_offset_seconds: Seconds added to this controller's output-event timestamps to bring
+            them onto this PC's clock (positive when the controller clock is behind). Default 0.
+        source_timezone: Timezone of naive timestamps returned by the output-event source for this
+            signal (for example ``'UTC'``). Overrides the source's own setting. None = local time.
+        collection_extra: Optional mapping passed to the output-event source as
+            ``CollectionTarget.extra`` (for example the id your source uses for this controller).
     """
     device_id: str
     ip: str
@@ -48,6 +59,9 @@ class SignalConfig:
     buffer_minutes: float = 0.0
     replay_latency_offset_seconds: float = DEFAULT_REPLAY_LATENCY_OFFSET_SECONDS
     http_port: Optional[int] = field(default_factory=lambda: _USE_DEFAULT)
+    clock_offset_seconds: float = 0.0
+    source_timezone: Optional[str] = None
+    collection_extra: Optional[Mapping[str, Any]] = None
     
     # Internal: populated during simulation initialization
     events: Union[pd.DataFrame, str, Path, None] = field(default=None, init=False, repr=False)
@@ -122,6 +136,18 @@ class SignalConfig:
                 "replay_latency_offset_seconds must be a non-negative number, "
                 f"got {self.replay_latency_offset_seconds}"
             )
+        if (
+            not isinstance(self.clock_offset_seconds, (int, float))
+            or isinstance(self.clock_offset_seconds, bool)
+        ):
+            raise ValueError(f"clock_offset_seconds must be a number, got {self.clock_offset_seconds}")
+        if self.source_timezone is not None:
+            try:
+                pd.Timestamp("2026-01-01").tz_localize(self.source_timezone)
+            except Exception as exc:
+                raise ValueError(f"source_timezone {self.source_timezone!r} is not a known timezone") from exc
+        if self.collection_extra is not None and not isinstance(self.collection_extra, Mapping):
+            raise ValueError(f"collection_extra must be a mapping or None, got {type(self.collection_extra)}")
     
     @property
     def ip_port(self) -> Tuple[str, int]:
@@ -143,7 +169,8 @@ class SimulationConfig:
         simulation_replays: Number of times to replay the simulation
         stop_on_conflict: If True, stop before the next run when a conflict is detected after final end-of-run collection
         db_path: Path to DuckDB database file (defaults to ./atc_replay.db)
-        controller_type: Type of controller (currently only "MAXTIME" supported)
+        controller_type: Free-text label for the controller family (informational only;
+            replay works with any NTCIP 1202 controller)
         simulation_speed: Speed multiplier for the simulation (1.0 = real-time)
         collection_interval_minutes: How often to collect data from controllers (default: 5)
         post_replay_settle_seconds: Wait this long after replay completes before final collection
@@ -156,6 +183,20 @@ class SimulationConfig:
             each collector poll using this many minutes of recent sparse event 82 data.
         replay_latency_offset_min_samples: Optional minimum matched event 82 samples
             required before applying an adaptive latency update.
+        stop_grace_seconds: After a stop is requested, how long to wait for replay
+            workers to finish before abandoning them (default: 8)
+        detector_reset_timeout_seconds: Time budget for the detector reset that runs
+            at the end of every replay, including after a stop (default: 5)
+        cancel_final_poll_seconds: Time budget for one best-effort collection poll
+            after a cancel so events up to the stop are kept; 0 skips it (default: 3)
+        event_source: Where output events come from. None (default) reads the MAXTIME
+            HTTP event log of each signal with an ``http_port``. Otherwise a function
+            ``(target, since)`` (sync or async) or an object with ``fetch(target, since)``;
+            see :mod:`signal_replay.events`.
+        final_collection_timeout_seconds: After each replay (and the settle wait), how long
+            to keep polling until the source reports its events complete through the end of
+            the replay. A run still incomplete then is recorded as 'incomplete' (default: 900)
+        final_collection_poll_seconds: Poll interval during that wait (default: 20)
     """
     signals: List[SignalConfig]
     events: Union[pd.DataFrame, str, Path, None]
@@ -174,6 +215,12 @@ class SimulationConfig:
     replay_latency_offset_lookback_min: Optional[float] = None
     replay_latency_offset_update_min: Optional[float] = None
     replay_latency_offset_min_samples: Optional[int] = None
+    stop_grace_seconds: float = 8.0
+    detector_reset_timeout_seconds: float = 5.0
+    cancel_final_poll_seconds: float = 3.0
+    event_source: Any = None
+    final_collection_timeout_seconds: float = 900.0
+    final_collection_poll_seconds: float = 20.0
     
     def __post_init__(self):
         # Validate signals list
@@ -201,9 +248,16 @@ class SimulationConfig:
         if not isinstance(self.simulation_replays, int) or self.simulation_replays < 1:
             raise ValueError(f"simulation_replays must be a positive integer, got {self.simulation_replays}")
         
-        # Validate controller_type
-        if self.controller_type != "MAXTIME":
-            raise ValueError(f"controller_type must be 'MAXTIME', got {self.controller_type}")
+        # controller_type is a free label; collection is chosen by event_source.
+        if self.controller_type is not None and not isinstance(self.controller_type, str):
+            raise ValueError(f"controller_type must be a string, got {type(self.controller_type)}")
+        if self.event_source is not None and not (
+            callable(self.event_source) or callable(getattr(self.event_source, "fetch", None))
+        ):
+            raise ValueError(
+                "event_source must be a function (target, since), an async function, "
+                "or an object with a fetch(target, since) method"
+            )
         
         # Validate simulation_speed
         if not isinstance(self.simulation_speed, (int, float)) or self.simulation_speed <= 0:
@@ -285,6 +339,17 @@ class SimulationConfig:
                     f"got {self.replay_latency_offset_min_samples}"
                 )
         
+        for name in (
+            "stop_grace_seconds",
+            "detector_reset_timeout_seconds",
+            "cancel_final_poll_seconds",
+            "final_collection_timeout_seconds",
+            "final_collection_poll_seconds",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative number, got {value}")
+
         # Validate db_path
         if not isinstance(self.db_path, str):
             raise ValueError(f"db_path must be a string, got {type(self.db_path)}")

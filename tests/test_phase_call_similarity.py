@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 
-import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.figure import Figure
 import signal_replay as sr
@@ -534,7 +533,6 @@ def test_create_comparison_gantt_matplotlib_omits_transition_section_text():
     assert fig is not None
     text_values = [text.get_text() for text in fig.axes[0].texts]
     assert "Transition / Preempt / Ped Service" not in text_values
-    plt.close(fig)
 
 
 def test_combined_timeline_chart_uses_dynamic_y_axis_without_exclusion_legend():
@@ -582,30 +580,18 @@ def test_comparison_gantt_overlays_programmed_splits_without_adding_rows():
         ]
     )
 
-    original_subplots = sr.comparison.plt.subplots
+    fig = create_comparison_gantt_matplotlib(
+        timeline_a=timeline_a,
+        timeline_b=timeline_b,
+        label_a="2.15.1",
+        label_b="2.17.3",
+        title="2B045 Issue Focus - Ph 2 Green",
+        window_minutes=5.0,
+        align_by_time_delta=False,
+        programmed_split_timeline=programmed_split_timeline,
+    )
 
-    def fake_subplots(*args, **kwargs):
-        fig = Figure(figsize=kwargs.get("figsize"))
-        ax = fig.add_subplot(111)
-        return fig, ax
-
-    sr.comparison.plt.subplots = fake_subplots
-
-    try:
-        fig = create_comparison_gantt_matplotlib(
-            timeline_a=timeline_a,
-            timeline_b=timeline_b,
-            label_a="2.15.1",
-            label_b="2.17.3",
-            title="2B045 Issue Focus - Ph 2 Green",
-            window_minutes=5.0,
-            align_by_time_delta=False,
-            programmed_split_timeline=programmed_split_timeline,
-        )
-    finally:
-        sr.comparison.plt.subplots = original_subplots
-
-    assert fig is not None
+    assert isinstance(fig, Figure)
     axis = fig.axes[0]
     row_labels = [tick.get_text() for tick in axis.get_yticklabels()]
     legend = axis.get_legend()
@@ -614,7 +600,6 @@ def test_comparison_gantt_overlays_programmed_splits_without_adding_rows():
     assert legend is not None
     assert [text.get_text() for text in legend.get_texts()] == ["Programed Split"]
     assert len(axis.collections) >= 4
-    plt.close(fig)
 
 
 def test_create_multi_divergence_plots_passes_programmed_splits_through(monkeypatch, tmp_path):
@@ -651,7 +636,6 @@ def test_create_multi_divergence_plots_passes_programmed_splits_through(monkeypa
         return object()
 
     monkeypatch.setattr(sr.comparison, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
-    monkeypatch.setattr(plt, "close", lambda fig: None)
 
     result = sr.ComparisonResult(
         device_id="2B045",
@@ -678,7 +662,7 @@ def test_create_multi_divergence_plots_passes_programmed_splits_through(monkeypa
         match_percentage=100.0,
     )
 
-    paths = sr.create_multi_divergence_plots(
+    paths = sr.comparison.create_multi_divergence_plots(
         timeline_a=timeline_a,
         timeline_b=timeline_b,
         comparison_result=result,
@@ -735,7 +719,7 @@ def test_create_multi_divergence_plots_skips_divergences_without_min_context(mon
         match_percentage=100.0,
     )
 
-    paths = sr.create_multi_divergence_plots(
+    paths = sr.comparison.create_multi_divergence_plots(
         timeline_a=timeline_a,
         timeline_b=timeline_b,
         comparison_result=result,

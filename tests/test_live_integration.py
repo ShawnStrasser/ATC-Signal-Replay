@@ -1,15 +1,22 @@
 """
 Integration tests for live device simulation.
 
-These tests require a live SNMP-enabled controller and will be skipped
-if the device is not reachable. They verify:
+These tests send SNMP (and poll HTTP) to a real test controller. They verify:
 1. Timing is correct (no double-wait bug)
 2. Output events match input events (via DTW comparison)
 3. Database storage and retrieval works correctly
 4. Full simulation pipeline functions end-to-end
 
-Run with: pytest tests/test_live_integration.py -v -s
-Skip in CI: These tests are marked with @pytest.mark.live_device
+Every test in this module carries the ``live`` marker, which the default
+pytest options deselect (``-m 'not live'``), so a plain ``pytest`` never
+contacts a device. To run them against your own bench controller:
+
+    TEST_CONTROLLER_IP=192.168.1.100[:161] TEST_CONTROLLER_HTTP_PORT=80 \
+        pytest -m live tests/test_live_integration.py -v -s
+
+Tests skip when TEST_CONTROLLER_IP is unset or the device is unreachable.
+Reachability is only checked when a live test actually runs, never at
+collection time.
 """
 
 import pytest
@@ -23,14 +30,16 @@ import pandas as pd
 import signal_replay as sr
 
 
-# Test device configuration
-# Set TEST_CONTROLLER_IP env var to enable live tests (e.g. TEST_CONTROLLER_IP=192.168.1.100)
-_raw_ip = os.environ.get('TEST_CONTROLLER_IP', '')
+pytestmark = pytest.mark.live
+
+# Test device configuration (no default device; see the module docstring).
+# TEST_CONTROLLER_IP is "ip" or "ip:snmp_port" (SNMP port defaults to 161).
+_raw_ip = os.environ.get('TEST_CONTROLLER_IP', '').strip()
 _ip, _, _port_str = _raw_ip.partition(':')
 LIVE_DEVICE_IP_PORT: Tuple[str, int] = (_ip, int(_port_str) if _port_str else 161)
 
 # HTTP port for data collection (may differ from SNMP port)
-LIVE_DEVICE_HTTP_PORT: int = 80
+LIVE_DEVICE_HTTP_PORT: int = int(os.environ.get('TEST_CONTROLLER_HTTP_PORT', '80') or 80)
 
 
 def is_device_reachable(ip_port: Tuple[str, int], timeout: float = 5.0) -> bool:
@@ -78,18 +87,29 @@ def create_synthetic_events(
     return pd.DataFrame(events)
 
 
-# Custom marker for live device tests
-live_device = pytest.mark.skipif(
-    not _ip or not is_device_reachable(LIVE_DEVICE_IP_PORT),
-    reason=f"Live device not configured (set TEST_CONTROLLER_IP) or not reachable"
-)
+@pytest.fixture(scope="module")
+def _require_live_device() -> None:
+    """Skip unless TEST_CONTROLLER_IP is set and answers SNMP (checked lazily)."""
+    if not _ip:
+        pytest.skip("Live device not configured (set TEST_CONTROLLER_IP)")
+    if not is_device_reachable(LIVE_DEVICE_IP_PORT):
+        pytest.skip(f"Live device not reachable: {LIVE_DEVICE_IP_PORT}")
 
-# Custom marker for tests needing HTTP collection
-live_device_http = pytest.mark.skipif(
-    not _ip or not is_device_reachable(LIVE_DEVICE_IP_PORT) or
-    not is_http_reachable(LIVE_DEVICE_IP_PORT[0], LIVE_DEVICE_HTTP_PORT),
-    reason=f"Live device HTTP endpoint not configured or not reachable"
-)
+
+@pytest.fixture(scope="module")
+def _require_live_http(_require_live_device) -> None:
+    """Skip unless the live device's HTTP event log endpoint answers."""
+    if not is_http_reachable(LIVE_DEVICE_IP_PORT[0], LIVE_DEVICE_HTTP_PORT):
+        pytest.skip(
+            f"Live device HTTP endpoint not reachable on port {LIVE_DEVICE_HTTP_PORT} "
+            "(set TEST_CONTROLLER_HTTP_PORT)"
+        )
+
+
+# Decorators for live tests. They only request fixtures, so nothing touches the
+# network while pytest collects this module.
+live_device = pytest.mark.usefixtures("_require_live_device")
+live_device_http = pytest.mark.usefixtures("_require_live_http")
 
 
 @pytest.fixture(scope="module")

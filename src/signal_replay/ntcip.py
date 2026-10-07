@@ -14,6 +14,7 @@ the 300 MB → 21 GB growth observed 2025-06.
 """
 
 import asyncio
+import logging
 from typing import Tuple, Literal
 
 from pysnmp.hlapi.v3arch.asyncio import (
@@ -26,6 +27,10 @@ from pysnmp.hlapi.v3arch.asyncio import (
     Integer,
     set_cmd,
 )
+
+from ._logging import debug_level
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,7 @@ async def async_reset_all_detectors(
     timeout: float = 2.0,
     *,
     snmp_engine: SnmpEngine,
+    raise_on_error: bool = False,
 ) -> None:
     """
     Reset all detector states to 0 for a controller (async version).
@@ -117,6 +123,13 @@ async def async_reset_all_detectors(
         debug: If True, print debug messages
         timeout: SNMP response timeout in seconds for each reset command
         snmp_engine: Reusable SnmpEngine instance.
+        raise_on_error: If True, a failed reset (no answer, timeout, any
+            error other than noSuchName) raises RuntimeError. If False (the
+            default) it is logged at WARNING and the remaining resets are
+            skipped.
+
+    Raises:
+        RuntimeError: Only with ``raise_on_error=True``.
 
     Note:
         Silently skips detectors that don't exist (noSuchName errors).
@@ -132,21 +145,22 @@ async def async_reset_all_detectors(
             except RuntimeError as e:
                 err_msg = str(e)
                 if "noSuchName" in err_msg:
-                    if debug:
-                        print(
-                            f"Detector group {detector_group} of type "
-                            f"{detector_type} does not exist for {ip_port}."
-                        )
+                    logger.log(
+                        debug_level(debug),
+                        "Detector group %s of type %s does not exist for %s.",
+                        detector_group, detector_type, ip_port,
+                    )
                     break
                 else:
-                    print(
-                        f"Warning: reset failed for {ip_port} ({err_msg}), "
-                        f"skipping remaining resets"
+                    if raise_on_error:
+                        raise
+                    logger.warning(
+                        "Reset failed for %s (%s), skipping remaining resets",
+                        ip_port, err_msg,
                     )
                     return
 
-    if debug:
-        print(f"Detector states reset successfully for {ip_port}")
+    logger.log(debug_level(debug), "Detector states reset successfully for %s", ip_port)
 
 
 # ---------------------------------------------------------------------------
@@ -185,11 +199,16 @@ def reset_all_detectors(
     community: str = 'public',
     debug: bool = False,
     timeout: float = 2.0,
+    raise_on_error: bool = False,
 ) -> None:
-    """Synchronous wrapper around :func:`async_reset_all_detectors`."""
+    """Synchronous wrapper around :func:`async_reset_all_detectors`.
+
+    With ``raise_on_error=True`` it doubles as a connectivity check: it
+    raises RuntimeError when the controller does not answer SNMP.
+    """
     asyncio.run(
         _with_engine(lambda eng: async_reset_all_detectors(
             ip_port, community, debug, timeout,
-            snmp_engine=eng,
+            snmp_engine=eng, raise_on_error=raise_on_error,
         ))
     )

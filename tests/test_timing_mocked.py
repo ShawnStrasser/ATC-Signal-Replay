@@ -276,10 +276,10 @@ class TestOrchestratorTimingWithMocks:
             def clear_run_data(self, _run_number=None, device_ids=None):
                 return None
 
-            def mark_run_started(self, _run_number):
+            def mark_run_started(self, _run_number, **_kwargs):
                 return None
 
-            def mark_run_completed(self, _run_number):
+            def mark_run_completed(self, _run_number, **_kwargs):
                 return None
 
             def insert_input_events(self, *_args, **_kwargs):
@@ -292,16 +292,19 @@ class TestOrchestratorTimingWithMocks:
             def run_collection_loop(self, *args, **kwargs):
                 return None
 
-            def collect_once(
+            def collect_once(self, *args, **kwargs):
+                return {}
+
+            def finalize_run(
                 self,
                 run_number,
                 simulation_start_time,
-                detect_conflicts=False,
+                complete_target,
                 conflict_callback=None,
-                error_event=None,
+                **_kwargs,
             ):
                 self.collect_calls += 1
-                if self.collect_calls == 1 and detect_conflicts and conflict_callback is not None:
+                if self.collect_calls == 1 and conflict_callback is not None:
                     conflict_callback([
                         sr.ConflictRecord(
                             device_id='test_device',
@@ -359,10 +362,10 @@ class TestOrchestratorTimingWithMocks:
             def clear_run_data(self, _run_number=None, device_ids=None):
                 return None
 
-            def mark_run_started(self, run_number):
+            def mark_run_started(self, run_number, **_kwargs):
                 started_runs.append(run_number)
 
-            def mark_run_completed(self, run_number):
+            def mark_run_completed(self, run_number, **_kwargs):
                 completed_runs.append(run_number)
 
             def insert_input_events(self, *_args, **_kwargs):
@@ -377,6 +380,9 @@ class TestOrchestratorTimingWithMocks:
 
             def collect_once(self, *args, **kwargs):
                 return None
+
+            def finalize_run(self, *args, **kwargs):
+                return {"status": "complete"}
 
         def fake_store(self):
             self._cached_durations = {'test_device': 0.0}
@@ -532,7 +538,10 @@ class TestSignalReplayTiming:
 
         asyncio.run(_run_inside_loop())
 
-        assert sent_counter["count"] == expected_calls
+        # Every queued command is sent, then one end-of-replay reset per touched group.
+        assert replay.touched_keys == {("Vehicle", 1)}
+        assert sent_counter["count"] == expected_calls + len(replay.touched_keys)
+        assert replay.detectors_reset is True
 
     @patch("signal_replay.replay.async_send_ntcip", new_callable=AsyncMock)
     def test_send_command_uses_configured_snmp_timeout(

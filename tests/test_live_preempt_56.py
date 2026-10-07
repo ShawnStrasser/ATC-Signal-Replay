@@ -14,10 +14,15 @@ By default the tests target:
 - 13010 on localhost ports 9705-9708
 
 Override with environment variables if needed:
-- PREEMPT_TEST_HOST
-- PREEMPT_2B045_PORTS
-- PREEMPT_13010_PORTS
+- PREEMPT_TEST_HOST (emulator host, default 127.0.0.1)
+- PREEMPT_2B045_PORTS (comma-separated, default 9701,9702,9703,9704)
+- PREEMPT_13010_PORTS (comma-separated, default 9705,9706,9707,9708)
 - PREEMPT_TEST_SETTLE_SECONDS
+- PREEMPT_TEST_POLL_SECONDS
+- PREEMPT_TEST_POLL_INTERVAL_SECONDS
+
+Every test here carries the ``live`` marker and is deselected by default.
+Run with: pytest -m live tests/test_live_preempt_56.py
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import pytest
 import signal_replay as sr
 
 
-pytestmark = pytest.mark.live_device
+pytestmark = pytest.mark.live
 
 PREEMPT_ON = 102
 PREEMPT_OFF = 104

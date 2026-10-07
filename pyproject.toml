@@ -1,37 +1,68 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal_replay"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Python package for replaying high-resolution event logs from ATC signal controllers back to test controllers using NTCIP"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Shawn Strasser"}
 ]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
 
 dependencies = [
-    "pysnmp>=7.0,<8.0",
-    "duckdb",
-    "pandas",
-    "dtaidistance",
-    "jinja2",
-    "openpyxl",
-    "requests",
-    "matplotlib",
-    "pyyaml",
-    "atspm",
-    "pyarrow",
-    "psutil",
+    "pysnmp>=7.0,<8",
+    "duckdb>=1.1,<2",
+    "pandas>=2.0,<3",
+    "numpy>=1.24",
+    "pyarrow>=14",
+    "dtaidistance>=2.3,<3",
+    "jinja2>=3",
+    "matplotlib>=3.7",
+    # Imported lazily, only by generate_timeline().
+    "atspm>=2.5,<3",
+    # Imported lazily, only by the built-in MAXTIME HTTP event log fetch.
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]
+# report.load_annotations() reads YAML annotation files.
+yaml = [
+    "pyyaml>=6",
+]
+# Memory usage in DEBUG-level collector logs.
+diagnostics = [
+    "psutil>=5.9",
+]
+# Extra packages used by software_validation/software_validate.py.
+validation = [
+    "openpyxl>=3.1",
+    "pyyaml>=6",
+    "psutil>=5.9",
+]
 dev = [
+    "signal_replay[validation]",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0",
+    "build>=1.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
@@ -41,21 +72,35 @@ Homepage = "https://github.com/ShawnStrasser/ATC-Signal-Replay"
 Documentation = "https://github.com/ShawnStrasser/ATC-Signal-Replay#readme"
 Repository = "https://github.com/ShawnStrasser/ATC-Signal-Replay"
 Issues = "https://github.com/ShawnStrasser/ATC-Signal-Replay/issues"
+Changelog = "https://github.com/ShawnStrasser/ATC-Signal-Replay/blob/main/CHANGELOG.md"
+"Integration Guide" = "https://github.com/ShawnStrasser/ATC-Signal-Replay/blob/main/docs/integration.md"
+
+[tool.setuptools.dynamic]
+version = {attr = "signal_replay.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-signal_replay = ["sql/*.sql"]
+signal_replay = ["sql/*.sql", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Live tests send SNMP/HTTP to a real controller. They never run unless selected
+# explicitly with `pytest -m live` (see README, "Running the tests").
+addopts = "-m 'not live'"
+markers = [
+    "live: sends SNMP/HTTP to a real or emulated controller; deselected by default, run with -m live",
+]
 
 [tool.black]
 line-length = 100
-target-version = ["py39", "py310", "py311", "py312"]
+target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
 ignore = ["E501"]

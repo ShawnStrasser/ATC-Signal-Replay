@@ -2,30 +2,55 @@
 Main orchestrator for ATC Signal Replay simulations.
 """
 
+import logging
 import threading
 import time
-from copy import copy
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Union, Tuple, Set
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 import pandas as pd
 
 from .config import SimulationConfig, SignalConfig
-from .replay import SignalReplay, create_replays
-from .collector import DatabaseManager, DataCollector, fetch_output_data, check_conflicts, _log_memory
+from .replay import SignalReplay, source_time_from_info
+from .collector import ConflictRecord, DatabaseManager, DataCollector, _log_memory
+from .events import CollectionTarget, required_event_codes
 from .latency import AdaptiveLatencyOffsetManager
 from .comparison import (
-    compare_all_runs, 
-    format_comparison_summary, 
+    compare_all_runs,
+    format_comparison_summary,
     ComparisonResult,
     ComparisonThresholds,
-    compare_runs,
-    compare_and_visualize,
     store_comparison_result,
     generate_timeline,
     prepare_events_for_comparison,
 )
+from ._logging import debug_level, log_to_file, run_in_log_context
+from .progress import ProgressCallback, ProgressReporter, Stage, StatusTracker
+from .results import ReplicationResult, RunRecord, new_run_uuid
+from .workspace import PLOTS_DIR_NAME, REPLAY_DB_NAME, RUN_LOG_NAME, resolve_work_dir, write_manifest
+
+logger = logging.getLogger(__name__)
+
+#: Values of ``results['stop_reason']`` returned by :meth:`ATCSimulation.run`.
+STOP_REASONS = ('completed', 'conflict', 'cancelled', 'collection_error', 'all_signals_failed')
+
+# How long a cancelled run waits for the background collection thread before
+# abandoning it (it is a daemon thread and discards anything it fetches later).
+_CANCEL_COLLECTION_JOIN_SECONDS = 1.0
+# How often the main thread wakes while waiting, so Ctrl+C is seen on Windows.
+_MAIN_WAIT_SECONDS = 0.25
+# SimulationConfig's default database path (relative to the current directory).
+_DEFAULT_DB_PATH = "./atc_replay.db"
+# Run status -> simulation_runs / RunRecord status.
+_RECORD_STATUS = {
+    'completed': 'completed',
+    'incomplete': 'incomplete',
+    'cancelled': 'cancelled',
+    'collection_error': 'failed',
+    'all_signals_failed': 'failed',
+}
 
 
 def _load_events(events: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
@@ -98,6 +123,38 @@ def _signals_have_events(signals: List[SignalConfig]) -> bool:
     return all(signal.events is not None for signal in signals)
 
 
+def _is_missing(value: Any) -> bool:
+    """True for None, NaN and NaT (values read back from a DataFrame row)."""
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+class _CancelView:
+    """Stop flag for the final collection: set once the simulation is cancelled.
+
+    Reading it also picks up the caller's shared stop event.
+    """
+
+    def __init__(self, sim: "ATCSimulation"):
+        self._sim = sim
+
+    def is_set(self) -> bool:
+        return self._sim._is_cancelled()
+
+    def wait(self, timeout: float) -> bool:
+        step = min(timeout, _MAIN_WAIT_SECONDS)
+        if self._sim._stop_event.is_set():
+            # Set by a non-cancel stop (conflict): do not spin.
+            time.sleep(step)
+        else:
+            self._sim._stop_event.wait(step)
+        return self.is_set()
+
+
 class ATCSimulation:
     """
     Main orchestrator for multi-signal ATC replay simulations.
@@ -132,7 +189,7 @@ class ATCSimulation:
         events: Union[pd.DataFrame, str, Path, None] = None,
         replays: int = 1,
         stop_on_conflict: bool = True,
-        db_path: str = "./atc_replay.db",
+        db_path: Optional[str] = None,
         simulation_speed: float = 1.0,
         collection_interval_minutes: float = 5.0,
         post_replay_settle_seconds: float = 10.0,
@@ -147,7 +204,17 @@ class ATCSimulation:
         comparison_thresholds: Optional[ComparisonThresholds] = None,
         output_dir: Optional[Union[str, Path]] = None,
         skip_comparison: bool = False,
-        debug: bool = False
+        debug: bool = False,
+        stop_event: Optional[threading.Event] = None,
+        stop_grace_seconds: float = 8.0,
+        detector_reset_timeout_seconds: float = 5.0,
+        cancel_final_poll_seconds: float = 3.0,
+        event_source: Any = None,
+        final_collection_timeout_seconds: float = 900.0,
+        final_collection_poll_seconds: float = 20.0,
+        on_progress: Optional[ProgressCallback] = None,
+        work_dir: Optional[Union[str, Path]] = None,
+        run_log: bool = False,
     ):
         """
         Initialize the ATC simulation.
@@ -159,7 +226,9 @@ class ATCSimulation:
                 Events are automatically filtered and distributed to signals by device_id.
             replays: Number of simulation runs (streamlined pattern)
             stop_on_conflict: Stop before the next run when a conflict is detected after final end-of-run collection
-            db_path: Path to DuckDB database
+            db_path: Path to the working DuckDB database. Default:
+                ``<work_dir>/replay.duckdb`` when ``work_dir`` is given,
+                else ``./atc_replay.db`` (relative to the current directory)
             simulation_speed: Speed multiplier (1.0 = real-time)
             collection_interval_minutes: How often to poll controller event logs
             post_replay_settle_seconds: Wait after replay before final collection
@@ -175,11 +244,56 @@ class ATCSimulation:
             skip_comparison: If True, skip the post-replay comparison analysis.
                 Useful when comparison is done separately (e.g., in a report step).
             debug: Enable debug output
+            stop_event: Optional ``threading.Event`` shared with the caller (for
+                example a GUI Cancel button or a BatchRunner). Setting it cancels
+                the simulation exactly like :meth:`request_stop`, and
+                :meth:`request_stop` sets it, so one event can cover several
+                simulations. A conflict stop does not set it.
+            stop_grace_seconds: Streamlined-pattern value for
+                ``SimulationConfig.stop_grace_seconds``
+            detector_reset_timeout_seconds: Streamlined-pattern value for
+                ``SimulationConfig.detector_reset_timeout_seconds``
+            cancel_final_poll_seconds: Streamlined-pattern value for
+                ``SimulationConfig.cancel_final_poll_seconds``
+            event_source: Streamlined-pattern value for ``SimulationConfig.event_source``:
+                where output events come from (None = MAXTIME HTTP event log)
+            final_collection_timeout_seconds: Streamlined-pattern value for
+                ``SimulationConfig.final_collection_timeout_seconds``
+            final_collection_poll_seconds: Streamlined-pattern value for
+                ``SimulationConfig.final_collection_poll_seconds``
+            on_progress: Optional callback receiving
+                :class:`~signal_replay.ProgressEvent` objects (SETUP,
+                STORE_INPUT, RUN_START, DETECTOR_RESET, WAITING, REPLAY,
+                COLLECT, FINAL_COLLECTION, CONFLICT, SIGNAL_FAILED,
+                RUN_COMPLETE, COMPARE, PLOT, then one of DONE, CANCELLED or
+                ERROR). It is called on the package's worker threads, not the
+                caller's; a GUI must hand events to its UI thread itself.
+                Exceptions raised by the callback are logged and ignored.
+                :meth:`get_status` gives the same information on demand.
+            work_dir: Optional working folder owned by the caller. Every
+                file goes under it with a fixed name (``replay.duckdb``,
+                ``plots/``, ``run.log`` when ``run_log`` is True, and
+                ``manifest.json``); nothing is derived from the current
+                directory. No file stays open after :meth:`run` returns,
+                so the folder can be deleted. See
+                :mod:`signal_replay.workspace`.
+            run_log: With ``work_dir``, copy this package's log records to
+                ``<work_dir>/run.log`` while :meth:`run` executes.
         """
+        self._status = StatusTracker()
+        self._progress = ProgressReporter(on_progress, log=logger, status=self._status)
         self.debug = debug
         self.skip_comparison = skip_comparison
         self.comparison_thresholds = comparison_thresholds or ComparisonThresholds()
+        #: Identifier of this simulation's run() (see ReplicationResult.run_uuid).
+        self.run_uuid: str = new_run_uuid()
+        self.work_dir: Optional[Path] = resolve_work_dir(work_dir) if work_dir is not None else None
+        self.run_log = bool(run_log)
+        if output_dir is None and self.work_dir is not None:
+            output_dir = self.work_dir / PLOTS_DIR_NAME
         self.output_dir = Path(output_dir) if output_dir else None
+        if db_path is None:
+            db_path = str(self.work_dir / REPLAY_DB_NAME) if self.work_dir is not None else _DEFAULT_DB_PATH
         
         # Handle legacy vs streamlined initialization
         if config is not None:
@@ -193,6 +307,8 @@ class ATCSimulation:
                 raise ValueError(
                     "SimulationConfig.events is None, but one or more signals are missing an event source"
                 )
+            if self.work_dir is not None and config.db_path == _DEFAULT_DB_PATH:
+                config.db_path = db_path
             self.config = config
         else:
             # Streamlined pattern: kwargs provided
@@ -225,36 +341,78 @@ class ATCSimulation:
                 replay_latency_offset_lookback_min=replay_latency_offset_lookback_min,
                 replay_latency_offset_update_min=replay_latency_offset_update_min,
                 replay_latency_offset_min_samples=replay_latency_offset_min_samples,
+                stop_grace_seconds=stop_grace_seconds,
+                detector_reset_timeout_seconds=detector_reset_timeout_seconds,
+                cancel_final_poll_seconds=cancel_final_poll_seconds,
+                event_source=event_source,
+                final_collection_timeout_seconds=final_collection_timeout_seconds,
+                final_collection_poll_seconds=final_collection_poll_seconds,
             )
 
         if any(sig.tod_align for sig in self.config.signals) and self.config.simulation_speed != 1.0:
             raise ValueError("simulation_speed must be 1.0 when any signal uses tod_align=True")
 
+        self._progress.set_context(total_runs=self.config.simulation_replays)
+        self._progress.emit(
+            Stage.SETUP,
+            f"Setting up simulation: {len(self.config.signals)} signal(s), "
+            f"{self.config.simulation_replays} run(s)",
+            log=False,
+            extra={"device_ids": [str(sig.device_id) for sig in self.config.signals],
+                   "db_path": str(self.config.db_path)},
+        )
+
         # State tracking used by replay setup and run-time shutdown.
         self._current_run: int = 0
         self._simulation_start_time: Optional[datetime] = None
+        # _stop_event stops this simulation's replays (cancel, conflict or
+        # collection error). _external_stop_event is the caller's cancel token.
         self._stop_event: threading.Event = threading.Event()
+        self._external_stop_event: Optional[threading.Event] = stop_event
+        self._stop_lock = threading.Lock()
+        self._stop_reason: Optional[str] = None
+        self._cancel_requested = False
+        self._run_stop_event: Optional[threading.Event] = None
+        self._run_ctx: Optional[Dict[str, Any]] = None
+        self._active_replays: Dict[str, SignalReplay] = {}
+        self._detectors_reset: Dict[str, bool] = {}
+        self._cancelled_run: Optional[int] = None
+        self.last_results: Optional[Dict[str, Any]] = None
         self._conflicts_found: List[Dict[str, Any]] = []
         self._conflict_keys: Set[Tuple[str, int, str]] = set()
         self._completed_runs: List[int] = []
+        self._incomplete_runs: List[int] = []
+        self._collection_health_by_run: Dict[int, Dict[str, Dict[str, Any]]] = {}
         self._failed_signals_by_run: Dict[int, List[str]] = {}
         self._comparison_results: Optional[Dict[str, List[ComparisonResult]]] = None
-        self._progress_line_active = False
-        self._progress_line_width = 0
-        
+        self._conflict_records: List[ConflictRecord] = []
+        # Conflicts stored by an earlier call for runs that were already done.
+        self._prior_conflict_records: List[ConflictRecord] = []
+        self._prior_completed_runs: List[int] = []
+        # Devices recorded for the current run (None: all signals).
+        self._run_devices: Optional[List[str]] = None
+        self._run_records: Dict[Tuple[str, int], RunRecord] = {}
+        self._runs_attempted = 0
+        self._conflict_store_errors: List[str] = []
+        self._started_at: Optional[datetime] = None
+        #: The typed result of the last :meth:`run` (also returned by it).
+        self.result: Optional[ReplicationResult] = None
+
         # Initialize database
         self.db = DatabaseManager(self.config.db_path)
+        self._safe_db_call('set_meta', 'run_uuid', self.run_uuid)
         
         # Determine starting run number using completed runs so interrupted runs
         # resume to the requested total instead of adding a fresh batch.
         self._run_offset = self.db.get_max_run_number(device_ids=[sig.device_id for sig in self.config.signals])
         if self._run_offset > 0:
-            print(f"Existing completed runs found in database: {self._run_offset}")
+            logger.info("Existing completed runs found in database: %d", self._run_offset)
+            self._progress.set_context(run_number=self._run_offset)
         
         # Store input events for comparison
         t0 = time.time()
         self._store_input_events()
-        print(f"  Input events stored in {time.time() - t0:.1f}s")
+        logger.info("Input events stored in %.1fs", time.time() - t0)
 
         # Free centralized events DataFrame (individual signals have their own sources)
         if isinstance(self.config.events, pd.DataFrame):
@@ -271,7 +429,16 @@ class ATCSimulation:
         """
         self._cached_durations: Dict[str, float] = {}
         
-        for signal_config in self.config.signals:
+        total = len(self.config.signals)
+        for index, signal_config in enumerate(self.config.signals, start=1):
+            self._progress.emit(
+                Stage.STORE_INPUT,
+                f"[{signal_config.device_id}] Preparing replay and storing input events",
+                device_id=signal_config.device_id,
+                index=index,
+                total=total,
+                log=False,
+            )
             replay = SignalReplay(
                 signal_config,
                 simulation_speed=self.config.simulation_speed,
@@ -316,54 +483,351 @@ class ATCSimulation:
             progress_log_interval_seconds=self.config.progress_log_interval_seconds,
             stop_event=self._stop_event,
             latency_offset_provider=latency_offset_provider,
-            debug=self.debug
+            detector_reset_timeout_seconds=self.config.detector_reset_timeout_seconds,
+            debug=self.debug,
+            on_progress=self._progress,
         )
+        self._active_replays[signal_config.device_id] = replay
         try:
             return replay.run()
         finally:
             replay.release_cached_data(keep_activation_feed=False)
 
-    def request_stop(self) -> None:
-        """Request cooperative shutdown of collectors and replay workers."""
+    def request_stop(self, reason: str = 'user') -> None:
+        """Cancel the simulation. Thread-safe; returns immediately.
+
+        Replays stop within about 0.25 s, queued SNMP sends are dropped, every
+        detector group that was driven is reset to 0, and :meth:`run` returns
+        a result with ``cancelled=True`` and ``stop_reason='cancelled'``
+        (normally within a second; at most about ``stop_grace_seconds`` plus
+        ``detector_reset_timeout_seconds``). The run in progress is recorded
+        as 'cancelled', not completed, so a resume runs it again.
+
+        Args:
+            reason: Free-text cancel reason reported as ``cancel_reason``
+                (``'user'`` by default; Ctrl+C uses ``'keyboard_interrupt'``).
+        """
+        self._set_stop(reason, cancel=True)
+
+    def _set_stop(self, reason: str, cancel: bool) -> None:
+        """Record the first stop reason and set every stop flag for this simulation."""
+        with self._stop_lock:
+            if self._stop_reason is None:
+                self._stop_reason = reason
+                self._cancel_requested = cancel
+                if cancel:
+                    logger.warning("Stop requested (%s)", reason)
         self._stop_event.set()
-    
+        if cancel:
+            self._status.set_state('stopping', stop_reason=reason)
+        if cancel and self._external_stop_event is not None:
+            self._external_stop_event.set()
+        run_stop_event = self._run_stop_event
+        if run_stop_event is not None and (cancel or reason == 'collection_error'):
+            run_stop_event.set()
+
+    def _should_stop(self) -> bool:
+        """Return True once any stop was requested, picking up the caller's event."""
+        external = self._external_stop_event
+        if external is not None and external.is_set() and not self._stop_event.is_set():
+            self.request_stop('user')
+        return self._stop_event.is_set()
+
+    def _is_cancelled(self) -> bool:
+        """True when the stop came from request_stop / Ctrl+C / the shared event."""
+        self._should_stop()
+        return self._cancel_requested
+
+    def _on_collection_fatal_error(self, exc: BaseException) -> None:
+        """Collector callback: stop the replay as soon as collection has failed."""
+        self._set_stop('collection_error', cancel=False)
+
+    def _wait_stoppable(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``; return False early if a stop is requested."""
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            if self._should_stop():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            self._stop_event.wait(min(remaining, _MAIN_WAIT_SECONDS))
+
+    def _join_bounded(self, thread: threading.Thread, timeout: float, stop_aware: bool = True) -> bool:
+        """Join ``thread`` in short steps for at most ``timeout`` seconds.
+
+        Short steps keep Ctrl+C responsive on Windows. With ``stop_aware``,
+        the join also ends early once the simulation is cancelled. Returns
+        True when the thread has finished.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        while thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if stop_aware and self._is_cancelled():
+                break
+            thread.join(min(remaining, _MAIN_WAIT_SECONDS))
+        return not thread.is_alive()
+
+    def _safe_db_call(self, method_name: str, *args: Any, **kwargs: Any) -> None:
+        """Call a DatabaseManager method, logging instead of raising on failure."""
+        method = getattr(self.db, method_name, None)
+        if method is None:
+            return
+        try:
+            method(*args, **kwargs)
+        except Exception:
+            logger.warning("Database update %s failed", method_name, exc_info=True)
+
+    def _all_device_ids(self) -> List[str]:
+        return [str(sig.device_id) for sig in self.config.signals]
+
+    def _device_ids(self) -> List[str]:
+        """Devices recorded for the current run (all, unless a resume re-runs some)."""
+        if self._run_devices is not None:
+            return list(self._run_devices)
+        return self._all_device_ids()
+
+    def _done_runs_by_device(self) -> Dict[str, Set[int]]:
+        """Run numbers already done per device in the working database."""
+        devices = self._all_device_ids()
+        reader = getattr(self.db, 'get_done_runs_by_device', None)
+        if callable(reader):
+            try:
+                return {str(d): set(runs) for d, runs in reader(devices).items()}
+            except Exception:
+                logger.warning("Could not read done runs per device", exc_info=True)
+        return {d: set(range(1, self._run_offset + 1)) for d in devices}
+
+    def _run_plan(self, done: Dict[str, Set[int]]) -> List[Tuple[int, List[str]]]:
+        """(run_number, devices to run) for every run up to the target not done for some device."""
+        devices = self._all_device_ids()
+        plan = []
+        for run_num in range(1, self.config.simulation_replays + 1):
+            needed = [d for d in devices if run_num not in done.get(d, set())]
+            if needed:
+                plan.append((run_num, needed))
+        return plan
+
+    def _load_prior_conflicts(self, done: Dict[str, Set[int]]) -> None:
+        """Load conflicts stored by earlier calls for runs that are already done."""
+        self._prior_conflict_records = []
+        getter = getattr(self.db, 'get_conflicts', None)
+        if not callable(getter):
+            return
+        for device_id, runs in done.items():
+            if not runs:
+                continue
+            try:
+                frame = getter(device_id=device_id)
+            except Exception:
+                logger.warning("Could not read stored conflicts for %s", device_id, exc_info=True)
+                continue
+            if frame is None or frame.empty:
+                continue
+            for row in frame.to_dict('records'):
+                if row.get('run_number') is None or int(row['run_number']) not in runs:
+                    continue
+                clean = {k: (None if _is_missing(v) else v) for k, v in row.items()}
+                clean = {k: v for k, v in clean.items() if v is not None}
+                try:
+                    record = ConflictRecord.from_dict(clean)
+                except Exception:
+                    logger.debug("Skipping unreadable stored conflict %r", row, exc_info=True)
+                    continue
+                record.run_number = int(record.run_number)
+                if record.occurrences is not None:
+                    record.occurrences = int(record.occurrences)
+                key = (str(record.device_id), record.run_number, record.conflict_details)
+                if key in self._conflict_keys:
+                    continue
+                self._conflict_keys.add(key)
+                self._prior_conflict_records.append(record)
+        if self._prior_conflict_records:
+            logger.info(
+                "%d conflict(s) already stored from earlier runs in %s",
+                len(self._prior_conflict_records), self.config.db_path,
+            )
+
+    def _source_time(self, device_id: str, run_number: int, timestamp: datetime) -> Optional[datetime]:
+        """Collected timestamp -> matching moment in the source log (None if unknown)."""
+        record = self._run_records.get((str(device_id), int(run_number)))
+        if record is not None:
+            return record.source_time(timestamp)
+        if int(run_number) == self._current_run:
+            for key, replay in list(self._active_replays.items()):
+                if str(key) == str(device_id):
+                    return source_time_from_info(getattr(replay, 'replay_info', None) or {}, timestamp)
+        return None
+
+    def _record_run(self, run_num: int, status: str) -> None:
+        """Keep one RunRecord per device for ``run_num`` and store its timing."""
+        record_status = _RECORD_STATUS.get(status, 'failed')
+        failed = {str(d) for d in self._failed_signals_by_run.get(run_num, [])} & set(self._device_ids())
+        replays = {str(k): v for k, v in self._active_replays.items()} if self._current_run == run_num else {}
+        for device_id in self._device_ids():
+            info = dict(getattr(replays.get(device_id), 'replay_info', None) or {})
+            reset = self._detectors_reset.get(device_id)
+            record = RunRecord(
+                device_id=device_id,
+                run_number=run_num,
+                status='failed' if device_id in failed else record_status,
+                replay_start=info.get('replay_start'),
+                replay_end=info.get('replay_end'),
+                source_start=info.get('source_start'),
+                source_end=info.get('source_end'),
+                date_shift_seconds=info.get('date_shift_seconds'),
+                events_sent=info.get('events_sent'),
+                events_total=info.get('events_total'),
+                mode=info.get('mode'),
+                speed=float(info.get('speed') or self.config.simulation_speed),
+                detectors_reset=None if reset is None else bool(reset),
+            )
+            self._run_records[(device_id, run_num)] = record
+            self._safe_db_call(
+                'update_run_details', run_num, device_id,
+                run_uuid=self.run_uuid,
+                replay_start=record.replay_start,
+                replay_end=record.replay_end,
+                source_start=record.source_start,
+                source_end=record.source_end,
+                date_shift_seconds=record.date_shift_seconds,
+                events_sent=record.events_sent,
+                events_total=record.events_total,
+            )
+        if failed and record_status in ('completed', 'incomplete'):
+            # A device whose replay failed did not run: resume runs it again.
+            self._safe_db_call('mark_run_failed', run_num, device_ids=sorted(failed))
+
     def _run_all_signals(
         self,
         latency_offset_provider: Optional[AdaptiveLatencyOffsetManager] = None,
     ) -> Tuple[Dict[str, datetime], List[str]]:
         """
         Run replay for all signals in parallel and return start times.
-        
-        This method BLOCKS until all signal replays have completed.
-        Multiple signals run in parallel via ThreadPoolExecutor, but this
-        method waits for all of them to finish before returning.
-        
+
+        Blocks until every replay has finished, but the main thread wakes
+        every 0.25 s, so Ctrl+C and stop requests are seen promptly (a
+        wait with no timeout cannot be interrupted on Windows). After a stop,
+        workers get ``stop_grace_seconds`` to finish (they reset their
+        detectors on the way out); any still running are then abandoned and
+        a safety-net detector reset is sent for them.
+
+        The first Ctrl+C becomes ``request_stop('keyboard_interrupt')``; a
+        second one stops waiting for the workers and goes straight to the
+        safety-net reset.
+
         Individual signal failures are logged but do not abort other signals.
         """
-        start_times = {}
-        failed_signals = []
-        
-        with ThreadPoolExecutor(max_workers=len(self.config.signals)) as executor:
-            futures = {
-                executor.submit(self._run_single_signal, sig, latency_offset_provider): sig.device_id
-                for sig in self.config.signals
-            }
-            
-            for future in as_completed(futures):
-                device_id = futures[future]
+        start_times: Dict[str, datetime] = {}
+        failed_signals: List[str] = []
+        signals = self.config.signals
+        self._active_replays = {}
+
+        executor = ThreadPoolExecutor(max_workers=len(signals), thread_name_prefix='replay')
+        futures: Dict[Any, str] = {}
+        pending: set = set()
+        interrupts = 0
+        try:
+            for sig in signals:
+                futures[executor.submit(run_in_log_context(self._run_single_signal), sig, latency_offset_provider)] = sig.device_id
+            pending = set(futures)
+            deadline: Optional[float] = None
+            while pending:
                 try:
-                    start_time = future.result()
-                    start_times[device_id] = start_time
-                except Exception as exc:
-                    failed_signals.append(device_id)
-                    print(f"*** Signal {device_id} failed: {exc}")
-        
+                    done, pending = wait(pending, timeout=_MAIN_WAIT_SECONDS, return_when=FIRST_COMPLETED)
+                except KeyboardInterrupt:
+                    interrupts += 1
+                    if interrupts == 1:
+                        logger.warning("Keyboard interrupt received. Stopping active replays...")
+                        self.request_stop('keyboard_interrupt')
+                        continue
+                    logger.warning("Second keyboard interrupt; no longer waiting for replay workers")
+                    break
+
+                for future in done:
+                    device_id = futures[future]
+                    try:
+                        start_times[device_id] = future.result()
+                    except Exception as exc:
+                        failed_signals.append(device_id)
+                        self._progress.emit(
+                            Stage.SIGNAL_FAILED,
+                            f"*** Signal {device_id} failed: {exc}",
+                            level=logging.ERROR,
+                            device_id=device_id,
+                            extra={"error": str(exc)},
+                        )
+
+                if pending and self._should_stop():
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + self.config.stop_grace_seconds
+                    elif now >= deadline:
+                        logger.warning(
+                            "%d replay worker(s) did not stop within %.1fs; abandoning them",
+                            len(pending), self.config.stop_grace_seconds,
+                        )
+                        break
+        finally:
+            abandoned = [futures[f] for f in pending if not f.done()]
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._record_detector_resets(abandoned)
+
         if failed_signals:
-            print(f"\n*** {len(failed_signals)}/{len(self.config.signals)} signals failed: "
-                  f"{', '.join(failed_signals)}")
-            print(f"    Continuing with {len(start_times)} successful signals.")
-        
+            logger.warning(
+                "*** %d/%d signals failed: %s. Continuing with %d successful signals.",
+                len(failed_signals), len(self.config.signals),
+                ", ".join(failed_signals), len(start_times),
+            )
+
         return start_times, failed_signals
+
+    def _record_detector_resets(self, abandoned: List[str]) -> None:
+        """Record each replay's end-of-run reset; run a safety-net reset where it never ran.
+
+        A replay that finished reports True/False itself. One that was
+        abandoned (or died before its reset) reports None; for those the
+        touched groups are reset from here, in parallel, within
+        ``detector_reset_timeout_seconds``.
+        """
+        needs_reset: List[Tuple[str, SignalReplay]] = []
+        for device_id, replay in list(self._active_replays.items()):
+            status = replay.detectors_reset
+            if status is None:
+                needs_reset.append((device_id, replay))
+            else:
+                self._detectors_reset[device_id] = bool(status)
+
+        if not needs_reset:
+            return
+
+        budget = self.config.detector_reset_timeout_seconds
+        outcome: Dict[str, bool] = {}
+
+        def _reset(device_id: str, replay: SignalReplay) -> None:
+            outcome[device_id] = replay.reset_touched_groups_blocking(budget=budget)
+
+        threads = []
+        for device_id, replay in needs_reset:
+            if device_id in abandoned:
+                logger.warning("[%s] Replay worker abandoned; sending safety-net detector reset", device_id)
+            thread = threading.Thread(
+                target=run_in_log_context(_reset), args=(device_id, replay), name=f"safety-reset-{device_id}", daemon=True
+            )
+            thread.start()
+            threads.append(thread)
+        deadline = time.monotonic() + budget + 1.5
+        for thread in threads:
+            while thread.is_alive() and time.monotonic() < deadline:
+                try:
+                    thread.join(_MAIN_WAIT_SECONDS)
+                except KeyboardInterrupt:
+                    self.request_stop('keyboard_interrupt')
+                    logger.warning("Keyboard interrupt during detector reset; finishing reset first")
+        for device_id, _replay in needs_reset:
+            self._detectors_reset[device_id] = outcome.get(device_id, False)
     
     def _get_estimated_duration(self) -> float:
         """Get estimated simulation duration in seconds.
@@ -397,6 +861,7 @@ class ATCSimulation:
     
     def _on_conflict_detected(self, conflicts: List) -> None:
         """Callback when conflicts are detected."""
+        new_by_device: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
         for conflict in conflicts:
             conflict_key = (
                 conflict.device_id,
@@ -406,8 +871,16 @@ class ATCSimulation:
             if conflict_key in self._conflict_keys:
                 continue
 
-            # Create conflict dict
-            conflict_dict = {
+            if getattr(conflict, 'source_equivalent_timestamp', None) is None and hasattr(conflict, 'source_equivalent_timestamp'):
+                try:
+                    conflict.source_equivalent_timestamp = self._source_time(
+                        conflict.device_id, conflict.run_number, conflict.timestamp
+                    )
+                except Exception:
+                    logger.debug("Source time mapping failed", exc_info=True)
+
+            as_legacy = getattr(conflict, 'as_legacy_dict', None)
+            conflict_dict = as_legacy() if callable(as_legacy) else {
                 'device_id': conflict.device_id,
                 'run_number': conflict.run_number,
                 'timestamp': conflict.timestamp,
@@ -416,235 +889,655 @@ class ATCSimulation:
 
             self._conflict_keys.add(conflict_key)
             self._conflicts_found.append(conflict_dict)
-        
+            self._conflict_records.append(conflict)
+            new_by_device.setdefault((conflict.device_id, conflict.run_number), []).append(conflict_dict)
+
+        for (device_id, run_number), found in new_by_device.items():
+            self._progress.emit(
+                Stage.CONFLICT,
+                f"[{device_id}] {len(found)} conflict(s) in run {run_number}: "
+                + "; ".join(str(c['conflict_details']) for c in found[:3])
+                + (" ..." if len(found) > 3 else ""),
+                level=logging.WARNING,
+                device_id=device_id,
+                run_number=run_number,
+                log=False,
+                extra={"conflicts": found, "stop_on_conflict": bool(self.config.stop_on_conflict)},
+            )
+
         if self.config.stop_on_conflict:
-            self._stop_event.set()
+            self._set_stop('conflict', cancel=False)
 
-    def _update_progress_line(self, message: str) -> None:
-        """Update a single transient progress line for notebook-friendly output."""
-        self._progress_line_width = max(self._progress_line_width, len(message))
-        print(f"\r{message.ljust(self._progress_line_width)}", end="", flush=True)
-        self._progress_line_active = True
+    def get_status(self) -> Dict[str, Any]:
+        """Thread-safe, JSON-safe snapshot of the simulation's progress.
 
-    def _finish_progress_line(self) -> None:
-        """Terminate the transient progress line before normal output."""
-        if self._progress_line_active:
-            print()
-            self._progress_line_active = False
-    
-    def run(self) -> Dict[str, Any]:
+        Safe to call from any thread at any time (for example from a REST
+        handler while :meth:`run` executes on a worker thread). Keys are
+        described in :class:`~signal_replay.progress.StatusTracker`;
+        ``state`` is one of ``idle``, ``running``, ``stopping``,
+        ``cancelled``, ``completed`` or ``failed``.
+        """
+        status = self._status.snapshot()
+        status["kind"] = "simulation"
+        return status
+
+    def run(self) -> ReplicationResult:
         """
         Run the complete simulation.
-        
+
         Executes all configured replay runs, collects data,
         checks for conflicts, and runs comparison analysis.
-        
+
+        Cancelling: call :meth:`request_stop` from another thread (or set the
+        ``stop_event`` passed to the constructor). ``run()`` then returns
+        normally with ``cancelled=True``. Ctrl+C in the thread running
+        ``run()`` triggers the same clean stop (replays stopped, detectors
+        reset, run recorded as cancelled) and then re-raises
+        ``KeyboardInterrupt``; the result is still available as
+        :attr:`last_results`.
+
         Returns:
-            Dict with simulation results including:
-            - completed_runs: List of completed run numbers
+            A :class:`~signal_replay.ReplicationResult` (also kept as
+            :attr:`result`). Its attributes are the typed result
+            (``replicated``, ``first_conflict_run``, ``runs`` per device,
+            ``conflicts`` as ConflictRecord objects, ``comparisons``, ...).
+            For 0.x code it is also a read-only mapping with the old keys:
+            - completed_runs: Run numbers whose replay finished and whose
+              conflict check ran (includes incomplete runs)
+            - incomplete_runs: Completed runs whose output events were not
+              confirmed complete within ``final_collection_timeout_seconds``
+              (recorded as 'incomplete'; conflict detection used the events
+              received)
             - conflicts: List of detected conflicts
             - failed_signals_by_run: Dict of run_number -> failed device IDs
-            - stopped_early: Whether simulation stopped due to conflict
-            - comparison_summary: DTW comparison summary string
+            - stopped_early: True when the simulation ended before all runs
+              (for any reason)
+            - stop_reason: One of 'completed', 'conflict', 'cancelled',
+              'collection_error', 'all_signals_failed'
+            - cancelled: True when request_stop / Ctrl+C / the shared stop
+              event cancelled the simulation
+            - cancel_reason: The reason given to request_stop, or None
+            - cancelled_run: Run number that was cut short by the cancel, or None
+            - collection_error: True when data collection failed (or every
+              signal failed)
+            - detectors_reset: {device_id: bool}, whether the end-of-replay
+              detector reset of the last run was confirmed for each device
+            - collection_health: {device_id: {...}} for the last run: polls,
+              failures, consecutive_failures, rows, first_timestamp,
+              last_timestamp, last_success, last_error, complete_through,
+              degraded
+            - collection_health_by_run: {run_number: collection_health}
+            - comparison_summary: DTW comparison summary string (comparison
+              is skipped when the simulation was cancelled)
         """
-        print(f"Starting ATC simulation with {len(self.config.signals)} signals, "
-              f"{self.config.simulation_replays} replays")
-        
+        self._status.start(total_runs=self.config.simulation_replays)
+        self._started_at = datetime.now()
+        log_scope = (
+            log_to_file(self.work_dir / RUN_LOG_NAME)
+            if self.run_log and self.work_dir is not None else nullcontext()
+        )
+        try:
+            with log_scope:
+                return self._run()
+        except KeyboardInterrupt:
+            if self._status.state in ('running', 'stopping'):
+                self._status.set_state('cancelled', stop_reason='keyboard_interrupt')
+                self._progress.emit(
+                    Stage.CANCELLED, "Simulation cancelled (keyboard_interrupt)",
+                    level=logging.WARNING, log=False,
+                )
+            raise
+        except BaseException as exc:
+            if self._status.state in ('running', 'stopping'):
+                self._status.set_state('failed', error=f"{type(exc).__name__}: {exc}")
+                self._progress.emit(
+                    Stage.ERROR, f"Simulation failed: {type(exc).__name__}: {exc}",
+                    level=logging.ERROR, log=False,
+                    extra={"final": True, "error": f"{type(exc).__name__}: {exc}"},
+                )
+            raise
+        finally:
+            self._write_manifest()
+
+    def _write_manifest(self) -> None:
+        """Refresh ``manifest.json`` in the working folder (if there is one)."""
+        if self.work_dir is None:
+            return
+        result = self.result
+        try:
+            write_manifest(
+                self.work_dir,
+                run_uuid=self.run_uuid,
+                kind="replication",
+                extra={
+                    "db_path": str(self.config.db_path),
+                    "stop_reason": result.stop_reason if result is not None else None,
+                    "state": self._status.state,
+                },
+            )
+        except Exception:
+            logger.warning("Could not write manifest.json in %s", self.work_dir, exc_info=True)
+
+    def _run(self) -> Dict[str, Any]:
+        """Body of :meth:`run`."""
+        logger.info(
+            "Starting ATC simulation with %d signals, %d replays",
+            len(self.config.signals), self.config.simulation_replays,
+        )
+
         tod_mode = any(sig.tod_align for sig in self.config.signals)
         t0 = time.time()
         estimated_duration = self._get_estimated_duration()
         duration_str = f"{int(estimated_duration // 3600):d}h {int((estimated_duration % 3600) // 60):02d}m"
         if tod_mode:
-            print(f"Replay data spans ~{duration_str} (TOD-align: events sent at real wall-clock times)")
+            logger.info(
+                "Replay data spans ~%s (TOD-align: events sent at real wall-clock times)",
+                duration_str,
+            )
         else:
-            print(f"Estimated duration per run: {duration_str} "
-                  f"(computed in {time.time() - t0:.1f}s)")
+            logger.info(
+                "Estimated duration per run: %s (computed in %.1fs)",
+                duration_str, time.time() - t0,
+            )
 
         adaptive_latency_enabled = bool(self.config.replay_latency_offset_lookback_min)
         if adaptive_latency_enabled and not tod_mode:
             raise ValueError("replay_latency_offset_lookback_min requires tod_align=True")
-        
-        # Build device configs for collector
-        # Structure: {device_id: (ip_port, incompatible_pairs, http_port)}
-        device_configs = {
-            sig.device_id: (sig.ip_port, sig.incompatible_pairs, sig.http_port)
-            for sig in self.config.signals
-        }
-        
-        # Create data collector
-        collector = DataCollector(
-            db_path=self.config.db_path,
-            device_configs=device_configs,
-            collection_interval_minutes=self.config.collection_interval_minutes,
-            stop_on_conflict=self.config.stop_on_conflict,
-            debug=self.debug
-        )
-        
+
+        collector = self._create_collector(adaptive_latency_enabled)
+
         stopped_early = False
         collection_error = False
+        stop_reason = 'completed'
 
-        if self._run_offset >= self.config.simulation_replays:
-            print(
-                f"Requested total runs already satisfied: {self._run_offset} completed, "
-                f"target was {self.config.simulation_replays}."
+        done = self._done_runs_by_device()
+        all_devices = self._all_device_ids()
+        self._prior_completed_runs = sorted(
+            set.intersection(*(done.get(d, set()) for d in all_devices)) if all_devices else set()
+        )
+        self._load_prior_conflicts(done)
+        plan = self._run_plan(done)
+        if not plan:
+            logger.info(
+                "Requested total runs already satisfied: %d completed, target was %d.",
+                self._run_offset, self.config.simulation_replays,
             )
 
-        for run_num in range(self._run_offset + 1, self.config.simulation_replays + 1):
-            
-            if self._stop_event.is_set():
+        for run_num, run_devices in plan:
+            if len(run_devices) < len(all_devices):
+                logger.info(
+                    "Run %d is done for %s; replaying it again and recording it only for %s",
+                    run_num, ", ".join(d for d in all_devices if d not in run_devices),
+                    ", ".join(run_devices),
+                )
+                self._run_devices = list(run_devices)
+            else:
+                self._run_devices = None
+            limit = getattr(collector, 'limit_to_devices', None)
+            if callable(limit):
+                limit(self._run_devices)
+
+            if self._should_stop():
                 stopped_early = True
-                self._finish_progress_line()
-                print(f"Simulation stopped early due to conflict after run {run_num - 1}")
+                stop_reason = self._stop_reason_for_result()
+                logger.warning(
+                    "Simulation stopped before run %d (%s)", run_num, self._stop_reason
+                )
                 break
 
-            self._update_progress_line(
-                f"Working on run {run_num} of {self.config.simulation_replays}"
-            )
-            _log_memory(f"[start run {run_num}]")
-            self._current_run = run_num
-            # Scope run cleanup to the active devices only so a later batch that
-            # reuses run number 1 does not erase previously collected devices.
-            self.db.clear_run_data(
-                run_num,
-                device_ids=[sig.device_id for sig in self.config.signals],
-            )
-            self.db.mark_run_started(run_num)
-            
-            # Reset stop event for this run
-            run_stop_event = threading.Event()
-            collection_error_event = threading.Event()
-            
-            # Start data collection in background thread
-            latency_manager = None
-            if adaptive_latency_enabled:
-                latency_manager = AdaptiveLatencyOffsetManager(
-                    db_manager=self.db,
-                    run_number=run_num,
-                    device_ids=[sig.device_id for sig in self.config.signals],
-                    initial_offset_seconds=self.config.signals[0].replay_latency_offset_seconds,
-                    lookback_minutes=float(self.config.replay_latency_offset_lookback_min),
-                    min_samples=self.config.replay_latency_offset_min_samples,
-                    debug=self.debug,
-                )
-
-            collection_kwargs: Dict[str, Any] = {"error_event": collection_error_event}
-            if latency_manager is not None:
-                collection_kwargs["after_collect_callback"] = latency_manager.update_after_poll
-
-            collection_thread = threading.Thread(
-                target=collector.run_collection_loop,
-                args=(run_num, datetime.now(), run_stop_event, self._on_conflict_detected),
-                kwargs=collection_kwargs,
-                daemon=True
-            )
-            collection_thread.start()
-            
-            # Run all signals - this BLOCKS until all replays complete
-            # No additional sleep needed since _run_all_signals waits for completion
+            status = 'failed'
             try:
-                start_times, failed_signals = self._run_all_signals(latency_manager)
+                status = self._execute_run(run_num, collector, adaptive_latency_enabled)
             except KeyboardInterrupt:
-                self._finish_progress_line()
-                print("Keyboard interrupt received. Stopping active replays...")
-                self.request_stop()
-                run_stop_event.set()
-                collection_thread.join(timeout=10)
-                raise
-            if failed_signals:
-                self._failed_signals_by_run[run_num] = failed_signals
-                self._finish_progress_line()
-                print(
-                    f"Run {run_num} signal failures: "
-                    + ", ".join(failed_signals)
-                )
-            self._simulation_start_time = min(start_times.values()) if start_times else datetime.now()
+                # Ctrl+C outside the replay wait (e.g. during collection or DB work).
+                logger.warning("Keyboard interrupt received. Stopping simulation...")
+                self.request_stop('keyboard_interrupt')
+                self._abandon_run_after_interrupt(run_num)
+                status = 'cancelled'
+            finally:
+                self._record_collection_health(run_num, collector)
+                self._record_run(run_num, status)
 
-            if not start_times:
-                self._finish_progress_line()
-                print(f"*** Aborting run {run_num}: all signals failed.")
-                stopped_early = True
-                collection_error = True
-                run_stop_event.set()
-                collection_thread.join(timeout=60)
-                break
-            
-            # Check if collection thread hit a fatal error during replay
-            if collection_error_event.is_set():
-                self._finish_progress_line()
-                print("*** Aborting: data collection failed (controller unreachable).")
-                stopped_early = True
-                collection_error = True
-                break
-            
-            # Stop collection for this run
-            run_stop_event.set()
-            collection_thread.join(timeout=60)
-            
-            # Ensure collection thread has fully released file handles
-            if collection_thread.is_alive():
-                print("Warning: collection thread still running, waiting for it to finish...")
-                collection_thread.join(timeout=120)
-
-            if self.config.post_replay_settle_seconds > 0:
-                time.sleep(self.config.post_replay_settle_seconds)
-            
-            # Final data collection for this run (with retry for file lock release)
-            for _attempt in range(3):
-                try:
-                    collector.collect_once(
-                        run_num,
-                        self._simulation_start_time,
-                        detect_conflicts=True,
-                        conflict_callback=self._on_conflict_detected,
-                    )
+            if status in ('completed', 'incomplete'):
+                # Check if we should stop
+                if self._conflicts_found and self.config.stop_on_conflict:
+                    stopped_early = True
+                    stop_reason = 'conflict'
+                    logger.warning("Conflict detected! Stopping simulation.")
                     break
-                except Exception as e:
-                    if _attempt < 2 and "being used by another process" in str(e):
-                        print(f"  Retrying collection (file lock)...")
-                        time.sleep(5)
-                    else:
-                        raise
-            
-            self._completed_runs.append(run_num)
-            self.db.mark_run_completed(run_num)
-            _log_memory(f"[end run {run_num}]")
-            self._update_progress_line(
-                f"Working on run {run_num} of {self.config.simulation_replays}"
-            )
-            
-            # Check if we should stop
-            if self._conflicts_found and self.config.stop_on_conflict:
-                stopped_early = True
-                self._finish_progress_line()
-                print("Conflict detected! Stopping simulation.")
-                break
+                continue
 
-        self._finish_progress_line()
-        
+            stopped_early = True
+            stop_reason = status
+            if status in ('collection_error', 'all_signals_failed'):
+                collection_error = True
+            break
+
+        self._run_devices = None
+        limit = getattr(collector, 'limit_to_devices', None)
+        if callable(limit):
+            limit(None)
+
+        cancelled = self._is_cancelled()
+        if cancelled:
+            stop_reason = 'cancelled'
+            stopped_early = True
+
         # Run comparison analysis
         if collection_error:
-            print("--- Skipping comparison (collection failed) ---")
+            logger.warning("--- Skipping comparison (collection failed) ---")
+        elif cancelled:
+            logger.warning("--- Skipping comparison (simulation cancelled) ---")
         elif self.skip_comparison:
             pass  # comparison deferred to report step
         else:
-            print("--- Running Comparison Analysis ---")
+            self._progress.emit(Stage.COMPARE, "--- Running Comparison Analysis ---")
             self._run_comparison()
-        
-        # Build results
-        results = {
-            'completed_runs': self._completed_runs,
-            'conflicts': self._conflicts_found,
-            'failed_signals_by_run': self._failed_signals_by_run,
-            'stopped_early': stopped_early,
-            'collection_error': collection_error,
-            'comparison_summary': self.get_comparison_summary()
-        }
-        
+
+        close = getattr(collector, 'close', None)
+        if close is not None:
+            close()
+        self._conflict_store_errors = list(getattr(collector, 'conflict_store_errors', None) or [])
+
+        results = self._build_result(stopped_early, stop_reason, cancelled, collection_error)
+        self.last_results = results
+        self.result = results
+
         # Print summary
         self._print_summary()
-        
+        self._report_finished(results)
+
+        if cancelled and self._stop_reason == 'keyboard_interrupt':
+            # Cleanup is done; let the CLI see the Ctrl+C.
+            raise KeyboardInterrupt
+
         return results
-    
+
+    def _build_result(
+        self,
+        stopped_early: bool,
+        stop_reason: str,
+        cancelled: bool,
+        collection_error: bool,
+    ) -> ReplicationResult:
+        """Assemble the ReplicationResult of this run()."""
+        from . import __version__ as package_version
+
+        last_health_run = max(self._collection_health_by_run) if self._collection_health_by_run else None
+        all_conflicts = sorted(
+            list(self._prior_conflict_records) + list(self._conflict_records),
+            key=lambda c: (int(c.run_number), str(c.device_id), str(c.timestamp)),
+        )
+        conflict_runs = [int(c.run_number) for c in all_conflicts]
+        comparisons: List[ComparisonResult] = []
+        for device_results in (self._comparison_results or {}).values():
+            comparisons.extend(device_results)
+        runs = [self._run_records[key] for key in sorted(self._run_records, key=lambda k: (k[1], k[0]))]
+        return ReplicationResult(
+            run_uuid=self.run_uuid,
+            stop_reason=stop_reason,
+            replicated=bool(all_conflicts),
+            first_conflict_run=min(conflict_runs) if conflict_runs else None,
+            runs_attempted=self._runs_attempted,
+            runs_completed=len(self._completed_runs),
+            runs=runs,
+            conflicts=all_conflicts,
+            prior_completed_runs=list(self._prior_completed_runs),
+            comparisons=comparisons,
+            completed_runs=self._completed_runs,
+            incomplete_runs=self._incomplete_runs,
+            failed_signals_by_run=self._failed_signals_by_run,
+            stopped_early=stopped_early,
+            cancelled=cancelled,
+            cancel_reason=self._stop_reason if cancelled else None,
+            cancelled_run=self._cancelled_run,
+            collection_error=collection_error,
+            detectors_reset=dict(self._detectors_reset),
+            collection_health=(
+                self._collection_health_by_run[last_health_run] if last_health_run is not None else {}
+            ),
+            collection_health_by_run=self._collection_health_by_run,
+            conflict_store_errors=list(self._conflict_store_errors),
+            comparison_summary=self.get_comparison_summary(),
+            db_path=str(self.config.db_path),
+            work_dir=str(self.work_dir) if self.work_dir is not None else None,
+            started_at=self._started_at,
+            finished_at=datetime.now(),
+            package_version=package_version,
+        )
+
+    def _report_finished(self, results: Dict[str, Any]) -> None:
+        """Set the final status and emit the terminal DONE / CANCELLED / ERROR event."""
+        extra = {
+            "stop_reason": results['stop_reason'],
+            "completed_runs": list(results['completed_runs']),
+            "incomplete_runs": list(results['incomplete_runs']),
+            "conflicts_found": len(results['conflicts']),
+            "replicated": bool(results.get('replicated')),
+            "first_conflict_run": results.get('first_conflict_run'),
+            "run_uuid": results.get('run_uuid'),
+            "final": True,
+        }
+        if results['cancelled']:
+            self._status.set_state('cancelled', stop_reason=results['cancel_reason'])
+            self._progress.emit(
+                Stage.CANCELLED, f"Simulation cancelled ({results['cancel_reason']})",
+                level=logging.WARNING, log=False, extra=extra,
+            )
+        elif results['stop_reason'] in ('collection_error', 'all_signals_failed'):
+            self._status.set_state('failed', stop_reason=results['stop_reason'], error=results['stop_reason'])
+            self._progress.emit(
+                Stage.ERROR, f"Simulation failed ({results['stop_reason']})",
+                level=logging.ERROR, log=False, extra=extra,
+            )
+        else:
+            self._status.set_state('completed', stop_reason=results['stop_reason'])
+            self._progress.emit(
+                Stage.DONE,
+                f"Simulation complete: {len(results['completed_runs'])} run(s), "
+                f"{len(results['conflicts'])} conflict(s)",
+                log=False, extra=extra,
+            )
+
+    def _stop_reason_for_result(self) -> str:
+        """Map the recorded stop reason onto a results['stop_reason'] value."""
+        if self._cancel_requested:
+            return 'cancelled'
+        if self._stop_reason in STOP_REASONS:
+            return self._stop_reason
+        return 'cancelled'
+
+    def _execute_run(self, run_num: int, collector: DataCollector, adaptive_latency_enabled: bool) -> str:
+        """Run one replay pass and return its status.
+
+        Returns 'completed', 'cancelled', 'collection_error' or
+        'all_signals_failed'.
+        """
+        self._progress.set_context(run_number=run_num)
+        self._progress.emit(
+            Stage.RUN_START,
+            f"Working on run {run_num} of {self.config.simulation_replays}",
+            run_number=run_num,
+        )
+        _log_memory(f"[start run {run_num}]")
+        self._current_run = run_num
+        self._runs_attempted += 1
+        self._active_replays = {}
+        # Scope run cleanup to the active devices only so a later batch that
+        # reuses run number 1 does not erase previously collected devices.
+        # On a resume only the devices that are not done for this run are
+        # cleared, so stored results of devices that finished it are kept.
+        self.db.clear_run_data(run_num, device_ids=self._device_ids())
+        self.db.mark_run_started(run_num, device_ids=self._device_ids(), run_uuid=self.run_uuid)
+
+        # Per-run collection flags. request_stop() also sets run_stop_event.
+        run_stop_event = threading.Event()
+        collection_abort = threading.Event()
+        collection_error_event = threading.Event()
+        ctx: Dict[str, Any] = {
+            'run_num': run_num,
+            'run_stop_event': run_stop_event,
+            'collection_abort': collection_abort,
+            'collection_thread': None,
+            'finished': False,
+        }
+        self._run_ctx = ctx
+        self._run_stop_event = run_stop_event
+        if self._is_cancelled():
+            run_stop_event.set()
+
+        # Start data collection in background thread
+        latency_manager = None
+        if adaptive_latency_enabled:
+            latency_manager = AdaptiveLatencyOffsetManager(
+                db_manager=self.db,
+                run_number=run_num,
+                device_ids=[sig.device_id for sig in self.config.signals],
+                initial_offset_seconds=self.config.signals[0].replay_latency_offset_seconds,
+                lookback_minutes=float(self.config.replay_latency_offset_lookback_min),
+                min_samples=self.config.replay_latency_offset_min_samples,
+                debug=self.debug,
+            )
+
+        collection_kwargs: Dict[str, Any] = {
+            "error_event": collection_error_event,
+            "abort_event": collection_abort,
+            "on_fatal_error": self._on_collection_fatal_error,
+        }
+        if latency_manager is not None:
+            def _after_poll(now: datetime, _manager=latency_manager, _collector=collector) -> Any:
+                # End the matching window where the collected output events
+                # are complete, not at the PC clock (file sources lag).
+                snapshot = getattr(_collector, "complete_through_snapshot", None)
+                return _manager.update_after_poll(
+                    now, data_complete_through=snapshot() if callable(snapshot) else None,
+                )
+
+            collection_kwargs["after_collect_callback"] = _after_poll
+
+        collection_thread = threading.Thread(
+            target=run_in_log_context(collector.run_collection_loop),
+            args=(run_num, datetime.now(), run_stop_event, self._on_conflict_detected),
+            kwargs=collection_kwargs,
+            daemon=True,
+            name=f"collect-run{run_num}",
+        )
+        collection_thread.start()
+        ctx['collection_thread'] = collection_thread
+
+        # Run all signals - this blocks until all replays complete or stop.
+        start_times, failed_signals = self._run_all_signals(latency_manager)
+        replay_end = datetime.now()
+        if failed_signals:
+            self._failed_signals_by_run[run_num] = failed_signals
+            logger.warning("Run %d signal failures: %s", run_num, ", ".join(failed_signals))
+        valid_starts = [t for t in start_times.values() if t is not None]
+        self._simulation_start_time = min(valid_starts) if valid_starts else datetime.now()
+
+        if self._is_cancelled():
+            self._finish_cancelled_run(run_num, collector, ctx, have_data=bool(valid_starts))
+            return 'cancelled'
+
+        # Check if collection hit a fatal error during replay (it also stopped the replay)
+        if collection_error_event.is_set() or self._stop_reason == 'collection_error':
+            logger.error("*** Aborting run %d: data collection failed.", run_num)
+            run_stop_event.set()
+            if not self._join_bounded(collection_thread, 5.0, stop_aware=False):
+                collection_abort.set()
+            self._safe_db_call('mark_run_failed', run_num, device_ids=self._device_ids())
+            return 'collection_error'
+
+        if not start_times:
+            logger.error("*** Aborting run %d: all signals failed.", run_num)
+            run_stop_event.set()
+            if not self._join_bounded(collection_thread, 60):
+                collection_abort.set()
+            self._safe_db_call('mark_run_failed', run_num, device_ids=self._device_ids())
+            return 'all_signals_failed'
+
+        # Stop collection for this run
+        run_stop_event.set()
+        if not self._join_bounded(collection_thread, 60):
+            if not self._is_cancelled():
+                # Ensure collection thread has fully released file handles
+                logger.warning("Collection thread still running, waiting for it to finish...")
+                self._join_bounded(collection_thread, 120)
+
+        if self._is_cancelled():
+            self._finish_cancelled_run(run_num, collector, ctx, have_data=True)
+            return 'cancelled'
+
+        if self.config.post_replay_settle_seconds > 0:
+            self._progress.emit(
+                Stage.WAITING,
+                f"Waiting {self.config.post_replay_settle_seconds:.0f}s for the controller to settle",
+                log=False,
+                extra={"reason": "settle", "seconds": self.config.post_replay_settle_seconds},
+            )
+            self._wait_stoppable(self.config.post_replay_settle_seconds)
+            if self._is_cancelled():
+                self._finish_cancelled_run(run_num, collector, ctx, have_data=True)
+                return 'cancelled'
+
+        # Final collection: poll until every source reports its events
+        # complete through the end of the replay (plus settle), then check the
+        # whole run for conflicts. A cancel ends the wait promptly.
+        complete_target = replay_end + timedelta(seconds=self.config.post_replay_settle_seconds)
+        outcome = collector.finalize_run(
+            run_num,
+            self._simulation_start_time,
+            complete_target,
+            conflict_callback=self._on_conflict_detected,
+            stop_event=_CancelView(self),
+        ) or {}
+        status = outcome.get('status', 'complete')
+        if latency_manager is not None:
+            try:
+                latency_manager.warn_if_never_applied()
+            except Exception:
+                logger.debug("Adaptive latency summary failed", exc_info=True)
+        if status == 'stopped' or self._is_cancelled():
+            self._finish_cancelled_run(run_num, collector, ctx, have_data=False)
+            return 'cancelled'
+
+        self._completed_runs.append(run_num)
+        ctx['finished'] = True
+        _log_memory(f"[end run {run_num}]")
+        if status == 'incomplete':
+            self._incomplete_runs.append(run_num)
+            self._safe_db_call('mark_run_incomplete', run_num, device_ids=self._device_ids())
+            self._progress.emit(
+                Stage.RUN_COMPLETE,
+                f"Completed run {run_num} of {self.config.simulation_replays} with INCOMPLETE "
+                f"output events for: {', '.join(outcome.get('incomplete_devices', []))}",
+                level=logging.WARNING,
+                run_number=run_num,
+                extra={"status": "incomplete",
+                       "incomplete_devices": list(outcome.get('incomplete_devices', []))},
+            )
+            return 'incomplete'
+        self.db.mark_run_completed(run_num, device_ids=self._device_ids())
+        self._progress.emit(
+            Stage.RUN_COMPLETE,
+            f"Completed run {run_num} of {self.config.simulation_replays}",
+            run_number=run_num,
+            extra={"status": "completed"},
+        )
+        return 'completed'
+
+    def _create_collector(self, adaptive_latency_enabled: bool) -> DataCollector:
+        """Build the DataCollector for this simulation's signals and event source."""
+        targets = {
+            sig.device_id: CollectionTarget(
+                device_id=sig.device_id,
+                ip=sig.ip,
+                http_port=sig.http_port,
+                extra=dict(sig.collection_extra or {}),
+            )
+            for sig in self.config.signals
+        }
+        return DataCollector(
+            db_path=self.config.db_path,
+            device_configs=targets,
+            collection_interval_minutes=self.config.collection_interval_minutes,
+            stop_on_conflict=self.config.stop_on_conflict,
+            debug=self.debug,
+            event_source=self.config.event_source,
+            incompatible_pairs={sig.device_id: sig.incompatible_pairs for sig in self.config.signals},
+            clock_offsets={sig.device_id: sig.clock_offset_seconds for sig in self.config.signals},
+            source_timezones={sig.device_id: sig.source_timezone for sig in self.config.signals},
+            required_codes={
+                sig.device_id: required_event_codes(sig.incompatible_pairs, adaptive_latency_enabled)
+                for sig in self.config.signals
+            },
+            final_collection_timeout_seconds=self.config.final_collection_timeout_seconds,
+            final_collection_poll_seconds=self.config.final_collection_poll_seconds,
+            on_progress=self._progress,
+            source_time=self._source_time,
+            run_uuid=self.run_uuid,
+        )
+
+    def _record_collection_health(self, run_num: int, collector: DataCollector) -> None:
+        """Keep the collector's per-device health for ``run_num`` in the results."""
+        snapshot = getattr(collector, 'health_snapshot', None)
+        if snapshot is None or getattr(collector, '_health_run', None) != run_num:
+            return
+        try:
+            self._collection_health_by_run[run_num] = snapshot()
+        except Exception:
+            logger.warning("Could not read collection health for run %d", run_num, exc_info=True)
+
+    def _finish_cancelled_run(
+        self,
+        run_num: int,
+        collector: DataCollector,
+        ctx: Dict[str, Any],
+        have_data: bool,
+    ) -> None:
+        """Wind down a cancelled run quickly and record it as 'cancelled'.
+
+        Skips the settle wait and conflict detection. If the background
+        collection thread finishes within about a second, one best-effort
+        poll (capped at ``cancel_final_poll_seconds``) keeps the events up
+        to the stop; otherwise the thread is abandoned and anything it
+        fetches later is discarded.
+        """
+        logger.warning(
+            "Run %d cancelled (%s); skipping settle wait and comparison",
+            run_num, self._stop_reason,
+        )
+        ctx['run_stop_event'].set()
+        thread = ctx.get('collection_thread')
+        joined = thread is None or self._join_bounded(
+            thread, _CANCEL_COLLECTION_JOIN_SECONDS, stop_aware=False
+        )
+        if not joined:
+            ctx['collection_abort'].set()
+            logger.warning(
+                "Collection poll for run %d still in progress; abandoning it", run_num
+            )
+        elif have_data and self.config.cancel_final_poll_seconds > 0:
+            self._bounded_final_poll(collector, run_num, self.config.cancel_final_poll_seconds)
+        self._safe_db_call('mark_run_cancelled', run_num, device_ids=self._device_ids())
+        self._cancelled_run = run_num
+        ctx['finished'] = True
+
+    def _bounded_final_poll(self, collector: DataCollector, run_num: int, budget: float) -> None:
+        """Run one collection poll on a helper thread; abandon it after ``budget`` seconds."""
+        abort = threading.Event()
+
+        def _poll() -> None:
+            try:
+                collector.collect_once(run_num, self._simulation_start_time, abort_event=abort)
+            except Exception:
+                logger.warning("Final poll after cancel failed", exc_info=True)
+
+        thread = threading.Thread(target=run_in_log_context(_poll), name=f"final-poll-run{run_num}", daemon=True)
+        thread.start()
+        if not self._join_bounded(thread, budget, stop_aware=False):
+            abort.set()
+            logger.warning(
+                "Final poll after cancel did not finish within %.1fs; results discarded", budget
+            )
+
+    def _abandon_run_after_interrupt(self, run_num: int) -> None:
+        """Best-effort cleanup when Ctrl+C escaped from the middle of a run."""
+        ctx = self._run_ctx
+        if ctx is None or ctx.get('run_num') != run_num or ctx.get('finished'):
+            return
+        ctx['run_stop_event'].set()
+        ctx['collection_abort'].set()
+        self._safe_db_call('mark_run_cancelled', run_num, device_ids=self._device_ids())
+        self._cancelled_run = run_num
+        ctx['finished'] = True
+
+    def _reader(self) -> Any:
+        """Read-only DatabaseManager for post-run reads (falls back to self.db)."""
+        try:
+            return DatabaseManager(self.config.db_path, read_only=True)
+        except TypeError:
+            return self.db
+
     def _run_comparison(self) -> None:
         """Run DTW comparison analysis on all collected data with threshold checks."""
         device_ids = [sig.device_id for sig in self.config.signals]
@@ -653,7 +1546,7 @@ class ATCSimulation:
         for attempt in range(5):
             try:
                 self._comparison_results = compare_all_runs(
-                    self.db,
+                    self._reader(),
                     device_ids,
                     self._completed_runs,
                     include_input_comparison=True
@@ -662,8 +1555,12 @@ class ATCSimulation:
             except Exception as e:
                 if attempt < 4 and "being used by another process" in str(e):
                     wait = 3 * (attempt + 1)
-                    print(f"  Database locked, retrying in {wait}s... (attempt {attempt + 1}/5)")
-                    time.sleep(wait)
+                    logger.info(
+                        "Database locked, retrying in %ds... (attempt %d/5)", wait, attempt + 1
+                    )
+                    if not self._wait_stoppable(wait) and self._is_cancelled():
+                        logger.warning("Comparison abandoned: simulation cancelled")
+                        return
                 else:
                     raise
         
@@ -687,35 +1584,36 @@ class ATCSimulation:
                 result.exceeds_threshold = exceeded
                 result.threshold_reason = reason
                 
-                # Store result in database
-                try:
-                    store_comparison_result(self.config.db_path, result)
-                except Exception as e:
-                    if self.debug:
-                        print(f"Failed to store comparison result: {e}")
-                
                 # Generate plot if threshold exceeded and output_dir configured
                 if exceeded and self.output_dir:
                     self._generate_comparison_plot(device_id, result)
                 elif exceeded:
-                    print(f"\n⚠️  Threshold exceeded for {device_id} ({result.run_a} vs {result.run_b}):")
-                    print(f"    {reason}")
-                    print(f"    Set output_dir to generate comparison plots.")
+                    logger.warning(
+                        "WARNING: Threshold exceeded for %s (%s vs %s): %s. "
+                        "Set output_dir to generate comparison plots.",
+                        device_id, result.run_a, result.run_b, reason,
+                    )
+
+                # Store result in database (after the plot so plot_path is set)
+                try:
+                    store_comparison_result(self.config.db_path, result, run_uuid=self.run_uuid)
+                except Exception:
+                    logger.warning("Failed to store comparison result", exc_info=True)
     
     def _generate_comparison_plot(self, device_id: str, result: ComparisonResult) -> None:
         """Generate Gantt chart for a comparison that exceeded thresholds."""
         try:
             # Get events for both runs
+            reader = self._reader()
             if result.run_a == "input":
-                events_a = self.db.get_input_events(device_id=device_id)
+                events_a = reader.get_input_events(device_id=device_id)
             else:
-                events_a = self.db.get_events(device_id=device_id, run_number=int(result.run_a))
-            
-            events_b = self.db.get_events(device_id=device_id, run_number=int(result.run_b))
+                events_a = reader.get_events(device_id=device_id, run_number=int(result.run_a))
+
+            events_b = reader.get_events(device_id=device_id, run_number=int(result.run_b))
             
             if events_a.empty or events_b.empty:
-                if self.debug:
-                    print(f"No events to plot for {device_id}")
+                logger.log(debug_level(self.debug), "No events to plot for %s", device_id)
                 return
             
             # Find divergence time
@@ -739,13 +1637,13 @@ class ATCSimulation:
             label_a = str(result.run_a)
             label_b = str(result.run_b)
             output_name = f"{device_id}_{label_a}_vs_{label_b}".replace(' ', '_')
+            self.output_dir.mkdir(parents=True, exist_ok=True)
             output_path = self.output_dir / f"{output_name}.png"
             
             # Create Gantt chart
             from .comparison import create_comparison_gantt_matplotlib
-            import matplotlib.pyplot as plt
 
-            fig = create_comparison_gantt_matplotlib(
+            create_comparison_gantt_matplotlib(
                 timeline_a=timeline_a,
                 timeline_b=timeline_b,
                 label_a=f"Run {label_a}" if label_a != "input" else "Input",
@@ -756,56 +1654,109 @@ class ATCSimulation:
                 output_path=output_path,
                 window_minutes=5.0
             )
-            if fig:
-                plt.close(fig)
-            
+
             result.plot_path = str(output_path)
-            
-            if self.debug:
-                print(f"Generated comparison plot: {output_path}")
-                
-        except Exception as e:
-            if self.debug:
-                print(f"Failed to generate plot for {device_id}: {e}")
+
+            logger.log(debug_level(self.debug), "Generated comparison plot: %s", output_path)
+            self._progress.emit(
+                Stage.PLOT,
+                f"[{device_id}] Comparison plot written: {output_path}",
+                device_id=device_id,
+                log=False,
+                extra={"path": str(output_path), "run_a": str(result.run_a), "run_b": str(result.run_b)},
+            )
+
+        except Exception as exc:
+            logger.warning("Failed to generate plot for %s", device_id, exc_info=True)
+            self._progress.emit(
+                Stage.PLOT,
+                f"[{device_id}] Comparison plot failed: {exc}",
+                level=logging.WARNING,
+                device_id=device_id,
+                log=False,
+                extra={"error": str(exc), "run_a": str(result.run_a), "run_b": str(result.run_b)},
+            )
     
-    def _print_summary(self) -> None:
-        """Print final simulation summary."""
-        self._finish_progress_line()
-        print("\n" + "=" * 60)
-        print("SIMULATION COMPLETE")
-        print("=" * 60)
-        
-        print(f"\nCompleted Runs: {len(self._completed_runs)}")
-        print(f"Conflicts Found: {len(self._conflicts_found)}")
+    def format_summary(self) -> str:
+        """Return the final simulation summary as plain ASCII text."""
+        header = "SIMULATION CANCELLED" if self._cancel_requested else "SIMULATION COMPLETE"
+        lines = ["", "=" * 60, header, "=" * 60, ""]
+        lines.append(f"Completed Runs: {len(self._completed_runs)}")
+        if self._conflict_records:
+            first_run = min(int(c.run_number) for c in self._conflict_records)
+            lines.append(f"Failure Replicated: yes (first conflict in run {first_run})")
+        if self._conflict_store_errors:
+            lines.append(
+                f"WARNING: {len(self._conflict_store_errors)} conflict(s) could not be written "
+                "to the working database (they are in the returned result)"
+            )
+        if self._incomplete_runs:
+            lines.append(
+                "WARNING: Output events incomplete for run(s): "
+                + ", ".join(str(r) for r in self._incomplete_runs)
+                + " (conflict check used the events received)"
+            )
+        if self._collection_health_by_run:
+            last = self._collection_health_by_run[max(self._collection_health_by_run)]
+            degraded = sorted(d for d, h in last.items() if h.get('degraded'))
+            if degraded:
+                lines.append("WARNING: Output collection degraded for: " + ", ".join(degraded))
+        if self._stop_reason is not None:
+            lines.append(f"Stop Reason: {self._stop_reason}")
+        if self._cancelled_run is not None:
+            lines.append(f"Cancelled Run: {self._cancelled_run} (recorded as cancelled)")
+        not_reset = sorted(d for d, ok in self._detectors_reset.items() if not ok)
+        if not_reset:
+            lines.append(
+                "WARNING: Detector reset not confirmed for: "
+                + ", ".join(not_reset)
+                + " (check the controller for inputs left ON)"
+            )
+        lines.append(f"Conflicts Found: {len(self._conflicts_found)}")
         if self._failed_signals_by_run:
-            print("Signal Failures by Run:")
+            lines.append("Signal Failures by Run:")
             for run_num in sorted(self._failed_signals_by_run):
                 failed = ", ".join(self._failed_signals_by_run[run_num])
-                print(f"  Run {run_num}: {failed}")
-        
+                lines.append(f"  Run {run_num}: {failed}")
+
         if self._conflicts_found:
-            print("\nConflicts:")
+            lines.append("")
+            lines.append("Conflicts:")
             for conflict in self._conflicts_found:
-                print(f"  [{conflict['device_id']}] Run {conflict['run_number']}: "
-                      f"{conflict['conflict_details']} at {conflict['timestamp']}")
-        
+                line = (
+                    f"  [{conflict['device_id']}] Run {conflict['run_number']}: "
+                    f"{conflict['conflict_details']} at {conflict['timestamp']}"
+                )
+                if conflict.get('source_equivalent_timestamp') is not None:
+                    line += f" (source log time {conflict['source_equivalent_timestamp']})"
+                lines.append(line)
+
         if self._comparison_results:
-            print("\n" + self.get_comparison_summary())
-            
-            # Print threshold alerts
+            lines.append("")
+            lines.append(self.get_comparison_summary())
+
             alerts = []
             for device_id, comparisons in self._comparison_results.items():
                 for result in comparisons:
                     if hasattr(result, 'exceeds_threshold') and result.exceeds_threshold:
                         alerts.append((device_id, result))
-            
+
             if alerts:
-                print("\n⚠️  THRESHOLD ALERTS:")
+                lines.append("")
+                lines.append("WARNING: THRESHOLD ALERTS:")
                 for device_id, result in alerts:
-                    print(f"  [{device_id}] {result.run_a} vs {result.run_b}: {result.threshold_reason}")
+                    lines.append(
+                        f"  [{device_id}] {result.run_a} vs {result.run_b}: "
+                        f"{result.threshold_reason}"
+                    )
                     if result.plot_path:
-                        print(f"      Plot: {result.plot_path}")
-    
+                        lines.append(f"      Plot: {result.plot_path}")
+        return "\n".join(lines)
+
+    def _print_summary(self) -> None:
+        """Log the final simulation summary at INFO level."""
+        logger.info("%s", self.format_summary())
+
     def get_events(
         self,
         device_id: Optional[str] = None,

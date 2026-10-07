@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
+
+from ._logging import debug_level
+
+logger = logging.getLogger(__name__)
 
 
 DETECTOR_LATENCY_EVENT_ID = 82
@@ -203,6 +208,8 @@ class AdaptiveLatencyOffsetManager:
             for device_id in self.device_ids
         }
         self._date_shifts: Dict[str, timedelta] = {}
+        # Per device: updates attempted / applied, for warn_if_never_applied().
+        self._update_counts: Dict[str, List[int]] = {d: [0, 0] for d in self.device_ids}
 
     @staticmethod
     def _offset_at(state: _DeviceLatencyState, now: datetime) -> float:
@@ -476,16 +483,50 @@ class AdaptiveLatencyOffsetManager:
         self.db.insert_latency_offset_update(self.run_number, result, samples=matches)
         return result
 
-    def update_once(self, now: Optional[datetime] = None) -> List[LatencyUpdateResult]:
+    def _window_end(
+        self,
+        device_id: str,
+        now: datetime,
+        data_complete_through: Optional[Union[datetime, Mapping[str, datetime]]],
+    ) -> datetime:
+        """End of the matching window: ``now``, or earlier when output events lag."""
+        through = data_complete_through
+        if isinstance(through, Mapping):
+            through = through.get(device_id)
+        if through is None:
+            return now
+        return min(now, through)
+
+    def update_once(
+        self,
+        now: Optional[datetime] = None,
+        data_complete_through: Optional[Union[datetime, Mapping[str, datetime]]] = None,
+    ) -> List[LatencyUpdateResult]:
+        """Measure latency over the lookback window and adjust the offsets.
+
+        Args:
+            now: Current PC time (transitions start here). Defaults to now.
+            data_complete_through: Time (or ``{device_id: time}``) through
+                which collected output events are complete. The window ends
+                there instead of at ``now``, so a source that delivers its
+                log late (closed files) does not leave the newest input
+                events with nothing to match.
+        """
         now = now or datetime.now()
-        window_end = now
-        window_start = window_end - timedelta(seconds=self.lookback_seconds)
+        windows = {
+            device_id: self._window_end(device_id, now, data_complete_through)
+            for device_id in self.device_ids
+        }
+        lookback = timedelta(seconds=self.lookback_seconds)
+        tolerance = timedelta(seconds=self.match_tolerance_seconds)
 
         source_all = self.db.get_input_detector_events(device_ids=self.device_ids)
+        query_end = max(windows.values()) if windows else now
+        query_start = (min(windows.values()) if windows else now) - lookback
         actual_all = self.db.get_events(
             run_number=self.run_number,
-            start_time=window_start - timedelta(seconds=self.match_tolerance_seconds),
-            end_time=window_end + timedelta(seconds=self.match_tolerance_seconds),
+            start_time=query_start - tolerance,
+            end_time=query_end + tolerance,
         )
         if not actual_all.empty:
             actual_all = actual_all[
@@ -496,6 +537,8 @@ class AdaptiveLatencyOffsetManager:
 
         results = []
         for device_id in self.device_ids:
+            window_end = windows[device_id]
+            window_start = window_end - lookback
             try:
                 result = self._update_device_once(
                     device_id=device_id,
@@ -524,23 +567,46 @@ class AdaptiveLatencyOffsetManager:
                 )
                 self.db.insert_latency_offset_update(self.run_number, result)
             results.append(result)
+            with self._lock:
+                counts = self._update_counts.setdefault(device_id, [0, 0])
+                counts[0] += 1
+                counts[1] += int(bool(result.applied))
 
-        if self.debug:
-            applied = [result for result in results if result.applied]
-            skipped = [result for result in results if not result.applied]
-            print(
-                "[latency] "
-                f"applied={len(applied)} skipped={len(skipped)} "
-                f"required_samples={self.required_min_samples}",
-                flush=True,
-            )
+        applied_count = sum(1 for result in results if result.applied)
+        logger.log(
+            debug_level(self.debug),
+            "[latency] applied=%d skipped=%d required_samples=%s",
+            applied_count, len(results) - applied_count, self.required_min_samples,
+        )
         return results
 
-    def update_after_poll(self, now: Optional[datetime] = None) -> List[LatencyUpdateResult]:
+    def warn_if_never_applied(self) -> List[str]:
+        """Log a warning for each device whose offset was never adjusted.
+
+        Call it at the end of a run. Returns the device ids warned about
+        (devices with at least one update attempt and none applied).
+        """
+        with self._lock:
+            idle = [d for d, (tried, applied) in self._update_counts.items() if tried and not applied]
+        for device_id in idle:
+            tried = self._update_counts[device_id][0]
+            logger.warning(
+                "[latency] Adaptive latency offset for %s was never adjusted in run %d "
+                "(%d update(s), all skipped: too few matched detector events). Check that the "
+                "controller logs event 82 and that output events arrive within the %.0f min lookback.",
+                device_id, self.run_number, tried, self.lookback_seconds / 60.0,
+            )
+        return idle
+
+    def update_after_poll(
+        self,
+        now: Optional[datetime] = None,
+        data_complete_through: Optional[Union[datetime, Mapping[str, datetime]]] = None,
+    ) -> List[LatencyUpdateResult]:
         """Run one update after a collector poll, logging errors without raising."""
         now = now or datetime.now()
         try:
-            return self.update_once(now=now)
+            return self.update_once(now=now, data_complete_through=data_complete_through)
         except Exception as exc:
             window_start = now - timedelta(seconds=self.lookback_seconds)
             results = []
@@ -563,6 +629,5 @@ class AdaptiveLatencyOffsetManager:
                 )
                 self.db.insert_latency_offset_update(self.run_number, result)
                 results.append(result)
-            if self.debug:
-                print(f"[latency] adaptive update failed: {exc}", flush=True)
+            logger.warning("[latency] adaptive update failed: %s", exc)
             return results

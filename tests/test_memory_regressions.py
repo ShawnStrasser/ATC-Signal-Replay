@@ -99,10 +99,10 @@ def test_simulation_uses_preloaded_signal_events_without_central_distribution(te
         def clear_run_data(self, _run_number=None, device_ids=None):
             return None
 
-        def mark_run_started(self, _run_number):
+        def mark_run_started(self, _run_number, **_kwargs):
             return None
 
-        def mark_run_completed(self, _run_number):
+        def mark_run_completed(self, _run_number, **_kwargs):
             return None
 
         def insert_input_events(self, *_args, **_kwargs):
@@ -171,10 +171,6 @@ def test_similarity_batch_passes_per_signal_event_sources_to_simulation(tmp_path
     assert captured["snmp_send_retries"] == suite.snmp_send_retries
     assert captured["snmp_retry_backoff_seconds"] == suite.snmp_retry_backoff_seconds
 
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
-
 
 def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
     events_1 = tmp_path / "events_1.parquet"
@@ -211,10 +207,6 @@ def test_conflict_batch_uses_shared_version_db_without_rerun_mode(tmp_path):
     assert db_path == runner.run_dir / "collected.db"
     assert captured["replays"] == 25
     assert "replace_existing_device_data" not in captured
-
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
 
 
 def test_database_manager_clear_run_data_can_scope_to_device_ids(temp_db_path):

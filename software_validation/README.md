@@ -1,6 +1,6 @@
 # Software validation workspace
 
-Batch A/B validation of a controller software release, or of a configuration change with the software held constant, across many intersections. `software_validate.py` is the reference runner. It uses only the public `signal_replay` API, so an application can call the same pieces directly (see the main [README](../README.md#use-the-validation-pieces-from-your-own-application)).
+Batch A/B validation of a controller software release, or of a configuration change with the software held constant, across many intersections. `software_validate.py` is the reference runner. It uses only the public `signal_replay` API (`SoftwareTestSuite`, `BatchRunner`, `compare_validation`, `generate_report`), so you can call the same pieces from your own script (see the main [README](../README.md#use-the-validation-pieces-from-python)). Applications that embed the package should read [docs/integration.md](../docs/integration.md).
 
 ## Layout
 
@@ -31,7 +31,8 @@ Everything except the scripts and the settings template is agency data and stays
    | `replay_latency_offset_seconds` | Fixed SNMP latency compensation (default 0.1853). |
    | `replay_latency_offset_lookback_min` | Enables adaptive per-device latency calibration using this many minutes of recent detector events. |
    | `catalog_file`, `logs_dir`, `databases_dir`, `results_dir`, `conflict_pairs_file` | Paths relative to this folder. |
-   | `comparison.sequence_threshold`, `comparison.timing_threshold`, `comparison.match_threshold` | DTW alert thresholds (defaults 0.05, 0.02, 95.0). |
+   | `comparison.sequence_threshold`, `comparison.timing_threshold`, `comparison.match_threshold` | DTW alert thresholds stored on the suite (defaults 0.05, 0.02, 95.0). They do not decide pass or fail. |
+   | `comparison.sequence_match_threshold`, `comparison.timing_match_threshold` | Pass criteria in percent (defaults 95 and 90), see [Pass criteria](#pass-criteria). |
    | `comparison.phase_call_similarity_threshold` | Minimum input-replay similarity (percent) before a window is treated as unreliable and excluded. |
    | `comparison.analysis_start_time`, `comparison.analysis_end_time` | Clock times (`HH:MM`) bounding the analysed window for time-of-day aligned scenarios. Leave empty to analyse everything after the settle window. |
    | `comparison.settle_minutes` | Minutes excluded at the start of each scenario (default 10) when no `analysis_start_time` is set. |
@@ -76,7 +77,11 @@ One invocation does the following:
 4. Checks SNMP and HTTP on every controller in the batch.
 5. Replays the batch. Similarity scenarios run once, time-of-day aligned, with conflict checking on but not stopping the run. Conflict scenarios run up to 25 times and stop at the first conflict.
 6. If more scenarios are pending, exits. Run the script again (typically the next day) for the next batch.
-7. When every scenario has data, compares each one against the baseline, writes `device_events/`, `divergence_plots/`, and `report.html`.
+7. When every scenario has data, compares each one against the baseline with `signal_replay.compare_validation` (using `analysis_workers` processes), writes `device_events/`, `divergence_plots/`, and `report.html`.
+
+Progress goes to the console (stdout) and, during the replay, to `results/<software_version>/run.log`. Output events are read from each controller's MAXTIME HTTP event log.
+
+Press Ctrl+C to stop a replay. The script stops within about a second, resets every detector and preempt input it drove on the controllers, clears the partly collected batch from `collected.db` so it is replayed next time, and exits with code 130.
 
 ## Outputs
 
@@ -105,4 +110,4 @@ One invocation does the following:
 ## Other files
 
 - `extract_data.py --software-version <label>`: exports per-intersection Parquet files from a run that was driven by `BatchRunner.run()` (it needs that runner's `checkpoint.json`). Runs made with `software_validate.py` should use `--archive` instead.
-- `walkthrough.ipynb`: the original interactive notebook version of this workflow, kept for reference. The script supersedes it.
+- `walkthrough.ipynb`: the original interactive notebook version of this workflow, kept for reference. It uses the same `BatchRunner` and `compare_validation` calls, with the original logs as the baseline. The script supersedes it.

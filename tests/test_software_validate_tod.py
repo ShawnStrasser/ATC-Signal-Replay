@@ -3,6 +3,7 @@ from datetime import datetime
 import pandas as pd
 
 import software_validation.software_validate as fv
+from signal_replay import validation as sv_val
 from signal_replay.comparison import ChunkScore, _filter_chunk_scores_after_settle, render_sparkline_svg
 
 
@@ -101,7 +102,7 @@ def test_prepare_analysis_inputs_for_tod_uses_shared_wall_clock_anchor():
         }
     )
 
-    shifted_original, shifted_collected, start_a, start_b = fv._prepare_analysis_inputs(
+    shifted_original, shifted_collected, start_a, start_b = sv_val._prepare_analysis_inputs(
         original,
         collected,
         tod_align=True,
@@ -122,7 +123,7 @@ def test_build_programmed_split_timeline_anchors_rows_to_issue_day():
         }
     ]
 
-    split_timeline = fv._build_programmed_split_timeline(
+    split_timeline = sv_val._build_programmed_split_timeline(
         schedule_rows,
         pd.Timestamp("2026-03-25 09:12:00"),
     )
@@ -141,7 +142,7 @@ def test_build_programmed_split_timeline_rolls_overnight_end_to_next_day():
         }
     ]
 
-    split_timeline = fv._build_programmed_split_timeline(
+    split_timeline = sv_val._build_programmed_split_timeline(
         schedule_rows,
         pd.Timestamp("2026-03-25 23:59:00"),
     )
@@ -162,7 +163,7 @@ def test_resolve_manual_analysis_start_uses_collected_run_date():
         }
     )
 
-    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
+    analysis_start, analysis_end = sv_val._resolve_manual_analysis_window(
         collected,
         analysis_start_time="09:10",
         analysis_end_time=None,
@@ -184,7 +185,7 @@ def test_resolve_manual_analysis_window_keeps_same_day_end_when_after_start():
         }
     )
 
-    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
+    analysis_start, analysis_end = sv_val._resolve_manual_analysis_window(
         collected,
         analysis_start_time="09:00",
         analysis_end_time="10:00",
@@ -206,7 +207,7 @@ def test_resolve_manual_analysis_window_uses_run_end_date_for_overnight_end():
         }
     )
 
-    analysis_start, analysis_end = fv._resolve_manual_analysis_window(
+    analysis_start, analysis_end = sv_val._resolve_manual_analysis_window(
         collected,
         analysis_start_time="09:00",
         analysis_end_time="07:00",
@@ -241,7 +242,7 @@ def test_trim_to_analysis_window_uses_sent_timestamp_cutoff():
         }
     )
 
-    trimmed = fv._trim_to_analysis_window(
+    trimmed = sv_val._trim_to_analysis_window(
         df,
         pd.Timestamp("2026-03-25 09:10:14.600"),
         None,
@@ -263,7 +264,7 @@ def test_trim_to_analysis_window_applies_end_cutoff():
         }
     )
 
-    trimmed = fv._trim_to_analysis_window(
+    trimmed = sv_val._trim_to_analysis_window(
         df,
         pd.Timestamp("2026-03-25 09:00:00"),
         pd.Timestamp("2026-03-25 10:00:00"),

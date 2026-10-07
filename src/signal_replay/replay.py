@@ -5,6 +5,7 @@ Replay module for generating activation feeds and sending SNMP commands.
 import duckdb
 import pandas as pd
 import asyncio
+import logging
 import threading
 import time
 import math
@@ -16,9 +17,58 @@ from jinja2 import Template
 
 import pyarrow as pa
 
+from ._logging import debug_level, run_in_log_context
+from .progress import ProgressCallback, Stage, as_reporter
 from .ntcip import async_send_ntcip, async_reset_all_detectors
 from .config import SignalConfig
 from pysnmp.hlapi.v3arch.asyncio import SnmpEngine
+
+logger = logging.getLogger(__name__)
+
+# Longest sleep between stop-flag checks while the replay waits for its next event.
+_STOP_POLL_SECONDS = 0.25
+# How often a send in progress checks whether a stop was requested.
+_STOP_WATCH_SECONDS = 0.1
+# Detector types in the order they are reset; preempt inputs are cleared first.
+_RESET_ORDER = {'Preempt': 0, 'Vehicle': 1, 'Ped': 2}
+
+
+async def reset_detector_groups(
+    ip_port: Tuple[str, int],
+    keys: List[Tuple[str, int]],
+    *,
+    snmp_engine: SnmpEngine,
+    timeout: float = 2.0,
+    budget: float = 5.0,
+) -> bool:
+    """Send state 0 to each (detector_type, group) in ``keys``, in order.
+
+    Every key is tried even if an earlier one fails. The whole reset is
+    capped at ``budget`` seconds. Returns True only when every SET succeeded.
+    """
+    all_ok = True
+
+    async def _send_all() -> None:
+        nonlocal all_ok
+        for detector_type, group_number in keys:
+            try:
+                await async_send_ntcip(
+                    ip_port, group_number, 0, detector_type,
+                    timeout=timeout, snmp_engine=snmp_engine,
+                )
+            except Exception as exc:
+                all_ok = False
+                logger.warning(
+                    "Reset of %s group %s at %s failed: %s",
+                    detector_type, group_number, ip_port, exc,
+                )
+
+    try:
+        await asyncio.wait_for(_send_all(), timeout=max(0.0, budget))
+    except asyncio.TimeoutError:
+        logger.warning("Detector reset at %s timed out after %.1fs", ip_port, budget)
+        return False
+    return all_ok
 
 
 def _get_sql_template(filename: str) -> str:
@@ -49,7 +99,9 @@ class SignalReplay:
         progress_log_interval_seconds: float = 60.0,
         stop_event: Optional[threading.Event] = None,
         latency_offset_provider: Optional[Any] = None,
-        debug: bool = False
+        detector_reset_timeout_seconds: float = 5.0,
+        debug: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
     ):
         """
         Initialize the SignalReplay.
@@ -64,9 +116,19 @@ class SignalReplay:
             snmp_retry_backoff_seconds: Delay between replay retry attempts
             show_progress_logs: If True, print periodic "Sent x/y events" updates
             progress_log_interval_seconds: Seconds between periodic progress updates
+            stop_event: Optional shared event; when set, the replay stops within
+                about 0.25 s, drops queued sends and cancels the send in progress
+            latency_offset_provider: Optional live latency offset source (TOD mode)
+            detector_reset_timeout_seconds: Time budget for the detector reset that
+                always runs when the replay ends (completed, stopped or failed)
             debug: Enable debug output
+            on_progress: Optional callback receiving
+                :class:`~signal_replay.progress.ProgressEvent` objects
+                (DETECTOR_RESET, WAITING, REPLAY). It runs on the replay
+                thread; REPLAY events are throttled to about one per second.
         """
         self.config = config
+        self._progress = as_reporter(on_progress, log=logger)
         self.device_id = config.device_id
         self.ip_port = config.ip_port
         self.cycle_length = config.cycle_length
@@ -97,6 +159,28 @@ class SignalReplay:
         self._send_worker_task: Optional[asyncio.Task] = None
         self._final_send_failures: Dict[Tuple[str, int], int] = {}
         self._first_send_logged = False
+        self.detector_reset_timeout_seconds = detector_reset_timeout_seconds
+        # (detector_type, group) pairs this replay has queued a state for.
+        self.touched_keys: set = set()
+        # None until the end-of-replay reset has run; then True/False.
+        self.detectors_reset: Optional[bool] = None
+        #: How this replay mapped source time onto wall-clock time; filled
+        #: while it runs. Keys: ``mode`` ('tod' or 'relative'), ``speed``,
+        #: ``replay_start``/``replay_end`` (PC time sending started/ended),
+        #: ``source_start``/``source_end`` (source timestamps of the first
+        #: and last event sent), ``date_shift_seconds`` (replay time minus
+        #: source time at speed 1), ``events_sent``, ``events_total``.
+        self.replay_info: Dict[str, Any] = {
+            "mode": "tod" if self.tod_align else "relative",
+            "speed": float(simulation_speed),
+            "replay_start": None,
+            "replay_end": None,
+            "source_start": None,
+            "source_end": None,
+            "date_shift_seconds": None,
+            "events_sent": 0,
+            "events_total": None,
+        }
         
         # Load and process events
         self._load_events()
@@ -118,10 +202,39 @@ class SignalReplay:
         while remaining > 0:
             if self._stop_event.is_set():
                 return False
-            chunk = min(remaining, 1.0)
+            chunk = min(remaining, _STOP_POLL_SECONDS)
             await asyncio.sleep(chunk)
             remaining -= chunk
         return not self._stop_event.is_set()
+
+    async def _wait_for_stop(self) -> None:
+        """Return once the stop event is set (polled, so it never blocks the loop)."""
+        while not self._stop_event.is_set():
+            await asyncio.sleep(_STOP_WATCH_SECONDS)
+
+    async def _run_unless_stopped(self, coro) -> Tuple[bool, Any]:
+        """Run ``coro`` but cancel it if a stop is requested first.
+
+        Returns ``(True, result)`` when the coroutine finished, or
+        ``(False, None)`` when the stop won and the coroutine was cancelled.
+        Exceptions raised by the coroutine propagate.
+        """
+        task = asyncio.ensure_future(coro)
+        watcher = asyncio.ensure_future(self._wait_for_stop())
+        try:
+            await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            task.cancel()
+            raise
+        finally:
+            watcher.cancel()
+        if task.done():
+            return True, task.result()
+        task.cancel()
+        await asyncio.wait({task})
+        if not task.cancelled():
+            task.exception()  # mark retrieved; the stop outcome wins
+        return False, None
 
     @staticmethod
     def _command_key(group_number: int, detector_type: str) -> Tuple[str, int]:
@@ -153,8 +266,9 @@ class SignalReplay:
         # Apply time-window slicing if specified
         self._apply_time_window()
         
-        if self.debug:
-            print(f"[{self.device_id}] Loaded {len(self.input_data)} events")
+        logger.log(
+            debug_level(self.debug), "[%s] Loaded %d events", self.device_id, len(self.input_data)
+        )
 
     def _apply_replay_latency_offset(self) -> None:
         """Advance detector event timestamps by the configured latency compensation."""
@@ -173,11 +287,11 @@ class SignalReplay:
             - pd.to_timedelta(self.replay_latency_offset_seconds, unit='s')
         )
 
-        if self.debug:
-            print(
-                f"[{self.device_id}] Advanced replay timestamps by "
-                f"{self.replay_latency_offset_seconds * 1000:.1f} ms"
-            )
+        logger.log(
+            debug_level(self.debug),
+            "[%s] Advanced replay timestamps by %.1f ms",
+            self.device_id, self.replay_latency_offset_seconds * 1000,
+        )
     
     def _load_from_dataframe(self, df: pd.DataFrame) -> None:
         """Load events from a pandas DataFrame."""
@@ -230,8 +344,7 @@ class SignalReplay:
     
     def _load_from_path(self, path: str) -> None:
         """Load events from a file path."""
-        if self.debug:
-            print(f"[{self.device_id}] Loading data from {path}")
+        logger.log(debug_level(self.debug), "[%s] Loading data from %s", self.device_id, path)
         
         # Check if it's a SQLite database
         suffix = Path(path).suffix.lower()
@@ -261,12 +374,14 @@ class SignalReplay:
     def _load_from_sqlite(self, db_path: str) -> None:
         """Load events from a MAXTIME SQLite database."""
         con = duckdb.connect()
-        con.execute(f"ATTACH DATABASE '{db_path}' AS LastFail (TYPE SQLITE)")
-        con.execute("USE LastFail")
-        
-        sql = _get_sql_template('load_maxtime_db.sql')
-        self.input_data = con.execute(sql).df()
-        con.close()
+        try:
+            con.execute(f"ATTACH DATABASE '{db_path}' AS LastFail (TYPE SQLITE)")
+            con.execute("USE LastFail")
+
+            sql = _get_sql_template('load_maxtime_db.sql')
+            self.input_data = con.execute(sql).df()
+        finally:
+            con.close()
 
     def _apply_time_window(self) -> None:
         """Slice input data to the last N minutes with optional buffer."""
@@ -299,8 +414,7 @@ class SignalReplay:
     
     def _generate_activation_feed(self) -> None:
         """Generate the activation feed from input data."""
-        if self.debug:
-            print(f"[{self.device_id}] Generating activation feed")
+        logger.log(debug_level(self.debug), "[%s] Generating activation feed", self.device_id)
 
         con = duckdb.connect()
         try:
@@ -330,8 +444,11 @@ class SignalReplay:
         # Store original start time for cycle sync
         self.original_start_time = self.activation_feed['TimeStamp'].min()
         
-        if self.debug:
-            print(f"[{self.device_id}] Generated {len(self.activation_feed)} activation commands")
+        logger.log(
+            debug_level(self.debug),
+            "[%s] Generated %d activation commands",
+            self.device_id, len(self.activation_feed),
+        )
 
         self.input_data = None
     
@@ -449,20 +566,22 @@ class SignalReplay:
         if suffix in ('.db', '.sqlite', '.sqlite3'):
             # Load from SQLite database
             con = duckdb.connect()
-            con.execute(f"ATTACH DATABASE '{path}' AS SourceDB (TYPE SQLITE)")
-            con.execute("USE SourceDB")
-            
-            # Query all events (not just detector events)
-            sql = """
-                SELECT
-                    TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS timestamp,
-                    EventTypeID AS event_id,
-                    Parameter AS parameter
-                FROM Event
-                ORDER BY timestamp
-            """
-            df = con.execute(sql).df()
-            con.close()
+            try:
+                con.execute(f"ATTACH DATABASE '{path}' AS SourceDB (TYPE SQLITE)")
+                con.execute("USE SourceDB")
+
+                # Query all events (not just detector events)
+                sql = """
+                    SELECT
+                        TO_TIMESTAMP(Timestamp + (Tick / 10))::TIMESTAMP AS timestamp,
+                        EventTypeID AS event_id,
+                        Parameter AS parameter
+                    FROM Event
+                    ORDER BY timestamp
+                """
+                df = con.execute(sql).df()
+            finally:
+                con.close()
             return df
         if suffix == '.parquet':
             return self._load_comparison_from_dataframe(pd.read_parquet(path))
@@ -482,35 +601,41 @@ class SignalReplay:
         attempts = self.snmp_send_retries + 1
 
         for attempt in range(1, attempts + 1):
+            if self._stop_event.is_set():
+                return False
             try:
-                await async_send_ntcip(
+                # Race the send against the stop flag so a silent controller
+                # cannot hold up a stop for a full SNMP timeout.
+                finished, _ = await self._run_unless_stopped(async_send_ntcip(
                     self.ip_port,
                     group_number,
                     state_integer,
                     detector_type,
                     timeout=self.snmp_timeout_seconds,
                     snmp_engine=snmp_engine,
-                )
+                ))
+                if not finished:
+                    return False
                 self._final_send_failures[key] = 0
                 return True
             except Exception as exc:
                 is_final_attempt = attempt >= attempts
                 if is_final_attempt:
                     self._final_send_failures[key] = self._final_send_failures.get(key, 0) + 1
-                    print(
-                        f"[{self.device_id}] SNMP send failed for group {group_number} "
-                        f"type {detector_type} state {state_integer} after "
-                        f"{attempts} attempt(s): {exc}",
-                        flush=True,
+                    logger.warning(
+                        "[%s] SNMP send failed for group %s type %s state %s after "
+                        "%s attempt(s): %s",
+                        self.device_id, group_number, detector_type, state_integer,
+                        attempts, exc,
                     )
                     return False
 
-                if self.debug:
-                    print(
-                        f"[{self.device_id}] Retrying group {group_number} type {detector_type} "
-                        f"state {state_integer}, attempt {attempt + 1}/{attempts}: {exc}",
-                        flush=True,
-                    )
+                logger.log(
+                    debug_level(self.debug),
+                    "[%s] Retrying group %s type %s state %s, attempt %d/%d: %s",
+                    self.device_id, group_number, detector_type, state_integer,
+                    attempt + 1, attempts, exc,
+                )
 
                 if self.snmp_retry_backoff_seconds > 0:
                     if not await self._sleep_interruptibly(self.snmp_retry_backoff_seconds):
@@ -537,7 +662,10 @@ class SignalReplay:
 
                 key, state_integer = item
                 try:
-                    await self._send_state_with_retries(key, state_integer, snmp_engine)
+                    # After a stop, queued commands are dropped; the end-of-replay
+                    # reset puts every touched group back to 0 instead.
+                    if not self._stop_event.is_set():
+                        await self._send_state_with_retries(key, state_integer, snmp_engine)
                 finally:
                     self._send_queue.task_done()
 
@@ -553,6 +681,7 @@ class SignalReplay:
         await self._ensure_send_worker(snmp_engine)
 
         assert self._send_queue is not None
+        self.touched_keys.add(key)
         await self._send_queue.put((key, state_integer))
 
     async def _send_command(self, row, snmp_engine: SnmpEngine) -> None:
@@ -565,14 +694,75 @@ class SignalReplay:
 
         if not self._first_send_logged and self.debug:
             self._first_send_logged = True
-            print(
-                f"[{self.device_id}] First command dispatched at {datetime.now():%H:%M:%S} "
-                f"for target {pd.to_datetime(row.TimeStamp):%H:%M:%S} "
-                f"group {row.group_number} type {row.DetectorType} state {state_integer}",
-                flush=True,
+            logger.info(
+                "[%s] First command dispatched at %s for target %s group %s type %s state %s",
+                self.device_id,
+                f"{datetime.now():%H:%M:%S}",
+                f"{pd.to_datetime(row.TimeStamp):%H:%M:%S}",
+                row.group_number, row.DetectorType, state_integer,
             )
 
         await self._enqueue_state_send(key, state_integer, snmp_engine)
+
+    def _note_sent(self, row, sent_count: int) -> None:
+        """Record the source timestamp of a sent event in :attr:`replay_info`."""
+        info = self.replay_info
+        info["events_sent"] = int(sent_count)
+        try:
+            source_ts = pd.Timestamp(row.TimeStamp).to_pydatetime()
+        except (AttributeError, TypeError, ValueError):
+            return
+        if info["source_start"] is None:
+            info["source_start"] = source_ts
+        info["source_end"] = source_ts
+
+    def source_time_for(self, timestamp: datetime) -> Optional[datetime]:
+        """Map a wall-clock (controller) timestamp of this replay back to the source log's clock.
+
+        TOD replays subtract the whole-day date shift; relative replays
+        subtract the offset between the replay start and the first source
+        event (scaled by the simulation speed). None before the replay ran.
+        """
+        return source_time_from_info(self.replay_info, timestamp)
+
+    def _report_sent(self, sent: int, total: int, *, final: bool = False, message: str = "") -> None:
+        """REPLAY progress for the callback/status (throttled unless ``final``)."""
+        self._progress.emit(
+            Stage.REPLAY,
+            message,
+            device_id=self.device_id,
+            events_sent=int(sent),
+            events_total=int(total),
+            throttle_key=("replay", self.device_id),
+            force=final,
+            log=False,
+            extra={"complete": bool(final and sent >= total), "stopped": self._stop_event.is_set()},
+        )
+
+    async def _wait_with_countdown(self, delay: float, reason: str, message: str) -> bool:
+        """Sleep ``delay`` seconds interruptibly, reporting WAITING with a countdown.
+
+        Returns False when a stop was requested.
+        """
+        deadline = time.monotonic() + max(0.0, delay)
+        force = True
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return not self._stop_event.is_set()
+            self._progress.emit(
+                Stage.WAITING,
+                message,
+                device_id=self.device_id,
+                seconds_until_start=remaining,
+                throttle_key=("waiting", self.device_id),
+                force=force,
+                log=False,
+                extra={"reason": reason},
+            )
+            force = False
+            if not await self._sleep_interruptibly(min(remaining, 1.0)):
+                return False
 
     def _print_send_summary(self) -> None:
         """Emit a concise summary when replay ended with unresolved send failures."""
@@ -588,18 +778,34 @@ class SignalReplay:
             f"{detector_type} group {group_number} ({count})"
             for (detector_type, group_number), count in failed_keys
         )
-        print(f"[{self.device_id}] Replay completed with unresolved SNMP send failures: {summary}", flush=True)
+        self._progress.emit(
+            Stage.REPLAY,
+            f"[{self.device_id}] Replay completed with unresolved SNMP send failures: {summary}",
+            level=logging.WARNING,
+            device_id=self.device_id,
+            extra={"send_failures": {f"{t} {g}": c for (t, g), c in failed_keys}},
+            log_to=logger,
+        )
 
     async def _wait_for_pending_sends(self) -> None:
         """Wait until the per-device SNMP send queue has drained."""
         if self._send_queue is None:
             return
 
-        await self._send_queue.join()
+        worker = self._send_worker_task
+        drained = False
+        if worker is not None and not worker.done():
+            # Drain normally, but give up as soon as a stop is requested so a
+            # backlog of queued commands is never sent after the stop.
+            drained, _ = await self._run_unless_stopped(self._send_queue.join())
 
-        if self._send_worker_task is not None and not self._send_worker_task.done():
-            await self._send_queue.put(None)
-            await self._send_worker_task
+        if worker is not None and not worker.done():
+            if drained:
+                await self._send_queue.put(None)
+                await worker
+            else:
+                worker.cancel()
+                await asyncio.wait({worker})
 
         self._send_worker_task = None
         self._send_queue = None
@@ -607,7 +813,7 @@ class SignalReplay:
     async def _run_async_inner(self, activation_feed, snmp_engine: SnmpEngine) -> None:
         """Inner replay loop that uses a shared SnmpEngine."""
         if self._stop_event.is_set():
-            print(f"[{self.device_id}] Stop requested before replay start", flush=True)
+            logger.info("[%s] Stop requested before replay start", self.device_id)
             return
 
         if self.tod_align:
@@ -619,6 +825,10 @@ class SignalReplay:
             # land on tomorrow, the day after, etc.
             min_event_date = pd.to_datetime(activation_feed['TimeStamp'].min()).date()
             date_shift = self.simulation_start_time.date() - min_event_date
+            self.replay_info.update(
+                replay_start=self.simulation_start_time,
+                date_shift_seconds=float(date_shift.total_seconds()),
+            )
 
             replay_start = self.simulation_start_time
             skipped_events = 0
@@ -642,29 +852,52 @@ class SignalReplay:
             if first_valid_idx is not None:
                 first_target = shifted_ts.loc[first_valid_idx]
                 skipped_events = int((shifted_ts < replay_start).sum())
-                print(f"[{self.device_id}] TOD align: date_shift={date_shift.days}d, "
-                      f"skipping {skipped_events}/{len(activation_feed)} old events, "
-                    f"first event at {first_target:%H:%M:%S}", flush=True)
+                logger.info(
+                    "[%s] TOD align: date_shift=%dd, skipping %d/%d old events, "
+                    "first event at %s",
+                    self.device_id, date_shift.days, skipped_events, len(activation_feed),
+                    f"{first_target:%H:%M:%S}",
+                )
             else:
-                print(f"[{self.device_id}] TOD align: ALL {len(activation_feed)} events "
-                    f"are before {replay_start:%H:%M:%S} — nothing to send!", flush=True)
+                logger.warning(
+                    "[%s] TOD align: ALL %d events are before %s - nothing to send!",
+                    self.device_id, len(activation_feed), f"{replay_start:%H:%M:%S}",
+                )
                 return
 
             # Slice to only the events we need (avoids iterating through skipped rows)
             active_feed = activation_feed.loc[first_valid_idx:]
             active_shifted = shifted_ts.loc[first_valid_idx:]
             total_to_send = len(active_feed)
+            self.replay_info["events_total"] = int(total_to_send)
 
             # Show wait time if first event is in the future
             first_delay = (first_target.to_pydatetime() - datetime.now()).total_seconds()
             if first_delay > 5:
-                print(f"[{self.device_id}] Waiting {first_delay:.0f}s until first event...", flush=True)
+                logger.info(
+                    "[%s] Waiting %.0fs until first event...", self.device_id, first_delay
+                )
+            if first_delay > 1.0:
+                # Leave the last second to the per-event wait (the live latency
+                # offset may move the target slightly).
+                if not await self._wait_with_countdown(
+                    first_delay - 1.0,
+                    "tod_first_event",
+                    f"[{self.device_id}] Waiting until first event at {first_target:%H:%M:%S}",
+                ):
+                    logger.info("[%s] Stop requested while waiting for first event", self.device_id)
+                    self._report_sent(0, total_to_send, final=True)
+                    return
 
             sent_count = 0
+            self._report_sent(0, total_to_send, final=True)
             last_progress = time.time()
             for idx, row in active_feed.iterrows():
                 if self._stop_event.is_set():
-                    print(f"[{self.device_id}] Stop requested — halting replay after {sent_count} events", flush=True)
+                    logger.info(
+                        "[%s] Stop requested - halting replay after %d events",
+                        self.device_id, sent_count,
+                    )
                     break
 
                 if self.latency_offset_provider is None:
@@ -673,15 +906,13 @@ class SignalReplay:
                     delay = (target_time - datetime.now()).total_seconds()
                     if delay > 0:
                         if not await self._sleep_interruptibly(delay):
-                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
+                            logger.info(
+                                "[%s] Stop requested while waiting for next event", self.device_id
+                            )
                             break
                 else:
                     source_target = base_ts.loc[idx]
-                    while True:
-                        if self._stop_event.is_set():
-                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
-                            return
-
+                    while not self._stop_event.is_set():
                         live_offset = self.latency_offset_provider.get_offset(self.device_id)
                         target_time = (
                             source_target
@@ -690,58 +921,96 @@ class SignalReplay:
                         delay = (target_time - datetime.now()).total_seconds()
                         if delay <= 0:
                             break
-                        if not await self._sleep_interruptibly(min(delay, 1.0)):
-                            print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
-                            return
+                        await self._sleep_interruptibly(min(delay, 1.0))
+                    if self._stop_event.is_set():
+                        # Same handling as the static path: fall through to the
+                        # drain (which drops the queue) and the detector reset.
+                        logger.info(
+                            "[%s] Stop requested while waiting for next event", self.device_id
+                        )
+                        break
 
                 await self._send_command(row, snmp_engine)
                 sent_count += 1
+                self._note_sent(row, sent_count)
+                self._report_sent(sent_count, total_to_send)
 
                 # Print progress every 60 seconds
                 now = time.time()
                 if self.show_progress_logs and now - last_progress >= self.progress_log_interval_seconds:
-                    print(f"[{self.device_id}] Sent {sent_count}/{total_to_send} events", flush=True)
+                    logger.info(
+                        "[%s] Sent %d/%d events", self.device_id, sent_count, total_to_send
+                    )
                     last_progress = now
 
             await self._wait_for_pending_sends()
+            self.replay_info["replay_end"] = datetime.now()
             self._print_send_summary()
+            self._report_sent(
+                sent_count, total_to_send, final=True,
+                message=f"[{self.device_id}] Complete - sent {sent_count} events",
+            )
             if self.show_progress_logs or self.debug:
-                print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
+                logger.info("[%s] Complete - sent %d events", self.device_id, sent_count)
             return
 
-        start_time = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
         total_events = len(activation_feed)
         sent_count = 0
+        replay_start = self.simulation_start_time or datetime.now()
+        source_anchor = pd.Timestamp(self.original_start_time) if self.original_start_time is not None else None
+        self.replay_info.update(
+            replay_start=replay_start,
+            events_total=int(total_events),
+            date_shift_seconds=(
+                float((pd.Timestamp(replay_start) - source_anchor).total_seconds())
+                if source_anchor is not None else None
+            ),
+        )
         last_progress = time.time()
+        self._report_sent(0, total_events, final=True)
 
         for _, row in activation_feed.iterrows():
             if self._stop_event.is_set():
-                print(f"[{self.device_id}] Stop requested — halting replay after {sent_count} events", flush=True)
+                logger.info(
+                    "[%s] Stop requested - halting replay after %d events",
+                    self.device_id, sent_count,
+                )
                 break
 
             # Calculate delay from start
-            current_time = asyncio.get_event_loop().time()
+            current_time = loop.time()
             delay = row.sleep_time_cumulative - (current_time - start_time)
 
             if delay > 0:
                 if not await self._sleep_interruptibly(delay):
-                    print(f"[{self.device_id}] Stop requested while waiting for next event", flush=True)
+                    logger.info(
+                        "[%s] Stop requested while waiting for next event", self.device_id
+                    )
                     break
 
             # Send command (non-blocking via executor)
             await self._send_command(row, snmp_engine)
             sent_count += 1
+            self._note_sent(row, sent_count)
+            self._report_sent(sent_count, total_events)
 
             # Print progress every 60 seconds
             now = time.time()
             if self.show_progress_logs and now - last_progress >= self.progress_log_interval_seconds:
-                print(f"[{self.device_id}] Sent {sent_count}/{total_events} events", flush=True)
+                logger.info("[%s] Sent %d/%d events", self.device_id, sent_count, total_events)
                 last_progress = now
 
         await self._wait_for_pending_sends()
+        self.replay_info["replay_end"] = datetime.now()
         self._print_send_summary()
+        self._report_sent(
+            sent_count, total_events, final=True,
+            message=f"[{self.device_id}] Complete - sent {sent_count} events",
+        )
         if self.show_progress_logs or self.debug:
-            print(f"[{self.device_id}] Complete — sent {sent_count} events", flush=True)
+            logger.info("[%s] Complete - sent %d events", self.device_id, sent_count)
     
     def _run_in_thread(self) -> None:
         """Run the async replay in a new event loop in a separate thread."""
@@ -751,22 +1020,129 @@ class SignalReplay:
         new_loop.close()
 
     async def _reset_and_run(self) -> None:
-        """Create one SnmpEngine, reset detectors, wait for cycle, then replay."""
+        """Create one SnmpEngine, reset detectors, wait for cycle, then replay.
+
+        Every group this replay touched is reset to 0 when it ends, whether
+        it completed, was stopped or failed.
+        """
         snmp_engine = SnmpEngine()
         try:
-            await async_reset_all_detectors(
-                self.ip_port,
-                debug=self.debug,
-                timeout=self.snmp_timeout_seconds,
-                snmp_engine=snmp_engine,
-            )
-            self._wait_until_next_cycle()
-            self.simulation_start_time = datetime.now()
-            await self._run_async_inner(self.activation_feed, snmp_engine)
+            try:
+                if self._stop_event.is_set():
+                    logger.info("[%s] Stop requested before replay start", self.device_id)
+                    return
+                self._progress.emit(
+                    Stage.DETECTOR_RESET,
+                    f"[{self.device_id}] Resetting all detectors before replay",
+                    device_id=self.device_id,
+                    log=False,
+                    extra={"when": "before_replay"},
+                )
+                await self._run_unless_stopped(async_reset_all_detectors(
+                    self.ip_port,
+                    debug=self.debug,
+                    timeout=self.snmp_timeout_seconds,
+                    snmp_engine=snmp_engine,
+                ))
+                await self._wait_until_next_cycle()
+                self.simulation_start_time = datetime.now()
+                await self._run_async_inner(self.activation_feed, snmp_engine)
+            finally:
+                await self._cancel_send_worker()
+                self.detectors_reset = await self._reset_touched_groups(snmp_engine)
+                self._progress.emit(
+                    Stage.DETECTOR_RESET,
+                    f"[{self.device_id}] Detector reset after replay "
+                    + ("confirmed" if self.detectors_reset else "NOT confirmed"),
+                    level=logging.INFO if self.detectors_reset else logging.WARNING,
+                    device_id=self.device_id,
+                    log=False,
+                    extra={"when": "after_replay", "ok": bool(self.detectors_reset),
+                           "groups": len(self.touched_keys)},
+                )
         finally:
             snmp_engine.close_dispatcher()
-    
-    def _wait_until_next_cycle(self) -> None:
+
+    async def _cancel_send_worker(self) -> None:
+        """Stop the send worker if the replay left early (error or cancel)."""
+        worker = self._send_worker_task
+        if worker is not None and not worker.done():
+            worker.cancel()
+            await asyncio.wait({worker})
+        self._send_worker_task = None
+        self._send_queue = None
+
+    @staticmethod
+    def _reset_keys_in_order(keys) -> List[Tuple[str, int]]:
+        """Return (type, group) keys with preempt first, then vehicle, then ped."""
+        return sorted(keys, key=lambda k: (_RESET_ORDER.get(k[0], 99), k[1]))
+
+    async def _reset_touched_groups(self, snmp_engine: SnmpEngine) -> bool:
+        """Send state 0 to every group this replay touched, within a time budget.
+
+        Runs even after a stop. Returns True when every reset was acknowledged
+        (or nothing was touched) and False on any failure or timeout.
+        """
+        keys = self._reset_keys_in_order(self.touched_keys)
+        if not keys:
+            return True
+        ok = await reset_detector_groups(
+            self.ip_port,
+            keys,
+            snmp_engine=snmp_engine,
+            timeout=self.snmp_timeout_seconds,
+            budget=self.detector_reset_timeout_seconds,
+        )
+        if ok:
+            logger.log(
+                debug_level(self.debug),
+                "[%s] Reset %d detector group(s) to 0", self.device_id, len(keys),
+            )
+        else:
+            logger.warning(
+                "[%s] Detector reset after replay did not complete; check the controller "
+                "for detector or preempt inputs left ON",
+                self.device_id,
+            )
+        return ok
+
+    def reset_touched_groups_blocking(self, budget: Optional[float] = None) -> bool:
+        """Synchronous, time-boxed reset of the touched groups (orchestrator safety net).
+
+        Safe to call from any thread, including one with a running event loop:
+        the reset runs on its own short-lived thread and event loop.
+        """
+        keys = self._reset_keys_in_order(self.touched_keys)
+        if not keys:
+            return True
+        budget = self.detector_reset_timeout_seconds if budget is None else budget
+        outcome: Dict[str, bool] = {}
+
+        async def _do() -> bool:
+            engine = SnmpEngine()
+            try:
+                return await reset_detector_groups(
+                    self.ip_port, keys, snmp_engine=engine,
+                    timeout=self.snmp_timeout_seconds, budget=budget,
+                )
+            finally:
+                engine.close_dispatcher()
+
+        def _target() -> None:
+            try:
+                outcome['ok'] = asyncio.run(_do())
+            except Exception:
+                logger.warning(
+                    "[%s] Safety-net detector reset failed", self.device_id, exc_info=True
+                )
+                outcome['ok'] = False
+
+        thread = threading.Thread(target=run_in_log_context(_target), name=f"reset-{self.device_id}", daemon=True)
+        thread.start()
+        thread.join(budget + 1.0)
+        return bool(outcome.get('ok', False))
+
+    async def _wait_until_next_cycle(self) -> None:
         """Wait until the next cycle boundary for coordinated signals."""
         if self.tod_align:
             return
@@ -784,16 +1160,32 @@ class SignalReplay:
         sleep_time = (offset - cycle_pos) % self.cycle_length
 
         if sleep_time > 0:
-            if self.debug:
-                print(
-                    f"[{self.device_id}] Waiting {sleep_time:.1f}s to align with cycle offset {offset:.1f}s"
-                )
-            remaining = sleep_time
-            while remaining > 0 and not self._stop_event.is_set():
-                chunk = min(remaining, 1.0)
-                time.sleep(chunk)
-                remaining -= chunk
+            logger.log(
+                debug_level(self.debug),
+                "[%s] Waiting %.1fs to align with cycle offset %.1fs",
+                self.device_id, sleep_time, offset,
+            )
+            await self._wait_with_countdown(
+                sleep_time,
+                "cycle_align",
+                f"[{self.device_id}] Waiting {sleep_time:.1f}s to align with cycle offset {offset:.1f}s",
+            )
     
+    def _join_after_interrupt(self, thread: threading.Thread) -> None:
+        """Wait (bounded) for a stopped replay thread to finish its reset."""
+        budget = float(self.detector_reset_timeout_seconds) + float(self.snmp_timeout_seconds) + 2.0
+        deadline = time.monotonic() + budget
+        try:
+            while thread.is_alive() and time.monotonic() < deadline:
+                thread.join(0.2)
+        except BaseException:  # a second interrupt stops the wait
+            pass
+        if thread.is_alive():
+            logger.warning(
+                "[%s] Replay thread still running %.0fs after the interrupt; detectors may not be reset",
+                self.device_id, budget,
+            )
+
     def run(self) -> datetime:
         """
         Run the SNMP command replay.
@@ -808,11 +1200,37 @@ class SignalReplay:
             asyncio.run(self._reset_and_run())
         else:
             # Event loop already running, use thread
-            thread = threading.Thread(target=self._run_in_thread)
+            thread = threading.Thread(target=run_in_log_context(self._run_in_thread), daemon=True)
             thread.start()
-            thread.join()
+            # Join in short steps so Ctrl+C can still reach the caller on Windows.
+            try:
+                while thread.is_alive():
+                    thread.join(0.5)
+            except BaseException:
+                # Ctrl+C or a kernel interrupt: stop the replay thread and give
+                # it time to reset the detectors it touched before re-raising.
+                self.request_stop()
+                self._join_after_interrupt(thread)
+                raise
         
         return self.simulation_start_time
+
+
+def source_time_from_info(info: Dict[str, Any], timestamp: datetime) -> Optional[datetime]:
+    """Map ``timestamp`` to source time using a :attr:`SignalReplay.replay_info` dict."""
+    if not info or timestamp is None:
+        return None
+    shift = info.get("date_shift_seconds")
+    if shift is None:
+        return None
+    ts = pd.Timestamp(timestamp)
+    speed = float(info.get("speed") or 1.0)
+    if info.get("mode") == "relative" and speed != 1.0 and info.get("replay_start") is not None:
+        replay_start = pd.Timestamp(info["replay_start"])
+        source_anchor = replay_start - pd.Timedelta(seconds=shift)
+        # Scaling can leave nanoseconds that datetime cannot hold; truncate them.
+        return (source_anchor + (ts - replay_start) * speed).floor("us").to_pydatetime()
+    return (ts - pd.Timedelta(seconds=float(shift))).to_pydatetime()
 
 
 def create_replays(
@@ -824,7 +1242,8 @@ def create_replays(
     show_progress_logs: bool = False,
     progress_log_interval_seconds: float = 60.0,
     stop_event: Optional[threading.Event] = None,
-    debug: bool = False
+    debug: bool = False,
+    on_progress: Optional[ProgressCallback] = None,
 ) -> List[SignalReplay]:
     """
     Create SignalReplay instances for multiple signals.
@@ -837,7 +1256,9 @@ def create_replays(
         snmp_retry_backoff_seconds: Delay between replay retry attempts
         show_progress_logs: If True, print periodic "Sent x/y events" updates
         progress_log_interval_seconds: Seconds between periodic progress updates
+        stop_event: Optional shared stop event for every replay
         debug: Enable debug output
+        on_progress: Optional progress callback shared by every replay
     
     Returns:
         List of SignalReplay instances
@@ -853,6 +1274,7 @@ def create_replays(
             progress_log_interval_seconds=progress_log_interval_seconds,
             stop_event=stop_event,
             debug=debug,
+            on_progress=on_progress,
         )
         for config in configs
     ]

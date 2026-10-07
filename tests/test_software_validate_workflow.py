@@ -1,6 +1,5 @@
 import importlib.util
 import json
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +8,7 @@ import duckdb
 import pandas as pd
 
 import signal_replay as sr
+from signal_replay import validation
 
 
 def _load_software_validate_module():
@@ -638,8 +638,7 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
         "analysis_workers": 1,
     }
 
-    with patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
-        results = software_validate.run_analysis(suite, settings, software_dir)
+    results = software_validate.run_analysis(suite, settings, software_dir)
 
     assert len(results) == 1
     assert not (results_dir / "2.17.3" / "logs").exists()
@@ -654,6 +653,9 @@ def test_run_analysis_computes_conflicts_from_saved_output_logs(tmp_path):
             "run_number": 2,
             "timestamp": "2026-01-02 10:00:05",
             "conflict_details": "Ph1 & Ph2",
+            "last_timestamp": "2026-01-02 10:00:10",
+            "occurrences": 1,
+            "duration_seconds": 5.0,
         }
     ]
     assert "Conflict observed on 2.17.3 in run(s): 2." in result.notes
@@ -724,8 +726,7 @@ def test_run_analysis_marks_similarity_scenarios_with_missing_collected_rows_as_
         "analysis_workers": 1,
     }
 
-    with patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor):
-        results = software_validate.run_analysis(suite, settings, software_dir)
+    results = software_validate.run_analysis(suite, settings, software_dir)
 
     assert len(results) == 1
     result = results[0]
@@ -793,7 +794,6 @@ def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
 
     with (
         patch.object(software_validate, "_export_device_csvs", side_effect=AssertionError("device CSV export should be skipped")),
-        patch.object(software_validate, "ProcessPoolExecutor", ThreadPoolExecutor),
     ):
         results = software_validate.run_analysis(
             suite,
@@ -807,9 +807,30 @@ def test_run_analysis_can_skip_device_csv_export_in_report_only_mode(tmp_path):
     assert not (results_dir / "2.17.3" / "device_events").exists()
 
 
-def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_path):
-    software_validate = _load_software_validate_module()
+def _similarity_job(baseline, collected, tmp_path):
+    return {
+        "scenario_id": "12035",
+        "baseline": baseline,
+        "candidate": collected,
+        "candidate_source": "collected.db",
+        "settings": sr.ValidationSettings(
+            settle_minutes=0.0,
+            group_tolerance=0.0,
+            max_plots=5,
+            window_minutes=15,
+            phase_call_threshold=90.0,
+            baseline_label="2.15.1",
+            candidate_label="2.17.3",
+        ),
+        "notes_column": "",
+        "tod_align": False,
+        "plots_dir": str(tmp_path / "plots"),
+        "coord_split_schedules": {},
+        "quiet": False,
+    }
 
+
+def test_compare_similarity_marks_empty_chunk_similarity_as_thrown_out(tmp_path):
     baseline = pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
     )
@@ -834,47 +855,23 @@ def test_compare_one_scenario_marks_empty_chunk_similarity_as_thrown_out(tmp_pat
             return "Match: thrown out\nInsufficient scored chunks remained after settling/filtering for a reliable comparison."
 
     with (
-        patch.object(software_validate, "_load_baseline_events", return_value=baseline),
-        patch.object(software_validate, "_load_collected_events_from_duckdb", return_value=collected),
         patch.object(
-            software_validate,
+            validation,
             "_prepare_analysis_inputs",
             return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 1)),
         ),
-        patch("signal_replay.compare_runs", return_value=FakeComparisonResult()),
-        patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
-        patch("signal_replay.render_sparkline_svg", return_value=""),
+        patch.object(validation, "compare_runs", return_value=FakeComparisonResult()),
+        patch.object(validation, "generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
+        patch.object(validation, "render_sparkline_svg", return_value=""),
     ):
-        out = software_validate._compare_one_scenario(
-            (
-                "12035",
-                ("parquet", str(tmp_path / "12035.parquet")),
-                "2.15.1",
-                "SIMILARITY",
-                str(tmp_path / "collected.db"),
-                "2.17.3",
-                str(tmp_path / "plots"),
-                0.0,
-                0.0,
-                5,
-                15,
-                False,
-                "",
-                False,
-                None,
-                None,
-                90.0,
-            )
-        )
+        out = validation._compare_similarity(_similarity_job(baseline, collected, tmp_path))
 
-    assert out["thrown_out"] is True
-    assert out["thrown_out_reason"] == "Insufficient scored chunks remained after settling/filtering for a reliable comparison."
-    assert "Match: thrown out" in out["summary"]
+    assert out.thrown_out is True
+    assert out.thrown_out_reason == "Insufficient scored chunks remained after settling/filtering for a reliable comparison."
+    assert "Match: thrown out" in out.notes
 
 
-def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_path):
-    software_validate = _load_software_validate_module()
-
+def test_compare_similarity_fails_when_timing_match_is_below_threshold(tmp_path):
     baseline = pd.DataFrame(
         [{"timestamp": pd.Timestamp("2026-01-01 09:00:00"), "event_id": 1, "parameter": 1}]
     )
@@ -886,7 +883,7 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
     class FakeComparisonResult:
         def __init__(self):
             self.chunk_scores = [
-                software_validate.sr.ChunkScore(
+                sr.ChunkScore(
                     center_seconds=1350.0,
                     match_percentage=100.0,
                     window_seconds=2700.0,
@@ -908,44 +905,22 @@ def test_compare_one_scenario_fails_when_timing_match_is_below_threshold(tmp_pat
             return "Match: 100.0%\nTiming: Timing match=89.9%, max=2.000s, 95th pctl=0.750s"
 
     with (
-        patch.object(software_validate, "_load_baseline_events", return_value=baseline),
-        patch.object(software_validate, "_load_collected_events_from_duckdb", return_value=collected),
         patch.object(
-            software_validate,
+            validation,
             "_prepare_analysis_inputs",
             return_value=(baseline, collected, datetime(2026, 1, 1, 9, 0, 0), datetime(2026, 1, 1, 9, 0, 0)),
         ),
-        patch("signal_replay.compare_runs", return_value=FakeComparisonResult()),
-        patch("signal_replay.generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
-        patch("signal_replay.render_sparkline_svg", return_value=""),
+        patch.object(validation, "compare_runs", return_value=FakeComparisonResult()),
+        patch.object(validation, "generate_timeline", side_effect=[empty_timeline.copy(), empty_timeline.copy()]),
+        patch.object(validation, "render_sparkline_svg", return_value=""),
     ):
-        out = software_validate._compare_one_scenario(
-            (
-                "12035",
-                ("parquet", str(tmp_path / "12035.parquet")),
-                "2.15.1",
-                "SIMILARITY",
-                str(tmp_path / "collected.db"),
-                "2.17.3",
-                str(tmp_path / "plots"),
-                0.0,
-                0.0,
-                5,
-                15,
-                False,
-                "",
-                False,
-                None,
-                None,
-                90.0,
-            )
-        )
+        out = validation._compare_similarity(_similarity_job(baseline, collected, tmp_path))
 
-    assert out["match_percentage"] == 100.0
-    assert out["timing_match_percentage"] == 89.9
-    assert out["timing_p95_error_seconds"] == 0.75
-    assert out["timing_max_error_seconds"] == 2.0
-    assert out["passed"] is False
+    assert out.match_percentage == 100.0
+    assert out.timing_match_percentage == 89.9
+    assert out.timing_p95_error_seconds == 0.75
+    assert out.timing_max_error_seconds == 2.0
+    assert out.passed is False
 
 
 def test_main_report_only_fast_skips_device_csv_export(tmp_path):
@@ -1010,7 +985,7 @@ def _build_issue_timeline(rows):
 
 
 def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_duration_outlier():
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1065,7 +1040,7 @@ def test_select_operational_issue_anchor_prefers_missing_service_cluster_over_du
 
 
 def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path):
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1098,21 +1073,7 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
         return object()
 
     with (
-        patch.object(
-            software_validate,
-            "_load_coord_split_schedules",
-            return_value={
-                "S1": [
-                    {
-                        "phase": 4,
-                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
-                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
-                    }
-                ]
-            },
-        ),
-        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(software_validate.plt, "close"),
+        patch.object(validation, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
     ):
         plot_paths, plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
@@ -1146,6 +1107,15 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
             time_offset_b=0.0,
             align_by_time_delta=False,
             tod_align=True,
+            coord_split_schedules={
+                "S1": [
+                    {
+                        "phase": 4,
+                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
+                    }
+                ]
+            },
         )
 
     assert len(plot_paths) == 1
@@ -1160,7 +1130,7 @@ def test_generate_special_issue_plots_includes_green_phase_differences(tmp_path)
 
 
 def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transition_with_base_device_fallback(tmp_path):
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1197,21 +1167,7 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
         return object()
 
     with (
-        patch.object(
-            software_validate,
-            "_load_coord_split_schedules",
-            return_value={
-                "2B045": [
-                    {
-                        "phase": 2,
-                        "start_time": datetime.strptime("09:00:05", "%H:%M:%S").time(),
-                        "end_time": datetime.strptime("09:00:40", "%H:%M:%S").time(),
-                    }
-                ]
-            },
-        ),
-        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(software_validate.plt, "close"),
+        patch.object(validation, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
     ):
         plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="2B045_c",
@@ -1239,6 +1195,15 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
             time_offset_b=0.0,
             align_by_time_delta=False,
             tod_align=True,
+            coord_split_schedules={
+                "2B045": [
+                    {
+                        "phase": 2,
+                        "start_time": datetime.strptime("09:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("09:00:40", "%H:%M:%S").time(),
+                    }
+                ]
+            },
         )
 
     assert len(plot_paths) == 1
@@ -1248,7 +1213,7 @@ def test_generate_special_issue_plots_passes_programmed_splits_for_tod_transitio
 
 
 def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(tmp_path):
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1279,21 +1244,7 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
         return object()
 
     with (
-        patch.object(
-            software_validate,
-            "_load_coord_split_schedules",
-            return_value={
-                "S1": [
-                    {
-                        "phase": 4,
-                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
-                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
-                    }
-                ]
-            },
-        ),
-        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(software_validate.plt, "close"),
+        patch.object(validation, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
     ):
         plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
@@ -1327,6 +1278,15 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
             time_offset_b=0.0,
             align_by_time_delta=False,
             tod_align=True,
+            coord_split_schedules={
+                "S1": [
+                    {
+                        "phase": 4,
+                        "start_time": datetime.strptime("11:00:05", "%H:%M:%S").time(),
+                        "end_time": datetime.strptime("11:00:35", "%H:%M:%S").time(),
+                    }
+                ]
+            },
         )
 
     assert len(plot_paths) == 1
@@ -1335,7 +1295,7 @@ def test_generate_special_issue_plots_skips_programmed_splits_for_overlap_green(
 
 
 def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(tmp_path):
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1408,8 +1368,7 @@ def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(t
         return object()
 
     with (
-        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(software_validate.plt, "close"),
+        patch.object(validation, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
     ):
         plot_paths, _plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
@@ -1503,7 +1462,7 @@ def test_generate_special_issue_plots_groups_non_clearance_types_per_new_rules(t
 
 
 def test_select_operational_issue_anchor_handles_transition_rows_with_missing_event_value():
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1543,7 +1502,7 @@ def test_select_operational_issue_anchor_handles_transition_rows_with_missing_ev
 
 
 def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conflicts(tmp_path):
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [
@@ -1586,8 +1545,7 @@ def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conf
         return object()
 
     with (
-        patch.object(software_validate.sr, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
-        patch.object(software_validate.plt, "close"),
+        patch.object(validation, "create_comparison_gantt_matplotlib", side_effect=fake_create_comparison_gantt_matplotlib),
     ):
         plot_paths, plot_captions = software_validate._generate_special_issue_plots(
             scenario_id="S1",
@@ -1650,7 +1608,7 @@ def test_generate_special_issue_plots_uses_next_best_window_when_top_window_conf
 
 
 def test_select_clearance_issue_spec_anchors_current_version_irregularity():
-    software_validate = _load_software_validate_module()
+    software_validate = validation
 
     timeline_a = _build_issue_timeline(
         [

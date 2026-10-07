@@ -2,29 +2,48 @@
 Pytest configuration and fixtures for signal_replay tests.
 
 This module provides:
-- Fixtures for live device testing (skipped in CI if device unreachable)
+- Fixtures for live device testing (opt-in; see below)
 - Common test utilities and synthetic data generators
+
+Live tests are marked ``live`` and deselected by default (``addopts`` in
+pyproject.toml). No device address is stored in the repository. To run them
+against your own test controller set the environment variables and select the
+marker explicitly::
+
+    TEST_CONTROLLER_IP=192.168.1.100:161 TEST_CONTROLLER_HTTP_PORT=80 pytest -m live
 """
+
+import os
+from typing import Optional, Tuple
 
 import matplotlib
 
-# Headless plotting for the whole test session. CI has no display, and the interactive
-# Tk backend that Windows picks by default is not safe to drive from pytest's worker threads.
+# Headless plotting for the whole test session. The package itself never uses pyplot,
+# but software_validation/software_validate.py (exercised by some tests) does, and the
+# interactive Tk backend that Windows picks by default is not safe from worker threads.
 matplotlib.use("Agg")
 
 import pytest
-from typing import Tuple
 
 
-# Live test device configuration
-# Update this to match your test controller
-LIVE_DEVICE_IP_PORT: Tuple[str, int] = ('<controller-ip>', 161)
+def live_device_ip_port_from_env() -> Optional[Tuple[str, int]]:
+    """Parse TEST_CONTROLLER_IP ("ip" or "ip:snmp_port"); None when unset."""
+    raw = os.environ.get("TEST_CONTROLLER_IP", "").strip()
+    if not raw:
+        return None
+    ip, _, port = raw.partition(":")
+    return (ip, int(port) if port else 161)
+
+
+def live_device_http_port_from_env() -> int:
+    """HTTP port of the live device's event log endpoint (TEST_CONTROLLER_HTTP_PORT, default 80)."""
+    return int(os.environ.get("TEST_CONTROLLER_HTTP_PORT", "80") or 80)
 
 
 def is_device_reachable(ip_port: Tuple[str, int], timeout: float = 5.0) -> bool:
     """
     Check if a device is reachable via SNMP.
-    
+
     Attempts to send a simple SNMP command to verify connectivity.
     """
     try:
@@ -35,32 +54,25 @@ def is_device_reachable(ip_port: Tuple[str, int], timeout: float = 5.0) -> bool:
         return False
 
 
-def pytest_configure(config):
-    """Register custom markers."""
-    config.addinivalue_line(
-        "markers", "live_device: marks tests as requiring live device (skipped if unreachable)"
-    )
+@pytest.fixture(scope="session")
+def live_device_ip_port() -> Tuple[str, int]:
+    """
+    Fixture providing the live test device IP/port from TEST_CONTROLLER_IP.
+
+    Skips the test if the variable is unset or the device is not reachable.
+    """
+    ip_port = live_device_ip_port_from_env()
+    if ip_port is None:
+        pytest.skip("Live device not configured. Set TEST_CONTROLLER_IP to run live tests.")
+    if not is_device_reachable(ip_port):
+        pytest.skip(f"Live device {ip_port[0]}:{ip_port[1]} not reachable.")
+    return ip_port
 
 
 @pytest.fixture(scope="session")
-def live_device_available() -> bool:
-    """Check if live device is available for the entire test session."""
-    return is_device_reachable(LIVE_DEVICE_IP_PORT)
-
-
-@pytest.fixture(scope="session")
-def live_device_ip_port(live_device_available) -> Tuple[str, int]:
-    """
-    Fixture providing the live test device IP/port.
-    
-    Skips the test if the device is not reachable.
-    """
-    if not live_device_available:
-        pytest.skip(
-            f"Live device {LIVE_DEVICE_IP_PORT[0]}:{LIVE_DEVICE_IP_PORT[1]} not reachable. "
-            f"Set LIVE_DEVICE_IP_PORT in conftest.py to run live tests."
-        )
-    return LIVE_DEVICE_IP_PORT
+def live_device_http_port() -> int:
+    """Fixture providing the live device HTTP port (TEST_CONTROLLER_HTTP_PORT)."""
+    return live_device_http_port_from_env()
 
 
 @pytest.fixture
@@ -69,9 +81,8 @@ def temp_db_path(tmp_path):
     db_file = tmp_path / "test_simulation.db"
     db_path = str(db_file)
     yield db_path
-    
+
     # Cleanup after test
-    import os
     try:
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -81,4 +92,3 @@ def temp_db_path(tmp_path):
                 os.remove(db_path + ext)
     except Exception as e:
         print(f"Warning: Could not clean up {db_path}: {e}")
-

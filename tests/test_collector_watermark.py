@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 import threading
 
 import pandas as pd
@@ -104,7 +105,7 @@ def test_insert_failures_do_not_advance_watermark_and_abort_after_three():
     assert err.is_set()
 
 
-def test_http_collection_failures_are_non_fatal_and_logged_once(capsys):
+def test_http_collection_failures_are_non_fatal_and_logged_once(caplog):
     collector = DataCollector(
         db_path="ignored.db",
         device_configs={"d1": (("127.0.0.1", 161), [], 80)},
@@ -112,16 +113,20 @@ def test_http_collection_failures_are_non_fatal_and_logged_once(capsys):
     err = threading.Event()
     start_time = datetime(2026, 1, 1, 11, 0, 0)
 
-    with patch(
+    with caplog.at_level(logging.WARNING, logger="signal_replay.collector"), patch(
         "signal_replay.collector.fetch_output_data",
         side_effect=requests.exceptions.ConnectionError("boom"),
     ):
         collector.collect_once(1, start_time, error_event=err)
         collector.collect_once(1, start_time, error_event=err)
 
-    out = capsys.readouterr().out
-    assert "*** COLLECTION WARNING:" in out
-    assert out.count("*** COLLECTION WARNING:") == 1
+    warnings_logged = [
+        record for record in caplog.records
+        if record.name == "signal_replay.collector"
+        and "COLLECTION WARNING" in record.getMessage()
+    ]
+    assert len(warnings_logged) == 1
+    assert warnings_logged[0].levelno == logging.WARNING
     assert not err.is_set()
 
 

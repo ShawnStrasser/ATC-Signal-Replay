@@ -1,24 +1,10 @@
-import importlib.util
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
-
-def _load_software_validate_module():
-    module_name = "_software_validate_under_test"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-
-    module_path = Path(__file__).resolve().parents[1] / "software_validation" / "software_validate.py"
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+from signal_replay import validation
 
 
 def _timeline(event_class, event_value, durations):
@@ -42,14 +28,14 @@ def _timeline(event_class, event_value, durations):
 
 
 def test_clearance_issue_plots_skip_old_version_only_irregularities(tmp_path, monkeypatch):
-    fv = _load_software_validate_module()
+    fv = validation
     captured = []
 
     def fake_create_comparison_gantt_matplotlib(**kwargs):
         captured.append(kwargs)
         return plt.figure()
 
-    monkeypatch.setattr(fv.sr, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+    monkeypatch.setattr(fv, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
 
     plot_paths, captions = fv._generate_special_issue_plots(
         scenario_id="03013",
@@ -83,7 +69,7 @@ def test_clearance_issue_plots_skip_old_version_only_irregularities(tmp_path, mo
 
 
 def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, monkeypatch):
-    fv = _load_software_validate_module()
+    fv = validation
     base_time = datetime(2026, 4, 2, 9, 0, 0)
     captured = []
 
@@ -91,7 +77,7 @@ def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, 
         captured.append(kwargs)
         return plt.figure()
 
-    monkeypatch.setattr(fv.sr, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+    monkeypatch.setattr(fv, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
 
     timeline_a = pd.DataFrame(
         [
@@ -155,14 +141,14 @@ def test_clearance_issue_plots_skip_issues_without_five_minutes_after(tmp_path, 
 
 
 def test_clearance_issue_plots_anchor_new_version_irregularity(tmp_path, monkeypatch):
-    fv = _load_software_validate_module()
+    fv = validation
     captured = []
 
     def fake_create_comparison_gantt_matplotlib(**kwargs):
         captured.append(kwargs)
         return plt.figure()
 
-    monkeypatch.setattr(fv.sr, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
+    monkeypatch.setattr(fv, "create_comparison_gantt_matplotlib", fake_create_comparison_gantt_matplotlib)
 
     timeline_a = _timeline("Yellow", 2, [4.0, 4.0, 5.5])
     timeline_b = _timeline("Yellow", 2, [4.0, 4.0, 4.9])
@@ -201,7 +187,7 @@ def test_clearance_issue_plots_anchor_new_version_irregularity(tmp_path, monkeyp
 
 
 def test_mixed_use_overlap_yellow_is_treated_as_non_clearance_issue():
-    fv = _load_software_validate_module()
+    fv = validation
     diff = {
         "event_class": "Overlap Yellow",
         "event_value": 5,
@@ -215,7 +201,7 @@ def test_mixed_use_overlap_yellow_is_treated_as_non_clearance_issue():
 
 
 def test_clustered_overlap_yellow_remains_clearance_for_issue_selection():
-    fv = _load_software_validate_module()
+    fv = validation
     diff = {
         "event_class": "Overlap Yellow",
         "event_value": 5,

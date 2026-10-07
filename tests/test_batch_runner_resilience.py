@@ -92,10 +92,6 @@ def test_failed_batch_is_not_marked_complete_and_data_is_cleared(tmp_path):
     assert sample_rows == 0
     assert other_sample_rows == 1
 
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
-
 
 def test_similarity_batch_passes_suite_replay_latency_to_signal_config(tmp_path):
     suite = _build_suite(tmp_path)
@@ -118,10 +114,6 @@ def test_similarity_batch_passes_suite_replay_latency_to_signal_config(tmp_path)
         )
 
     assert captured["signals"][0].replay_latency_offset_seconds == 1.55
-
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
 
 
 def test_similarity_batch_passes_adaptive_latency_settings_to_simulation(tmp_path):
@@ -149,10 +141,6 @@ def test_similarity_batch_passes_adaptive_latency_settings_to_simulation(tmp_pat
     assert captured["kwargs"]["replay_latency_offset_lookback_min"] == 10.0
     assert captured["kwargs"]["replay_latency_offset_min_samples"] == 12
 
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
-
 
 def test_similarity_batch_raises_when_simulation_reports_collection_error(tmp_path):
     suite = _build_suite(tmp_path)
@@ -177,10 +165,6 @@ def test_similarity_batch_raises_when_simulation_reports_collection_error(tmp_pa
         else:
             raise AssertionError("Expected collection error to fail the batch")
 
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
-
 
 def test_conflict_scenario_passes_suite_replay_latency_to_signal_config(tmp_path):
     suite = _build_suite(tmp_path)
@@ -204,10 +188,6 @@ def test_conflict_scenario_passes_suite_replay_latency_to_signal_config(tmp_path
         )
 
     assert captured["signals"][0].replay_latency_offset_seconds == 1.55
-
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
 
 
 def test_conflict_scenario_raises_when_simulation_reports_collection_error(tmp_path):
@@ -234,6 +214,55 @@ def test_conflict_scenario_raises_when_simulation_reports_collection_error(tmp_p
         else:
             raise AssertionError("Expected collection error to fail the scenario")
 
-    for handler in runner.logger.handlers:
-        handler.close()
-    runner.logger.handlers.clear()
+
+def _legacy_db(db_path: Path) -> None:
+    """A collected.db as written by 0.x: simulation_runs keyed by run_number only."""
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        "CREATE TABLE events (device_id VARCHAR, run_number INTEGER, timestamp TIMESTAMP, "
+        "event_id INTEGER, parameter INTEGER, "
+        "PRIMARY KEY (device_id, run_number, timestamp, event_id, parameter))"
+    )
+    con.execute("INSERT INTO events VALUES ('S1', 1, '2026-01-01 12:00:00', 1, 1)")
+    con.execute("INSERT INTO events VALUES ('S2', 1, '2026-01-01 12:00:01', 1, 1)")
+    con.execute(
+        "CREATE TABLE simulation_runs (run_number INTEGER PRIMARY KEY, status VARCHAR, "
+        "started_at TIMESTAMP, completed_at TIMESTAMP)"
+    )
+    con.execute(
+        "INSERT INTO simulation_runs VALUES (1, 'completed', '2026-01-01 12:00:00', '2026-01-01 12:10:00')"
+    )
+    con.close()
+
+
+def test_clear_scenario_data_handles_legacy_simulation_runs(tmp_path):
+    suite = _build_suite(tmp_path)
+    runner = sr.BatchRunner(suite, debug=False)
+    db_path = runner.run_dir / "collected.db"
+    _legacy_db(db_path)
+
+    runner._clear_scenario_data(db_path, ["S1"])
+
+    con = duckdb.connect(str(db_path))
+    assert con.execute("SELECT device_id FROM events").fetchall() == [("S2",)]
+    assert con.execute("SELECT COUNT(*) FROM simulation_runs").fetchone()[0] == 1
+    con.close()
+    # Opening it migrates simulation_runs; the cleared scenario has no done run.
+    db = sr.DatabaseManager(str(db_path))
+    assert db.get_completed_run_numbers(["S1"]) == []
+    assert db.get_completed_run_numbers(["S2"]) == [1]
+
+
+def test_failed_batch_on_legacy_db_reports_the_real_error(tmp_path):
+    suite = _build_suite(tmp_path)
+    runner = sr.BatchRunner(suite, debug=False)
+    db_path = runner.run_dir / "collected.db"
+    _legacy_db(db_path)
+
+    with patch.object(runner, "_run_similarity_batch", side_effect=RuntimeError("boom")):
+        checkpoint = runner.run(db_loader_callback=lambda *_args: True)
+
+    assert "boom" in str(checkpoint.get("batch_errors", {}).get("batch_1"))
+    con = duckdb.connect(str(db_path))
+    assert con.execute("SELECT COUNT(*) FROM events WHERE device_id = 'S1'").fetchone()[0] == 0
+    con.close()

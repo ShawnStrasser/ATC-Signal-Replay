@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 (Unreleased)
+## 1.0.0 (2026-10-06)
 
 First stable release. From here on, renaming or removing anything in `signal_replay.__all__` bumps the major version; new features bump the minor version; fixes bump the patch version. `tests/test_public_api.py` guards the list.
 

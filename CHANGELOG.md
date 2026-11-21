@@ -15,7 +15,6 @@
 ### Changed
 
 - **Timeline validity follows atspm 3.** `has_data` now scores unexpected gaps, so the partly covered first and last 15-minute bins of a log count as having data. Their intervals were invalid in 1.0.x and now count in the phase, clearance and operational summaries instead of Data Integrity. On the 13008 reproduction example, pass/fail, sequence match (98.6%), timing match (96.6%), divergences and plots are unchanged, and the summaries use about 1% more rows (17,154 valid baseline rows instead of 16,944).
-- **`generate_timeline()` keeps 1:00 to 2:00 am on the first Sunday of November.** atspm 3 drops that hour by default (`drop_fall_back_hour`), and the two logs compared can come from different days.
 - `atspm` no longer installs `ibis-framework`, so the Windows long-path advice is gone. It installs `atspm-detector`, with `onnxruntime`.
 
 ## 1.0.1 (2026-10-06)

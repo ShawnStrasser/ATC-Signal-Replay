@@ -70,24 +70,6 @@ def test_timeline_from_field_events(field_events):
     assert timeline.loc[timeline["IsValid"], "StartTime"].dt.floor("15min").nunique() == 3
 
 
-def test_timeline_keeps_the_fall_back_hour():
-    """atspm drops 1-2 am on the first Sunday of November unless told not to."""
-    start = pd.Timestamp("2026-11-01 00:50:00")
-    rows = []
-    for cycle in range(100):
-        t = start + timedelta(seconds=90 * cycle)
-        rows += [(t, 1, 2), (t + timedelta(seconds=40), 8, 2), (t + timedelta(seconds=44), 10, 2),
-                 (t + timedelta(seconds=46), 1, 4), (t + timedelta(seconds=80), 8, 4),
-                 (t + timedelta(seconds=84), 10, 4)]
-    events = pd.DataFrame(rows, columns=["timestamp", "event_id", "parameter"])
-
-    timeline = generate_timeline(events, device_id=DEVICE)
-
-    greens = timeline[timeline["EventClass"] == "Green"]
-    in_hour = greens["StartTime"].between(pd.Timestamp("2026-11-01 01:00"), pd.Timestamp("2026-11-01 01:59:59"))
-    assert in_hour.sum() >= 75  # 40 cycles of two greens in that hour
-
-
 def test_compare_validation_builds_and_uses_the_timeline(field_events, tmp_path):
     [result] = sr.compare_validation(
         {DEVICE: field_events}, {DEVICE: _longer_yellow(field_events)}, _suite(),

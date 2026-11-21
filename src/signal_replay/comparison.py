@@ -3046,14 +3046,12 @@ def generate_timeline(
         'raw_data': df,
         'bin_size': 15,  # Required by atspm - 15 minute bins
         'verbose': 0,  # atspm prints timings to stdout otherwise; errors still raise
+        # atspm drops 1-2 am on the first Sunday of November by default; the two logs
+        # compared here can come from different days, so keep every event
+        'drop_fall_back_hour': False,
         'aggregations': [
-            {
-                'name': 'has_data', 
-                'params': {
-                    'no_data_min': 5,           # Min minutes of data required per bin
-                    'min_data_points': 1        # Min events required per sub-bin
-                }
-            },
+            # timeline requires has_data; it marks intervals over a bin with no data invalid
+            {'name': 'has_data', 'params': {}},
             {
                 'name': 'timeline',
                 'params': {

@@ -821,9 +821,9 @@ def test_compare_validation_with_dataframes_frames_and_conflicts(tmp_path):
             app.execute(f"CREATE TABLE {name} AS SELECT * FROM df")
             app.execute(f"INSERT INTO {name} SELECT * FROM df")
             app.unregister("df")
-            assert app.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0] == 2 * len(df)
-        assert app.execute("SELECT COUNT(*) FROM scenario_results").fetchone()[0] == 6
-        assert app.execute("SELECT COUNT(*) FROM comparison_scores").fetchone()[0] == 4
+            assert app.execute(f"SELECT COUNT(*) FROM {name}").fetchall()[0][0] == 2 * len(df)
+        assert app.execute("SELECT COUNT(*) FROM scenario_results").fetchall()[0][0] == 6
+        assert app.execute("SELECT COUNT(*) FROM comparison_scores").fetchall()[0][0] == 4
         kinds = {row[0] for row in app.execute("SELECT DISTINCT kind FROM scenario_findings").fetchall()}
         assert "analysis_diagnostic" in kinds
         windows = app.execute(
@@ -854,7 +854,7 @@ def test_results_to_frames_for_replication_result_inserts_into_app_db(tmp_path):
             app.unregister("df")
         row = app.execute(
             "SELECT run_uuid, device_id, run_number, source_equivalent_timestamp FROM replay_conflicts"
-        ).fetchone()
+        ).fetchall()[0]
     finally:
         app.close()
     assert row[0] == result.run_uuid and row[1] == DEVICE and row[2] == 2
@@ -926,7 +926,7 @@ def test_empty_frames_have_column_types_for_create_table():
         con.register("df", frames["scenario_results"])
         con.execute("INSERT INTO t_scenario_results SELECT * FROM df")
         con.unregister("df")
-        row = con.execute("SELECT scenario_id, passed, notes, error FROM t_scenario_results").fetchone()
+        row = con.execute("SELECT scenario_id, passed, notes, error FROM t_scenario_results").fetchall()[0]
         assert row == ("S1", True, "text", None)
     finally:
         con.close()

@@ -545,11 +545,14 @@ class ATCSimulation:
 
     def _wait_stoppable(self, seconds: float) -> bool:
         """Sleep up to ``seconds``; return False early if a stop is requested."""
-        deadline = time.monotonic() + max(0.0, seconds)
+        # perf_counter: before Python 3.13, monotonic() on Windows ticks every ~16 ms, so the
+        # settle wait could end just short of replay end + settle by the wall clock and the
+        # final collection then waited a whole poll interval
+        deadline = time.perf_counter() + max(0.0, seconds)
         while True:
             if self._should_stop():
                 return False
-            remaining = deadline - time.monotonic()
+            remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 return True
             self._stop_event.wait(min(remaining, _MAIN_WAIT_SECONDS))

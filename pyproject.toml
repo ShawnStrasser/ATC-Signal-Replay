@@ -9,7 +9,7 @@ description = "Python package for replaying high-resolution event logs from ATC 
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Shawn Strasser"}
 ]
@@ -19,7 +19,6 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -29,15 +28,15 @@ classifiers = [
 
 dependencies = [
     "pysnmp>=7.0,<8",
-    "duckdb>=1.1,<2",
-    "pandas>=2.0,<3",
-    "numpy>=1.24",
+    "duckdb>=2.0,<3",
+    "pandas>=3.0,<4",
+    "numpy>=2.0",
     "pyarrow>=14",
     "dtaidistance>=2.3,<3",
     "jinja2>=3",
     "matplotlib>=3.7",
     # Imported lazily, only by generate_timeline().
-    "atspm>=2.5,<3",
+    "atspm>=3.1.0,<4",
     # Imported lazily, only by the built-in MAXTIME HTTP event log fetch.
     "requests>=2.28",
 ]
@@ -89,17 +88,18 @@ testpaths = ["tests"]
 # Live tests send SNMP/HTTP to a real controller. They never run unless selected
 # explicitly with `pytest -m live` (see README, "Running the tests").
 addopts = "-m 'not live'"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "live: sends SNMP/HTTP to a real or emulated controller; deselected by default, run with -m live",
 ]
 
 [tool.black]
 line-length = 100
-target-version = ["py310", "py311", "py312", "py313"]
+target-version = ["py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]

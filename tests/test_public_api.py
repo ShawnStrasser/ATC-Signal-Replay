@@ -140,7 +140,8 @@ def test_consumer_pytest_collects_nothing_from_the_package(tmp_path):
     )
     proc = subprocess.run(
         [
-            sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            # no:asyncio: pytest-asyncio 1.x warns about its own unset config in a bare rootdir
+            sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:asyncio",
             "-W", "error::pytest.PytestCollectionWarning",
             "-o", "addopts=", "--rootdir", str(tmp_path), str(tmp_path / "test_consumer.py"),
         ],

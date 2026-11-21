@@ -19,7 +19,7 @@ pip install signal-replay          # from PyPI
 pip install -e .                   # from a clone of this repository
 ```
 
-Requires Python 3.10 or newer. The package installs `duckdb`, `pandas`, `pysnmp`, `atspm`, `matplotlib`, and the other runtime dependencies. On Windows, keep the virtual environment in a short folder path (or enable long-path support): `atspm` pulls in `ibis-framework`, whose files have long paths. Optional extras:
+Requires Python 3.11 or newer. The package installs `duckdb` (2.x), `pandas` (3.x), `pysnmp`, `atspm` (3.1 or newer), `matplotlib`, and the other runtime dependencies. Optional extras:
 
 ```bash
 pip install "signal-replay[yaml]"         # PyYAML, for report.load_annotations()

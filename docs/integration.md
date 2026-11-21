@@ -272,6 +272,6 @@ Plot files listed in the `plots` frame live in the package's work folder; copy t
 ## Packaging notes
 
 - Install: `pip install signal-replay` (the extras are only for the bundled scripts). `atspm` and `requests` are imported lazily, only when the timeline analysis or the built-in MAXTIME source runs; `import signal_replay` loads neither, nor `matplotlib.pyplot`.
-- `atspm` depends on `ibis-framework`, whose deep test paths can exceed the Windows 260-character path limit when a venv lives in a deep folder. Keep the venv path short or enable Windows long-path support.
 - PyInstaller: the SQL templates in `signal_replay/sql/*.sql` are package data; include them (for example `collect_data_files("signal_replay")`). Check the frozen build once against an emulator; libraries that load modules dynamically (such as `pysnmp`) may need their submodules collected too.
-- Version pins that are known to work together: `duckdb` 1.1 to 1.x, `pandas` 2.x, `atspm` 2.5.x, Python 3.10 to 3.13.
+- Version pins that are known to work together: `duckdb` 2.x, `pandas` 3.x, `numpy` 2.x, `atspm` 3.1 or newer, Python 3.11 to 3.13. signal-replay 1.0.x is the line for `duckdb` 1.x, `pandas` 2.x and `atspm` 2.x.
+- DuckDB 2: a connection with an unread `SELECT` result, including one read with `fetchone()`, refuses `register()`, `sql()` and `append()`. Read results fully (`fetchall()`, `df()`) before registering frames on the same connection, as in the snippet above.

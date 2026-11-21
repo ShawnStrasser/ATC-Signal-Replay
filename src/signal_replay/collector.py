@@ -484,7 +484,7 @@ class DatabaseManager:
         columns = {str(row[1]).lower() for row in con.execute("PRAGMA table_info('simulation_runs')").fetchall()}
         if "device_id" in columns:
             return
-        catalog = str(con.execute("SELECT current_database()").fetchone()[0]).replace('"', '""')
+        catalog = str(con.execute("SELECT current_database()").fetchall()[0][0]).replace('"', '""')
         sources = [
             f'SELECT DISTINCT device_id, run_number FROM "{catalog}".main.{name}'
             for name in ("events", "conflicts") if name in tables
@@ -913,11 +913,11 @@ class DatabaseManager:
         con = self._read()
         try:
             if device_id is not None:
-                row = con.execute(
+                rows = con.execute(
                     "SELECT status FROM simulation_runs WHERE device_id = ? AND run_number = ?",
                     [str(device_id), run_number],
-                ).fetchone()
-                return row[0] if row else None
+                ).fetchall()
+                return rows[0][0] if rows else None
             statuses = [
                 row[0]
                 for row in con.execute(
@@ -1068,7 +1068,7 @@ class DatabaseManager:
             return int(con.execute(
                 "SELECT COUNT(*) FROM events WHERE device_id = ? AND run_number = ?",
                 [device_id, run_number],
-            ).fetchone()[0])
+            ).fetchall()[0][0])
         finally:
             con.close()
 
@@ -1095,7 +1095,7 @@ class DatabaseManager:
                 AND run_number = ?
                 AND timestamp = ?
                 AND conflict_details = ?
-            """, key).fetchone()
+            """, key).fetchall()[0]
 
             if existing[0] == 0:
                 con.execute("""
@@ -1483,7 +1483,7 @@ class DatabaseManager:
             has_comparison = con.execute("""
                 SELECT COUNT(*) FROM information_schema.tables
                 WHERE lower(table_name) = 'comparison_results'
-            """).fetchone()[0] > 0
+            """).fetchall()[0][0] > 0
             if has_comparison:
                 con.execute(
                     f"DELETE FROM comparison_results WHERE device_id IN ({placeholders})",
